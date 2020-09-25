@@ -22,9 +22,10 @@
 #include "swift/AST/Identifier.h"
 #include "swift/Basic/Located.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace swift {
 class ASTContext;
@@ -106,6 +107,14 @@ namespace detail {
     SourceRange getSourceRange() const {
       if (empty()) return SourceRange();
       return SourceRange(raw.front().Loc, raw.back().Loc);
+    }
+
+    StringRef str() const {
+      SmallString<64> modulePathStr;
+      llvm::interleave(
+          *this, [&](Element elem) { modulePathStr += elem.Item.str(); },
+          [&] { modulePathStr += "."; });
+      return modulePathStr.str();
     }
   };
 

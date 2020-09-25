@@ -557,16 +557,10 @@ bool UnboundImport::checkModuleLoaded(ModuleDecl *M, SourceFile &SF) {
 
   ASTContext &ctx = SF.getASTContext();
 
-  SmallString<64> modulePathStr;
-  llvm::interleave(modulePath, [&](ImportPath::Element elem) {
-                     modulePathStr += elem.Item.str();
-                   },
-                   [&] { modulePathStr += "."; });
-
   auto diagKind = diag::sema_no_import;
   if (ctx.LangOpts.DebuggerSupport)
     diagKind = diag::sema_no_import_repl;
-  ctx.Diags.diagnose(importLoc, diagKind, modulePathStr);
+  ctx.Diags.diagnose(importLoc, diagKind, modulePath.str());
 
   if (ctx.SearchPathOpts.SDKPath.empty() &&
       llvm::Triple(llvm::sys::getProcessTriple()).isMacOSX()) {

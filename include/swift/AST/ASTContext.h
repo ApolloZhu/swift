@@ -23,8 +23,8 @@
 #include "swift/AST/Import.h"
 #include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/Type.h"
-#include "swift/AST/Types.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/AST/Types.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Located.h"
 #include "swift/Basic/Malloc.h"
@@ -36,6 +36,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/DataTypes.h"
@@ -345,7 +346,7 @@ private:
     DelayedPatternContexts;
 
   /// Cache of module names that fail the 'canImport' test in this context.
-  llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
+  llvm::StringSet<> FailedModuleImportNames;
 
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &

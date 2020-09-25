@@ -1885,8 +1885,9 @@ bool ASTContext::canImportModule(ImportPath::Module ModuleName) {
   if (getLoadedModule(ModuleName) != nullptr)
     return true;
 
+  auto ModuleNameStr = ModuleName.str();
   // If we've failed loading this module before, don't look for it again.
-  if (FailedModuleImportNames.count(ModuleName[0].Item))
+  if (FailedModuleImportNames.count(ModuleNameStr))
     return false;
 
   // Otherwise, ask the module loaders.
@@ -1896,9 +1897,7 @@ bool ASTContext::canImportModule(ImportPath::Module ModuleName) {
     }
   }
 
-  // FIXME: This only works with top-level modules.
-  if (ModuleName.size() == 1)
-    FailedModuleImportNames.insert(ModuleName[0].Item);
+  FailedModuleImportNames.insert(ModuleNameStr);
   return false;
 }
 

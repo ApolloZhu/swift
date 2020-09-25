@@ -3,22 +3,48 @@
 #if canImport(A)
 import A
 #else
-import A
-#error("canImport checked wrong")
+#error("should can import A")
 #endif
 
 #if canImport(A.B)
 import A.B
 #else
-import A.B
-#error("canImport checked wrong")
+#error("should can import A.B")
 #endif
 
 #if canImport(A.B.C)
 import A.B.C
 #else
-import A.B.C
-#error("canImport checked wrong")
+#error("should can import A.B.C")
+#endif
+
+
+#if canImport(Z)
+#error("should not can import Z")
+#endif
+
+#if canImport(A.Z)
+#error("should not can import A.Z")
+#endif
+
+#if canImport(Z.B)
+#error("should not can import Z.B")
+#endif
+
+#if canImport(Z.B.C)
+#error("should not can import Z.B.C")
+#endif
+
+#if canImport(A.B.Z)
+#error("should not can import A.B.Z")
+#endif
+
+#if canImport(A.Z.C)
+#error("should not can import A.Z.C")
+#endif
+
+#if canImport(A.B.C.Z)
+#error("should not can import A.B.C.Z")
 #endif
 
 

@@ -144,7 +144,7 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  virtual bool canImportModule(ImportPath::Element named) = 0;
+  virtual bool canImportModule(ImportPath::Module named) = 0;
 
   /// Import a module with the given module path.
   ///

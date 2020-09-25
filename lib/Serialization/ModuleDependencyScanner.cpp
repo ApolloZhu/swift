@@ -173,13 +173,16 @@ Optional<ModuleDependencies> SerializedModuleLoaderBase::getModuleDependencies(
           cache.findDependencies(moduleName, ModuleDependenciesKind::SwiftPlaceholder))
     return found;
 
-  auto moduleId = Ctx.getIdentifier(moduleName);
+  ImportPath::Module::Builder builder(Ctx, moduleName, /*separator=*/'.');
+  auto modulePath = builder.get();
+  auto moduleId = modulePath.front().Item;
   // Instantiate dependency scanning "loaders".
   SmallVector<std::unique_ptr<ModuleDependencyScanner>, 2> scanners;
-  // Placeholder dependencies must be resolved first, to prevent the ModuleDependencyScanner
-  // from first discovering artifacts of a previous build. Such artifacts are captured
-  // as compiledModuleCandidates in the dependency graph of the placeholder dependency module
-  // itself.
+  // Placeholder dependencies must be resolved first, to prevent the
+  // ModuleDependencyScanner from first discovering artifacts of a previous
+  // build. Such artifacts are captured as compiledModuleCandidates in the
+  // dependency graph of the placeholder dependency module itself.
+  // FIXME: submodules?
   scanners.push_back(std::make_unique<PlaceholderSwiftModuleScanner>(
       Ctx, LoadMode, moduleId, Ctx.SearchPathOpts.PlaceholderDependencyModuleMap,
       delegate));
@@ -190,7 +193,7 @@ Optional<ModuleDependencies> SerializedModuleLoaderBase::getModuleDependencies(
   assert(isa<PlaceholderSwiftModuleScanner>(scanners[0].get()) &&
          "Expected PlaceholderSwiftModuleScanner as the first dependency scanner loader.");
   for (auto &scanner : scanners) {
-    if (scanner->canImportModule({moduleId, SourceLoc()})) {
+    if (scanner->canImportModule(modulePath)) {
       // Record the dependencies.
       cache.recordDependencies(moduleName, *(scanner->dependencies),
                                scanner->dependencyKind);

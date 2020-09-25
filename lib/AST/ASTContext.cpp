@@ -1880,13 +1880,13 @@ bool ASTContext::shouldPerformTypoCorrection() {
   return NumTypoCorrections <= LangOpts.TypoCorrectionLimit;
 }
 
-bool ASTContext::canImportModule(ImportPath::Element ModuleName) {
+bool ASTContext::canImportModule(ImportPath::Module ModuleName) {
   // If this module has already been successfully imported, it is importable.
-  if (getLoadedModule(ImportPath::Module::Builder(ModuleName).get()) != nullptr)
+  if (getLoadedModule(ModuleName) != nullptr)
     return true;
 
   // If we've failed loading this module before, don't look for it again.
-  if (FailedModuleImportNames.count(ModuleName.Item))
+  if (FailedModuleImportNames.count(ModuleName[0].Item))
     return false;
 
   // Otherwise, ask the module loaders.
@@ -1896,7 +1896,9 @@ bool ASTContext::canImportModule(ImportPath::Element ModuleName) {
     }
   }
 
-  FailedModuleImportNames.insert(ModuleName.Item);
+  // FIXME: This only works with top-level modules.
+  if (ModuleName.size() == 1)
+    FailedModuleImportNames.insert(ModuleName[0].Item);
   return false;
 }
 

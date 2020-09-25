@@ -458,7 +458,9 @@ public:
       }
     } else if (KindName == "canImport") {
       auto Str = extractExprSource(Ctx.SourceMgr, Arg);
-      return Ctx.canImportModule({ Ctx.getIdentifier(Str) , E->getLoc()  });
+      ImportPath::Module::Builder builder(Ctx, Str, /*separator=*/'.',
+                                          Arg->getStartLoc());
+      return Ctx.canImportModule(builder.get());
     }
 
     auto Val = getDeclRefStr(Arg);

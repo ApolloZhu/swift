@@ -346,7 +346,7 @@ private:
 
   /// Cache of module names that fail the 'canImport' test in this context.
   llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
-  
+
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
@@ -870,7 +870,7 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(ImportPath::Element ModulePath);
+  bool canImportModule(ImportPath::Module ModulePath);
 
   /// \returns a module with a given name that was already loaded.  If the
   /// module was not loaded, returns nullptr.

@@ -929,8 +929,7 @@ void swift::serialization::diagnoseSerializedASTLoadFailure(
   }
 }
 
-bool SerializedModuleLoaderBase::canImportModule(
-    ImportPath::Element mID) {
+bool SerializedModuleLoaderBase::canImportModule(ImportPath::Module path) {
   // Look on disk.
   SmallVector<char, 0> *unusedModuleInterfacePath = nullptr;
   std::unique_ptr<llvm::MemoryBuffer> *unusedModuleBuffer = nullptr;
@@ -938,15 +937,17 @@ bool SerializedModuleLoaderBase::canImportModule(
   std::unique_ptr<llvm::MemoryBuffer> *unusedModuleSourceInfoBuffer = nullptr;
   bool isFramework = false;
   bool isSystemModule = false;
-  return findModule(mID, unusedModuleInterfacePath, unusedModuleBuffer,
+  // FIXME: Swift submodules?
+  return findModule(path[0], unusedModuleInterfacePath, unusedModuleBuffer,
                     unusedModuleDocBuffer, unusedModuleSourceInfoBuffer,
                     isFramework, isSystemModule);
 }
 
 bool MemoryBufferSerializedModuleLoader::canImportModule(
-    ImportPath::Element mID) {
+    ImportPath::Module path) {
   // See if we find it in the registered memory buffers.
-  return MemoryBuffers.count(mID.Item.str());
+  // FIXME: Swift submodules?
+  return MemoryBuffers.count(path[0].Item.str());
 }
 
 ModuleDecl *

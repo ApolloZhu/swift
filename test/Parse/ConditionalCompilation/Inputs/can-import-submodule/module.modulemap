@@ -1,5 +1,15 @@
 module A {
     explicit module B {
         explicit module C { }
+        explicit module CMissingRequirement {
+            requires missing
+        }
     }
+    explicit module BMissingRequirement {
+        requires missing
+    }
+}
+
+module AMissingRequirement {
+    requires missing
 }

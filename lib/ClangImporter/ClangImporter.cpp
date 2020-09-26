@@ -1710,8 +1710,11 @@ bool ClangImporter::isModuleImported(const clang::Module *M) {
 }
 
 bool ClangImporter::canImportModule(ImportPath::Module path) {
+  if (path.hasSubmodule()) {
+    // TODO: more efficient way to check for submodule availability?
+    return bool(loadModule(path.front().Loc, path));
+  }
   // Look up the top-level module to see if it exists.
-  // FIXME: This only works with top-level modules.
   auto &clangHeaderSearch = Impl.getClangPreprocessor().getHeaderSearchInfo();
   auto topModule = path.front();
   clang::Module *clangModule =

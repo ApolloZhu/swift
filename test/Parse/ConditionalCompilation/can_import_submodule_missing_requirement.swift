@@ -10,13 +10,13 @@
 
 
 #if canImport(A.Private.BPMissingRequirement)
-#error("should not can import A.Private.MissingRequirement")
+#error("should not can import A.Private.BPMissingRequirement")
 #endif
 
 #if canImport(A_Private.BPMissingRequirement)
-#error("should not can import A_Private.MissingRequirement")
+#error("should not can import A_Private.BPMissingRequirement")
 #endif
 
-#if canImport(A_Private.B.CPMissingRequirement)
-#error("should not can import A_Private.B.CPMissingRequirement")
+#if canImport(A_Private.BP.CPMissingRequirement)
+#error("should not can import A_Private.BP.CPMissingRequirement")
 #endif

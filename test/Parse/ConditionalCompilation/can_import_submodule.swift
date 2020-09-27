@@ -19,19 +19,6 @@ import A.B.C
 #endif
 
 
-#if canImport(AMissingRequirement)
-#error("should not can import A.BMissingRequirement")
-#endif
-
-#if canImport(A.BMissingRequirement)
-#error("should not can import A.BMissingRequirement")
-#endif
-
-#if canImport(A.B.CMissingRequirement)
-#error("should not can import A.B.CMissingRequirement")
-#endif
-
-
 #if canImport(Z)
 #error("should not can import Z")
 #endif

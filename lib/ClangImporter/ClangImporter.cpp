@@ -1710,10 +1710,6 @@ bool ClangImporter::isModuleImported(const clang::Module *M) {
 }
 
 bool ClangImporter::canImportModule(ImportPath::Module path) {
-  if (path.hasSubmodule()) {
-    // TODO: more efficient way to check for submodule availability?
-    return bool(loadModule(path.front().Loc, path));
-  }
   // Look up the top-level module to see if it exists.
   auto &clangHeaderSearch = Impl.getClangPreprocessor().getHeaderSearchInfo();
   auto topModule = path.front();
@@ -1724,11 +1720,36 @@ bool ClangImporter::canImportModule(ImportPath::Module path) {
     return false;
   }
 
+  auto &ctx = Impl.getClangASTContext();
+  auto &lo = ctx.getLangOpts();
+  auto &ti = getTargetInfo();
   clang::Module::Requirement r;
   clang::Module::UnresolvedHeaderDirective mh;
   clang::Module *m;
-  auto &ctx = Impl.getClangASTContext();
-  return clangModule->isAvailable(ctx.getLangOpts(), getTargetInfo(), r, mh, m);
+
+  if (!clangModule->isAvailable(lo, ti, r, mh, m)) {
+    return false;
+  }
+  if (!path.hasSubmodule()) {
+    return true;
+  }
+  for (auto &component : path.getSubmodulePath()) {
+    clangModule = clangModule->findSubmodule(component.Item.str());
+
+    // Special case: a submodule named "Foo.Private" can be moved to a top-level
+    // module named "Foo_Private". Clang has special support for this.
+    if (!clangModule && component.Item.str() == "Private" &&
+        (&component) == (&path.getRaw()[1])) {
+      clangModule = clangHeaderSearch.lookupModule(
+          (topModule.Item.str() + "_Private").str(),
+          /*AllowSearch=*/true,
+          /*AllowExtraModuleMapSearch=*/true);
+    }
+    if (!clangModule || !clangModule->isAvailable(lo, ti, r, mh, m)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 ModuleDecl *ClangImporter::Implementation::loadModuleClang(

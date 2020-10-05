@@ -9,6 +9,8 @@ else()
   )
 endif()
 
+set_swift_llvm_is_available()
+
 add_swift_host_library(swiftAST STATIC
   AbstractSourceFileDepGraphFactory.cpp
   AccessRequests.cpp
@@ -49,6 +51,7 @@ add_swift_host_library(swiftAST STATIC
   FineGrainedDependencyFormat.cpp
   FrontendSourceFileDepGraphFactory.cpp
   GenericEnvironment.cpp
+  GenericParamList.cpp
   GenericSignature.cpp
   GenericSignatureBuilder.cpp
   Identifier.cpp

@@ -168,6 +168,7 @@ class ModuleDepGraph {
 
   // Supports requests from the driver to getExternalDependencies.
   std::unordered_set<std::string> externalDependencies;
+  std::unordered_set<std::string> incrementalExternalDependencies;
 
   /// Keyed by swiftdeps filename, so we can get back to Jobs.
   std::unordered_map<std::string, const driver::Job *> jobsBySwiftDeps;
@@ -187,8 +188,6 @@ class ModuleDepGraph {
 public:
   const bool verifyFineGrainedDependencyGraphAfterEveryImport;
   const bool emitFineGrainedDependencyDotFileAfterEveryImport;
-
-  const bool EnableTypeFingerprints;
 
 private:
   /// If tracing dependencies, holds a vector used to hold the current path
@@ -295,14 +294,12 @@ public:
   /// \p stats may be null
   ModuleDepGraph(const bool verifyFineGrainedDependencyGraphAfterEveryImport,
                  const bool emitFineGrainedDependencyDotFileAfterEveryImport,
-                 const bool EnableTypeFingerprints,
                  const bool shouldTraceDependencies,
                  UnifiedStatsReporter *stats)
       : verifyFineGrainedDependencyGraphAfterEveryImport(
             verifyFineGrainedDependencyGraphAfterEveryImport),
         emitFineGrainedDependencyDotFileAfterEveryImport(
             emitFineGrainedDependencyDotFileAfterEveryImport),
-        EnableTypeFingerprints(EnableTypeFingerprints),
         currentPathIfTracing(
             shouldTraceDependencies
                 ? llvm::Optional<std::vector<const ModuleDepGraphNode *>>(
@@ -313,11 +310,10 @@ public:
   }
 
   /// For unit tests.
-  ModuleDepGraph(const bool EnableTypeFingerprints,
-                 const bool EmitDotFilesForDebugging = false)
+  ModuleDepGraph(const bool EmitDotFilesForDebugging = false)
       : ModuleDepGraph(
             true, /*emitFineGrainedDependencyDotFileAfterEveryImport=*/
-            EmitDotFilesForDebugging, EnableTypeFingerprints, false, nullptr) {}
+            EmitDotFilesForDebugging, false, nullptr) {}
 
   //============================================================================
   // MARK: ModuleDepGraph - updating from a switdeps file
@@ -335,6 +331,8 @@ public:
                                      const SourceFileDepGraph &,
                                      DiagnosticEngine &);
 
+  Changes loadFromSwiftModuleBuffer(const driver::Job *, llvm::MemoryBuffer &,
+                                    DiagnosticEngine &);
 
 private:
   /// Read a SourceFileDepGraph belonging to \p job from \p buffer
@@ -512,15 +510,28 @@ public:
   std::vector<const driver::Job *>
   findExternallyDependentUntracedJobs(StringRef externalDependency);
 
+  /// Find jobs that were previously not known to need compilation but that
+  /// depend on \c incrementalExternalDependency.
+  ///
+  /// This code path should only act as a fallback to the status-quo behavior.
+  /// Otherwise it acts to pessimize the behavior of cross-module incremental
+  /// builds.
+  std::vector<const driver::Job *>
+  findIncrementalExternallyDependentUntracedJobs(StringRef externalDependency);
+
   //============================================================================
   // MARK: ModuleDepGraph - External dependencies
   //============================================================================
 
 public:
   std::vector<StringRef> getExternalDependencies() const;
+  std::vector<StringRef> getIncrementalExternalDependencies() const;
 
   void forEachUntracedJobDirectlyDependentOnExternalSwiftDeps(
       StringRef externalDependency, function_ref<void(const driver::Job *)> fn);
+  void forEachUntracedJobDirectlyDependentOnExternalIncrementalSwiftDeps(
+      StringRef externalDependency, function_ref<void(const driver::Job *)> fn);
+
   //============================================================================
   // MARK: ModuleDepGraph - verification
   //============================================================================

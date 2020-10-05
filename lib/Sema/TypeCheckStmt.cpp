@@ -504,6 +504,8 @@ static bool typeCheckConditionForStatement(LabeledConditionalStmt *stmt,
     }
     elt.setPattern(pattern);
 
+    TypeChecker::diagnoseDuplicateBoundVars(pattern);
+
     // Check the pattern, it allows unspecified types because the pattern can
     // provide type information.
     auto contextualPattern = ContextualPattern::forRawPattern(pattern, dc);
@@ -956,6 +958,8 @@ public:
     if (TypeChecker::typeCheckForEachBinding(DC, S))
       return nullptr;
 
+    TypeChecker::diagnoseDuplicateBoundVars(S->getPattern());
+
     // Type-check the body of the loop.
     auto sourceFile = DC->getParentSourceFile();
     checkLabeledStmtShadowing(getASTContext(), sourceFile, S);
@@ -1031,6 +1035,8 @@ public:
       });
     }
     labelItem.setPattern(pattern, /*resolved=*/true);
+
+    TypeChecker::diagnoseDuplicateBoundVars(pattern);
 
     // Otherwise for each variable in the pattern, make sure its type is
     // identical to the initial case decl and stash the previous case decl as
@@ -1704,30 +1710,30 @@ static void checkClassConstructorBody(ClassDecl *classDecl,
   ASTContext &ctx = classDecl->getASTContext();
   bool wantSuperInitCall = false;
   bool isDelegating = false;
-  ApplyExpr *initExpr = nullptr;
-  switch (ctor->getDelegatingOrChainedInitKind(&ctx.Diags, &initExpr)) {
-  case ConstructorDecl::BodyInitKind::Delegating:
+  auto initKindAndExpr = ctor->getDelegatingOrChainedInitKind();
+  switch (initKindAndExpr.initKind) {
+  case BodyInitKind::Delegating:
     isDelegating = true;
     wantSuperInitCall = false;
     break;
 
-  case ConstructorDecl::BodyInitKind::Chained:
-    checkSuperInit(ctor, initExpr, false);
+  case BodyInitKind::Chained:
+    checkSuperInit(ctor, initKindAndExpr.initExpr, false);
 
     /// A convenience initializer cannot chain to a superclass constructor.
     if (ctor->isConvenienceInit()) {
-      ctx.Diags.diagnose(initExpr->getLoc(),
+      ctx.Diags.diagnose(initKindAndExpr.initExpr->getLoc(),
                          diag::delegating_convenience_super_init,
                          ctor->getDeclContext()->getDeclaredInterfaceType());
     }
 
     LLVM_FALLTHROUGH;
 
-  case ConstructorDecl::BodyInitKind::None:
+  case BodyInitKind::None:
     wantSuperInitCall = false;
     break;
 
-  case ConstructorDecl::BodyInitKind::ImplicitChained:
+  case BodyInitKind::ImplicitChained:
     wantSuperInitCall = true;
     break;
   }
@@ -1743,7 +1749,7 @@ static void checkClassConstructorBody(ClassDecl *classDecl,
           .fixItInsert(ctor->getLoc(), "convenience ");
     }
 
-    ctx.Diags.diagnose(initExpr->getLoc(), diag::delegation_here);
+    ctx.Diags.diagnose(initKindAndExpr.initExpr->getLoc(), diag::delegation_here);
   }
 
   // An inlinable constructor in a class must always be delegating,
@@ -2039,7 +2045,7 @@ TypeCheckFunctionBodyRequest::evaluate(Evaluator &evaluator,
 }
 
 bool TypeChecker::typeCheckClosureBody(ClosureExpr *closure) {
-  checkParameterAttributes(closure->getParameters());
+  TypeChecker::checkParameterList(closure->getParameters());
 
   BraceStmt *body = closure->getBody();
 

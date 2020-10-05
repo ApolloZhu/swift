@@ -108,7 +108,6 @@ Compilation::Compilation(DiagnosticEngine &Diags,
                          std::unique_ptr<DerivedArgList> TranslatedArgs,
                          InputFileList InputsWithTypes,
                          std::string CompilationRecordPath,
-                         bool OutputCompilationRecordForModuleOnlyBuild,
                          StringRef ArgsHash,
                          llvm::sys::TimePoint<> StartTime,
                          llvm::sys::TimePoint<> LastBuildTime,
@@ -122,13 +121,12 @@ Compilation::Compilation(DiagnosticEngine &Diags,
                          bool ShowDriverTimeCompilation,
                          std::unique_ptr<UnifiedStatsReporter> StatsReporter,
                          bool OnlyOneDependencyFile,
-                         bool EnableTypeFingerprints,
                          bool VerifyFineGrainedDependencyGraphAfterEveryImport,
                          bool EmitFineGrainedDependencyDotFileAfterEveryImport,
-                         bool FineGrainedDependenciesIncludeIntrafileOnes,
                          bool EnableSourceRangeDependencies,
                          bool CompareIncrementalSchemes,
-                         StringRef CompareIncrementalSchemesPath)
+                         StringRef CompareIncrementalSchemesPath,
+                         bool EnableCrossModuleIncrementalBuild)
   : Diags(Diags), TheToolChain(TC),
     TheOutputInfo(OI),
     Level(Level),
@@ -140,8 +138,6 @@ Compilation::Compilation(DiagnosticEngine &Diags,
     BuildStartTime(StartTime),
     LastBuildTime(LastBuildTime),
     EnableIncrementalBuild(EnableIncrementalBuild),
-    OutputCompilationRecordForModuleOnlyBuild(
-        OutputCompilationRecordForModuleOnlyBuild),
     EnableBatchMode(EnableBatchMode),
     BatchSeed(BatchSeed),
     BatchCount(BatchCount),
@@ -151,14 +147,12 @@ Compilation::Compilation(DiagnosticEngine &Diags,
     Stats(std::move(StatsReporter)),
     FilelistThreshold(FilelistThreshold),
     OnlyOneDependencyFile(OnlyOneDependencyFile),
-    EnableTypeFingerprints(EnableTypeFingerprints),
     VerifyFineGrainedDependencyGraphAfterEveryImport(
       VerifyFineGrainedDependencyGraphAfterEveryImport),
     EmitFineGrainedDependencyDotFileAfterEveryImport(
       EmitFineGrainedDependencyDotFileAfterEveryImport),
-    FineGrainedDependenciesIncludeIntrafileOnes(
-      FineGrainedDependenciesIncludeIntrafileOnes),
-    EnableSourceRangeDependencies(EnableSourceRangeDependencies)
+    EnableSourceRangeDependencies(EnableSourceRangeDependencies),
+    EnableCrossModuleIncrementalBuild(EnableCrossModuleIncrementalBuild)
     {
     if (CompareIncrementalSchemes)
       IncrementalComparator.emplace(
@@ -830,12 +824,12 @@ namespace driver {
           FineGrainedDepGraph(
               Comp.getVerifyFineGrainedDependencyGraphAfterEveryImport(),
               Comp.getEmitFineGrainedDependencyDotFileAfterEveryImport(),
-              Comp.getEnableTypeFingerprints(), Comp.getTraceDependencies(),
+              Comp.getTraceDependencies(),
               Comp.getStatsReporter()),
           FineGrainedDepGraphForRanges(
               Comp.getVerifyFineGrainedDependencyGraphAfterEveryImport(),
               Comp.getEmitFineGrainedDependencyDotFileAfterEveryImport(),
-              Comp.getEnableTypeFingerprints(), Comp.getTraceDependencies(),
+              Comp.getTraceDependencies(),
               Comp.getStatsReporter()),
           TQ(std::move(TaskQueue)) {}
 
@@ -935,6 +929,10 @@ namespace driver {
         jobsToSchedule.insert(cmd);
       for (const auto cmd :
            collectExternallyDependentJobsFromDependencyGraph(forRanges))
+        jobsToSchedule.insert(cmd);
+      for (const auto cmd :
+           collectIncrementalExternallyDependentJobsFromDependencyGraph(
+               forRanges))
         jobsToSchedule.insert(cmd);
       return jobsToSchedule;
     }
@@ -1139,6 +1137,75 @@ namespace driver {
       });
       noteBuildingJobs(ExternallyDependentJobs, forRanges,
                        "because of external dependencies");
+      return ExternallyDependentJobs;
+    }
+
+    SmallVector<const Job *, 16>
+    collectIncrementalExternallyDependentJobsFromDependencyGraph(
+        const bool forRanges) {
+      SmallVector<const Job *, 16> ExternallyDependentJobs;
+      auto fallbackToExternalBehavior = [&](StringRef external) {
+        for (const auto cmd :
+             markIncrementalExternalInDepGraph(external, forRanges)) {
+          ExternallyDependentJobs.push_back(cmd);
+        }
+      };
+
+      for (auto external : getFineGrainedDepGraph(forRanges)
+                               .getIncrementalExternalDependencies()) {
+        llvm::sys::fs::file_status depStatus;
+        // Can't `stat` this dependency? Treat it as a plain external
+        // dependency and drop schedule all of its consuming jobs to run.
+        if (llvm::sys::fs::status(external, depStatus)) {
+          fallbackToExternalBehavior(external);
+          continue;
+        }
+
+        // Is this module out of date? If not, just keep searching.
+        if (Comp.getLastBuildTime() >= depStatus.getLastModificationTime())
+          continue;
+
+        // Can we run a cross-module incremental build at all? If not, fallback.
+        if (!Comp.getEnableCrossModuleIncrementalBuild()) {
+          fallbackToExternalBehavior(external);
+          continue;
+        }
+
+        // If loading the buffer fails, the user may have deleted this external
+        // dependency or it could have become corrupted. We need to
+        // pessimistically schedule a rebuild to get dependent jobs to drop
+        // this dependency from their swiftdeps files if possible.
+        auto buffer = llvm::MemoryBuffer::getFile(external);
+        if (!buffer) {
+          fallbackToExternalBehavior(external);
+          continue;
+        }
+
+        // Cons up a fake `Job` to satisfy the incremental job tracing
+        // code's internal invariants.
+        Job fakeJob(Comp.getDerivedOutputFileMap(), external);
+        auto subChanges =
+            getFineGrainedDepGraph(forRanges).loadFromSwiftModuleBuffer(
+                &fakeJob, *buffer.get(), Comp.getDiags());
+
+        // If the incremental dependency graph failed to load, fall back to
+        // treating this as plain external job.
+        if (!subChanges.hasValue()) {
+          fallbackToExternalBehavior(external);
+          continue;
+        }
+
+        for (auto *CMD :
+             getFineGrainedDepGraph(forRanges)
+                 .findJobsToRecompileWhenNodesChange(subChanges.getValue())) {
+          if (CMD == &fakeJob) {
+            continue;
+          }
+          ExternallyDependentJobs.push_back(CMD);
+        }
+      }
+      noteBuildingJobs(ExternallyDependentJobs, forRanges,
+                       "because of incremental external dependencies");
       return ExternallyDependentJobs;
     }
 
@@ -1595,11 +1662,24 @@ namespace driver {
       return getFineGrainedDepGraph(forRanges).getExternalDependencies();
     }
 
+    std::vector<StringRef>
+    getIncrementalExternalDependencies(const bool forRanges) const {
+      return getFineGrainedDepGraph(forRanges)
+          .getIncrementalExternalDependencies();
+    }
+
     std::vector<const Job*>
     markExternalInDepGraph(StringRef externalDependency,
                                 const bool forRanges) {
       return getFineGrainedDepGraph(forRanges)
           .findExternallyDependentUntracedJobs(externalDependency);
+    }
+
+    std::vector<const Job *>
+    markIncrementalExternalInDepGraph(StringRef externalDependency,
+                                      const bool forRanges) {
+      return getFineGrainedDepGraph(forRanges)
+          .findIncrementalExternallyDependentUntracedJobs(externalDependency);
     }
 
     std::vector<const Job *> findJobsToRecompileWhenWholeJobChanges(
@@ -1815,12 +1895,6 @@ int Compilation::performJobsImpl(bool &abnormalExit,
     checkForOutOfDateInputs(Diags, InputInfo);
     writeCompilationRecord(CompilationRecordPath, ArgsHash, BuildStartTime,
                            InputInfo);
-
-    if (OutputCompilationRecordForModuleOnlyBuild) {
-      // TODO: Optimize with clonefile(2) ?
-      llvm::sys::fs::copy_file(CompilationRecordPath,
-                               CompilationRecordPath + "~moduleonly");
-    }
   }
   abnormalExit = State.hadAnyAbnormalExit();
   return State.getResult();

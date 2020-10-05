@@ -26,6 +26,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include <algorithm>
 
 namespace swift {
 class ASTContext;
@@ -215,6 +216,20 @@ namespace detail {
     }
   };
 }
+
+/// @name ImportPathBase Comparison Operators
+/// @{
+template <typename Subclass>
+inline bool operator<(const detail::ImportPathBase<Subclass> &LHS,
+                      const detail::ImportPathBase<Subclass> &RHS) {
+  using Element = typename detail::ImportPathBase<Subclass>::Element;
+  auto Comparator = [](const Element &l, const Element &r) {
+    return l.Item.compare(r.Item) < 0;
+  };
+  return std::lexicographical_compare(LHS.begin(), LHS.end(), RHS.begin(),
+                                      RHS.end(), Comparator);
+}
+/// @}
 
 /// An undifferentiated series of dotted identifiers in an \c import statement,
 /// like \c Foo.Bar. Each identifier is packaged with its corresponding source

@@ -5256,9 +5256,15 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
       }
 
       // Single expression function with implicit `return`.
-      if (elt->isResultOfSingleExprFunction()) {
-        increaseScore(SK_FunctionConversion);
-        return getTypeMatchSuccess();
+      if (elt->is<LocatorPathElt::ContextualType>()) {
+        auto anchor = locator.getAnchor();
+        auto contextualInfo = getContextualTypeInfo(anchor);
+        assert(contextualInfo &&
+               "Found contextual type locator without additional information");
+        if (contextualInfo->purpose == CTP_ReturnSingleExpr) {
+          increaseScore(SK_FunctionConversion);
+          return getTypeMatchSuccess();
+        }
       }
     }
   }
@@ -5892,6 +5898,12 @@ ConstraintSystem::simplifyOptionalObjectConstraint(
     return SolutionKind::Unsolved;
   }
   
+
+  if (optTy->isHole()) {
+    if (auto *typeVar = second->getAs<TypeVariableType>())
+      recordPotentialHole(typeVar);
+    return SolutionKind::Solved;
+  }
 
   Type objectTy = optTy->getOptionalObjectType();
   // If the base type is not optional, let's attempt a fix (if possible)
@@ -7014,7 +7026,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
       // type but a hole.
       auto shouldRecordFixForHole = [&](HoleType *baseType) {
         auto *originator =
-            baseType->getOriginatorType().dyn_cast<TypeVariableType *>();
+            baseType->getOriginator().dyn_cast<TypeVariableType *>();
 
         if (!originator)
           return false;
@@ -8531,6 +8543,12 @@ bool ConstraintSystem::simplifyAppliedOverloadsImpl(
     Constraint *disjunction, TypeVariableType *fnTypeVar,
     const FunctionType *argFnType, unsigned numOptionalUnwraps,
     ConstraintLocatorBuilder locator) {
+  // Don't attempt to filter overloads when solving for code completion
+  // because presence of code completion token means that any call
+  // could be malformed e.g. missing arguments e.g. `foo([.#^MEMBER^#`
+  if (isForCodeCompletion())
+    return false;
+
   if (shouldAttemptFixes()) {
     auto arguments = argFnType->getParams();
     bool allHoles =
@@ -10066,7 +10084,8 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::SpecifyKeyPathRootType:
   case FixKind::SpecifyLabelToAssociateTrailingClosure:
   case FixKind::AllowKeyPathWithoutComponents:
-  case FixKind::IgnoreInvalidFunctionBuilderBody: {
+  case FixKind::IgnoreInvalidFunctionBuilderBody:
+  case FixKind::SpecifyContextualTypeForNil: {
     return recordFix(fix) ? SolutionKind::Error : SolutionKind::Solved;
   }
 
@@ -10528,9 +10547,8 @@ void ConstraintSystem::addContextualConversionConstraint(
   }
 
   // Add the constraint.
-  bool isForSingleExprFunction = (purpose == CTP_ReturnSingleExpr);
-  auto *convertTypeLocator = getConstraintLocator(
-      expr, LocatorPathElt::ContextualType(isForSingleExprFunction));
+  auto *convertTypeLocator =
+      getConstraintLocator(expr, LocatorPathElt::ContextualType());
   addConstraint(constraintKind, getType(expr), conversionType,
                 convertTypeLocator, /*isFavored*/ true);
 }

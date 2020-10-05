@@ -1026,8 +1026,8 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
 
   SmallVector<ModuleDecl::ImportedModule, 8> allImports;
   M->getImportedModules(allImports,
-                        {ModuleDecl::ImportFilterKind::Public,
-                         ModuleDecl::ImportFilterKind::Private,
+                        {ModuleDecl::ImportFilterKind::Exported,
+                         ModuleDecl::ImportFilterKind::Default,
                          ModuleDecl::ImportFilterKind::ImplementationOnly,
                          ModuleDecl::ImportFilterKind::SPIAccessControl});
   ModuleDecl::removeDuplicateImports(allImports);
@@ -1035,11 +1035,15 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
   // Collect the public and private imports as a subset so that we can
   // distinguish them.
   ImportSet publicImportSet =
-      getImportsAsSet(M, ModuleDecl::ImportFilterKind::Public);
+      getImportsAsSet(M, ModuleDecl::ImportFilterKind::Exported);
   ImportSet privateImportSet =
-      getImportsAsSet(M, ModuleDecl::ImportFilterKind::Private);
+      getImportsAsSet(M, ModuleDecl::ImportFilterKind::Default);
   ImportSet spiImportSet =
-      getImportsAsSet(M, ModuleDecl::ImportFilterKind::SPIAccessControl);
+      getImportsAsSet(M, {
+          ModuleDecl::ImportFilterKind::Exported,
+          ModuleDecl::ImportFilterKind::Default,
+          ModuleDecl::ImportFilterKind::SPIAccessControl
+      });
 
   auto clangImporter =
     static_cast<ClangImporter *>(M->getASTContext().getClangModuleLoader());
@@ -2485,11 +2489,11 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
 
     auto *storage = dyn_cast<AbstractStorageDecl>(value);
     auto access = value->getFormalAccess();
-    // Emit the private descriminator for private decls.
+    // Emit the private discriminator for private decls.
     // FIXME: We shouldn't need to encode this for /all/ private decls.
     // In theory we can follow the same rules as mangling and only include
     // the outermost private context.
-    bool shouldEmitPrivateDescriminator =
+    bool shouldEmitPrivateDiscriminator =
         access <= swift::AccessLevel::FilePrivate &&
         !value->getDeclContext()->isLocalContext();
 
@@ -2503,10 +2507,10 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
           storage->getFormalAccess() >= swift::AccessLevel::Internal &&
           storage->hasPrivateAccessor()));
 
-    if (shouldEmitFilenameForPrivate || shouldEmitPrivateDescriminator) {
+    if (shouldEmitFilenameForPrivate || shouldEmitPrivateDiscriminator) {
       auto topLevelContext = value->getDeclContext()->getModuleScopeContext();
       if (auto *enclosingFile = dyn_cast<FileUnit>(topLevelContext)) {
-        if (shouldEmitPrivateDescriminator) {
+        if (shouldEmitPrivateDiscriminator) {
           Identifier discriminator =
               enclosingFile->getDiscriminatorForPrivateValue(value);
           unsigned abbrCode =
@@ -4136,7 +4140,10 @@ public:
     using namespace decls_block;
 
     auto resultType = S.addTypeRef(fnTy->getResult());
-    auto clangType = S.addClangTypeRef(fnTy->getClangTypeInfo().getType());
+    auto clangType =
+      S.getASTContext().LangOpts.UseClangFunctionTypes
+      ? S.addClangTypeRef(fnTy->getClangTypeInfo().getType())
+      : ClangTypeID(0);
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[FunctionTypeLayout::Code];
     FunctionTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
@@ -5208,9 +5215,11 @@ SerializerBase::SerializerBase(ArrayRef<unsigned char> signature,
   this->SF = DC.dyn_cast<SourceFile *>();
 }
 
-void Serializer::writeToStream(raw_ostream &os, ModuleOrSourceFile DC,
-                               const SILModule *SILMod,
-                               const SerializationOptions &options) {
+void Serializer::writeToStream(
+    raw_ostream &os, ModuleOrSourceFile DC,
+    const SILModule *SILMod,
+    const SerializationOptions &options,
+    const fine_grained_dependencies::SourceFileDepGraph *DepGraph) {
   Serializer S{SWIFTMODULE_SIGNATURE, DC};
 
   // FIXME: This is only really needed for debugging. We don't actually use it.
@@ -5222,6 +5231,9 @@ void Serializer::writeToStream(raw_ostream &os, ModuleOrSourceFile DC,
     S.writeInputBlock(options);
     S.writeSIL(SILMod, options.SerializeAllSIL);
     S.writeAST(DC);
+    if (options.ExperimentalCrossModuleIncrementalInfo) {
+      S.writeIncrementalInfo(DepGraph);
+    }
   }
 
   S.writeToStream(os);
@@ -5240,7 +5252,8 @@ void swift::serializeToBuffers(
                                "Serialization, swiftmodule, to buffer");
     llvm::SmallString<1024> buf;
     llvm::raw_svector_ostream stream(buf);
-    Serializer::writeToStream(stream, DC, M, options);
+    Serializer::writeToStream(stream, DC, M, options,
+                              /*dependency info*/ nullptr);
     bool hadError = withOutputFile(getContext(DC).Diags,
                                    options.OutputPath,
                                    [&](raw_ostream &out) {
@@ -5291,12 +5304,13 @@ void swift::serializeToBuffers(
 
 void swift::serialize(ModuleOrSourceFile DC,
                       const SerializationOptions &options,
-                      const SILModule *M) {
+                      const SILModule *M,
+                      const fine_grained_dependencies::SourceFileDepGraph *DG) {
   assert(!StringRef::withNullAsEmpty(options.OutputPath).empty());
 
   if (StringRef(options.OutputPath) == "-") {
     // Special-case writing to stdout.
-    Serializer::writeToStream(llvm::outs(), DC, M, options);
+    Serializer::writeToStream(llvm::outs(), DC, M, options, DG);
     assert(StringRef::withNullAsEmpty(options.DocOutputPath).empty());
     return;
   }
@@ -5306,7 +5320,7 @@ void swift::serialize(ModuleOrSourceFile DC,
                                  [&](raw_ostream &out) {
     FrontendStatsTracer tracer(getContext(DC).Stats,
                                "Serialization, swiftmodule");
-    Serializer::writeToStream(out, DC, M, options);
+    Serializer::writeToStream(out, DC, M, options, DG);
     return false;
   });
   if (hadError)

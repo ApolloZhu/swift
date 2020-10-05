@@ -19,6 +19,7 @@
 #include "swift/AST/ActorIsolation.h"
 #include "swift/AST/AnyFunctionRef.h"
 #include "swift/AST/ASTTypeIDs.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Evaluator.h"
@@ -210,6 +211,29 @@ private:
   // Evaluation.
   CtorInitializerKind
   evaluate(Evaluator &evaluator, ConstructorDecl *decl) const;
+
+public:
+// Caching.
+  bool isCached() const { return true; }
+};
+
+void simple_display(llvm::raw_ostream &out, BodyInitKind initKind);
+void simple_display(llvm::raw_ostream &out, BodyInitKindAndExpr initKindAndExpr);
+
+/// Computes the kind of initializer call (self.init or super.init) performed
+/// in the body of a \c ConstructorDecl
+class BodyInitKindRequest :
+    public SimpleRequest<BodyInitKindRequest,
+                         BodyInitKindAndExpr(ConstructorDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  BodyInitKindAndExpr evaluate(Evaluator &evaluator, ConstructorDecl *decl) const;
 
 public:
   // Caching.
@@ -782,6 +806,25 @@ public:
 /// Determine whether the given function is an @asyncHandler.
 class IsAsyncHandlerRequest :
     public SimpleRequest<IsAsyncHandlerRequest,
+                         bool(FuncDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  bool evaluate(Evaluator &evaluator, FuncDecl *func) const;
+
+public:
+  // Caching
+  bool isCached() const { return true; }
+};
+
+/// Determine whether the given function can be an @asyncHandler, without
+/// producing any diagnostics.
+class CanBeAsyncHandlerRequest :
+    public SimpleRequest<CanBeAsyncHandlerRequest,
                          bool(FuncDecl *),
                          RequestFlags::Cached> {
 public:
@@ -1941,29 +1984,6 @@ private:
 
 public:
   // Separate caching.
-  bool isCached() const { return true; }
-};
-
-/// Computes whether a class has a circular reference in its inheritance
-/// hierarchy.
-class HasCircularInheritanceRequest
-    : public SimpleRequest<HasCircularInheritanceRequest, bool(ClassDecl *),
-                           RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, ClassDecl *decl) const;
-
-public:
-  // Cycle handling.
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
-
-  // Cached.
   bool isCached() const { return true; }
 };
 

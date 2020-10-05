@@ -411,14 +411,7 @@ SILGenModule::getKeyPathProjectionCoroutine(bool isReadAccess,
                     : ParameterConvention::Indirect_In_Guaranteed },
   };
 
-  auto extInfo =
-      SILFunctionType::ExtInfoBuilder(SILFunctionTypeRepresentation::Thin,
-                                      /*pseudogeneric*/ false,
-                                      /*non-escaping*/ false,
-                                      /*async*/ false,
-                                      DifferentiabilityKind::NonDifferentiable,
-                                      /*clangFunctionType*/ nullptr)
-          .build();
+  auto extInfo = SILFunctionType::ExtInfo::getThin();
 
   auto functionTy = SILFunctionType::get(sig, extInfo,
                                          SILCoroutineKind::YieldOnce,
@@ -1295,8 +1288,8 @@ bool SILGenModule::requiresIVarDestroyer(ClassDecl *cd) {
   // Only needed if we have non-trivial ivars, we're not a root class, and
   // the superclass is not @objc.
   return (hasNonTrivialIVars(cd) &&
-          cd->getSuperclass() &&
-          !cd->getSuperclass()->getClassOrBoundGenericClass()->hasClangNode());
+          cd->getSuperclassDecl() &&
+          !cd->getSuperclassDecl()->hasClangNode());
 }
 
 /// TODO: This needs a better name.

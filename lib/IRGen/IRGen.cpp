@@ -16,6 +16,7 @@
 
 #define DEBUG_TYPE "irgen"
 #include "IRGenModule.h"
+#include "swift/ABI/MetadataValues.h"
 #include "swift/AST/DiagnosticsIRGen.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/IRGenRequests.h"
@@ -124,12 +125,6 @@ static void addSwiftContractPass(const PassManagerBuilder &Builder,
                                PassManagerBase &PM) {
   if (Builder.OptLevel > 0)
     PM.add(createSwiftARCContractPass());
-}
-
-static void addSwiftMergeFunctionsPass(const PassManagerBuilder &Builder,
-                                       PassManagerBase &PM) {
-  if (Builder.OptLevel > 0)
-    PM.add(createSwiftMergeFunctionsPass());
 }
 
 static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
@@ -249,9 +244,16 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
     PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
                            addSanitizerCoveragePass);
   }
-  if (RunSwiftSpecificLLVMOptzns)
+  if (RunSwiftSpecificLLVMOptzns) {
     PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
-                           addSwiftMergeFunctionsPass);
+      [&](const PassManagerBuilder &Builder, PassManagerBase &PM) {
+        if (Builder.OptLevel > 0) {
+          const PointerAuthSchema &schema = Opts.PointerAuth.FunctionPointers;
+          unsigned key = (schema.isEnabled() ? schema.getKey() : 0);
+          PM.add(createSwiftMergeFunctionsPass(schema.isEnabled(), key));
+        }
+      });
+  }
 
   // Configure the function passes.
   legacy::FunctionPassManager FunctionPasses(Module);

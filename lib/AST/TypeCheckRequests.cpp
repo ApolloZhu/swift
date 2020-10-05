@@ -1137,23 +1137,6 @@ void swift::simple_display(llvm::raw_ostream &out,
 }
 
 //----------------------------------------------------------------------------//
-// HasCircularInheritanceRequest computation.
-//----------------------------------------------------------------------------//
-
-void HasCircularInheritanceRequest::diagnoseCycle(
-    DiagnosticEngine &diags) const {
-  auto *decl = std::get<0>(getStorage());
-  diags.diagnose(decl, diag::circular_class_inheritance, decl->getName());
-}
-
-void HasCircularInheritanceRequest::noteCycleStep(
-    DiagnosticEngine &diags) const {
-  auto *decl = std::get<0>(getStorage());
-  diags.diagnose(decl, diag::kind_declname_declared_here,
-                 decl->getDescriptiveKind(), decl->getName());
-}
-
-//----------------------------------------------------------------------------//
 // HasCircularInheritedProtocolsRequest computation.
 //----------------------------------------------------------------------------//
 
@@ -1484,4 +1467,22 @@ void swift::simple_display(
       out << "unspecified actor isolation";
       break;
   }
+}
+
+void swift::simple_display(
+    llvm::raw_ostream &out, BodyInitKind initKind) {
+  switch (initKind) {
+  case BodyInitKind::None: out << "none"; return;
+  case BodyInitKind::Delegating: out << "delegating"; return;
+  case BodyInitKind::Chained: out << "chained"; return;
+  case BodyInitKind::ImplicitChained: out << "implicit_chained"; return;
+  }
+  llvm_unreachable("Bad body init kind");
+}
+
+void swift::simple_display(
+    llvm::raw_ostream &out, BodyInitKindAndExpr initKindAndExpr) {
+  simple_display(out, initKindAndExpr.initKind);
+  out << " ";
+  simple_display(out, initKindAndExpr.initExpr);
 }

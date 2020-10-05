@@ -19,6 +19,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
@@ -213,7 +214,7 @@ SourceRange DifferentiableAttributeScope::getSourceRangeOfThisASTNode(
   return differentiableAttr->getRange();
 }
 
-SourceRange AbstractFunctionBodyScope::getSourceRangeOfThisASTNode(
+SourceRange FunctionBodyScope::getSourceRangeOfThisASTNode(
     const bool omitAssertions) const {
   return decl->getOriginalBodySourceRange();
 }
@@ -247,7 +248,13 @@ SourceRange DefaultArgumentInitializerScope::getSourceRangeOfThisASTNode(
 
 SourceRange PatternEntryDeclScope::getSourceRangeOfThisASTNode(
     const bool omitAssertions) const {
-  return getPatternEntry().getSourceRange();
+  SourceRange range = getPatternEntry().getSourceRange();
+  if (endLoc.hasValue()) {
+    ASTScopeAssert(endLoc->isValid(),
+                   "BraceStmt ends before pattern binding entry?");
+    range.End = *endLoc;
+  }
+  return range;
 }
 
 SourceRange PatternEntryInitializerScope::getSourceRangeOfThisASTNode(
@@ -256,12 +263,6 @@ SourceRange PatternEntryInitializerScope::getSourceRangeOfThisASTNode(
   // Search for "When the initializer is removed we don't actually clear the
   // pointer" because we do!
   return initAsWrittenWhenCreated->getSourceRange();
-}
-
-SourceRange
-VarDeclScope::getSourceRangeOfThisASTNode(const bool omitAssertions) const {
-  const auto br = decl->getBracesRange();
-  return br.isValid() ? br : decl->getSourceRange();
 }
 
 SourceRange GenericParamScope::getSourceRangeOfThisASTNode(
@@ -450,9 +451,14 @@ SourceRange AttachedPropertyWrapperScope::getSourceRangeOfThisASTNode(
   return sourceRangeWhenCreated;
 }
 
+SourceRange GuardStmtScope::getSourceRangeOfThisASTNode(
+    const bool omitAssertions) const {
+  return SourceRange(getStmt()->getStartLoc(), endLoc);
+}
+
 SourceRange LookupParentDiversionScope::getSourceRangeOfThisASTNode(
     const bool omitAssertions) const {
-  return SourceRange(startLoc);
+  return SourceRange(startLoc, endLoc);
 }
 
 #pragma mark source range caching
@@ -592,7 +598,7 @@ SourceRange ASTScopeImpl::sourceRangeForDeferredExpansion() const {
 SourceRange IterableTypeScope::sourceRangeForDeferredExpansion() const {
   return portion->sourceRangeForDeferredExpansion(this);
 }
-SourceRange AbstractFunctionBodyScope::sourceRangeForDeferredExpansion() const {
+SourceRange FunctionBodyScope::sourceRangeForDeferredExpansion() const {
   const auto bsr = decl->getOriginalBodySourceRange();
   const SourceLoc endEvenIfNoCloseBraceAndEndsWithInterpolatedStringLiteral =
       getLocEncompassingPotentialLookups(getSourceManager(), bsr.End);

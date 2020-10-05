@@ -2987,8 +2987,19 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
     } else if (auto storage = dyn_cast<AbstractStorageDecl>(D)) {
       decl = storage;
 
-      // Check whether this is a property without an explicit getter.
+      // Check whether this is a storage declaration that is not permitted
+      // to have a function builder attached.
       auto shouldDiagnose = [&]() -> bool {
+        // An uninitialized stored property in a struct can have a function
+        // builder attached.
+        if (auto var = dyn_cast<VarDecl>(decl)) {
+          if (var->isInstanceMember() &&
+              isa<StructDecl>(var->getDeclContext()) &&
+              !var->getParentInitializer()) {
+            return false;
+          }
+        }
+
         auto getter = storage->getParsedAccessor(AccessorKind::Get);
         if (!getter)
           return true;
@@ -3193,12 +3204,6 @@ void AttributeChecker::visitNonEphemeralAttr(NonEphemeralAttr *attr) {
 
   diagnose(attr->getLocation(), diag::non_ephemeral_non_pointer_type);
   attr->setInvalid();
-}
-
-void TypeChecker::checkParameterAttributes(ParameterList *params) {
-  for (auto param: *params) {
-    checkDeclAttributes(param);
-  }
 }
 
 void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
@@ -3720,18 +3725,23 @@ enum class AbstractFunctionDeclLookupErrorKind {
   CandidateNotFunctionDeclaration
 };
 
-/// Returns the function declaration corresponding to the given base type
-/// (optional), function name, and lookup context.
+/// Returns the original function (in the context of a derivative or transpose
+/// function) declaration corresponding to the given base type (optional),
+/// function name, lookup context, and the expected original function type.
 ///
 /// If the base type of the function is specified, member lookup is performed.
 /// Otherwise, unqualified lookup is performed.
+///
+/// If the expected original function type has a generic signature, any
+/// candidate with a less constrained type signature than the expected original
+/// function type will be treated as a viable candidate.
 ///
 /// If the function declaration cannot be resolved, emits a diagnostic and
 /// returns nullptr.
 ///
 /// Used for resolving the referenced declaration in `@derivative` and
 /// `@transpose` attributes.
-static AbstractFunctionDecl *findAbstractFunctionDecl(
+static AbstractFunctionDecl *findAutoDiffOriginalFunctionDecl(
     DeclAttribute *attr, Type baseType, DeclNameRefWithLoc funcNameWithLoc,
     DeclContext *lookupContext, NameLookupOptions lookupOptions,
     const llvm::function_ref<Optional<AbstractFunctionDeclLookupErrorKind>(
@@ -4660,7 +4670,7 @@ static bool typeCheckDerivativeAttr(ASTContext &Ctx, Decl *D,
   }
 
   // Look up original function.
-  auto *originalAFD = findAbstractFunctionDecl(
+  auto *originalAFD = findAutoDiffOriginalFunctionDecl(
       attr, baseType, originalName, derivativeTypeCtx, lookupOptions,
       isValidOriginalCandidate, originalFnType);
   if (!originalAFD) {
@@ -5219,7 +5229,7 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   auto funcLoc = originalName.Loc.getBaseNameLoc();
   if (attr->getBaseTypeRepr())
     funcLoc = attr->getBaseTypeRepr()->getLoc();
-  auto *originalAFD = findAbstractFunctionDecl(
+  auto *originalAFD = findAutoDiffOriginalFunctionDecl(
       attr, baseType, originalName, transposeTypeCtx, lookupOptions,
       isValidOriginalCandidate, expectedOriginalFnType);
   if (!originalAFD) {

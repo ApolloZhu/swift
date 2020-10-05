@@ -296,6 +296,10 @@ void addFunctionPasses(SILPassPipelinePlan &P,
     P.addSROA();
   }
 
+  // We earlier eliminated ownership if we are not compiling the stdlib. Now
+  // handle the stdlib functions.
+  P.addNonTransparentFunctionOwnershipModelEliminator();
+
   // Promote stack allocations to values.
   P.addMem2Reg();
 
@@ -489,10 +493,7 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
   // FIXME: update EagerSpecializer to be a function pass!
   P.addEagerSpecializer();
 
-  // We earlier eliminated ownership if we are not compiling the stdlib. Now
-  // handle the stdlib functions.
-  P.addNonTransparentFunctionOwnershipModelEliminator();
-
+  // stdlib ownership model elimination is done within addFunctionPasses
   addFunctionPasses(P, OptimizationLevelKind::HighLevel);
 
   addHighLevelLoopOptPasses(P);

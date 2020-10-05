@@ -1992,14 +1992,15 @@ NOTE(witness_self_weaken_same_type,none,
       "consider weakening the same-type requirement %0 == %1 to a superclass "
       "requirement", (Type, Type))
 ERROR(witness_requires_dynamic_self,none,
-      "method %0 in non-final class %1 must return 'Self' to conform to "
-      "protocol %2",
-      (DeclName, Type, Type))
+      "%select{%error|method|property|subscript}0 %1 in non-final class %2 "
+      "must %select{%error|return|specify type|return}0 'Self' "
+      "to conform to protocol %3",
+      (RequirementKind, DeclName, Type, Type))
 ERROR(witness_requires_class_implementation,none,
-      "method %0 in non-final class %1 cannot be implemented in a "
-      "protocol extension because it returns 'Self' and has associated type "
-      "requirements",
-      (DeclName, Type))
+      "%select{%error|method|%error|subscript}0 %1 in non-final class %2 "
+      "cannot be implemented in a protocol extension because it returns 'Self' "
+      "and has associated type requirements",
+      (RequirementKind, DeclName, Type))
 ERROR(witness_not_accessible_proto,none,
       "%select{initializer %1|method %1|%select{|setter for }2property %1"
       "|subscript%select{| setter}2}0 must be declared "
@@ -4100,6 +4101,9 @@ ERROR(not_objc_function_async,none,
       "'async' function cannot be represented in Objective-C", ())
 NOTE(not_objc_function_type_async,none,
       "'async' function types cannot be represented in Objective-C", ())
+ERROR(actor_isolated_objc,none,
+      "actor-isolated %0 %1 cannot be @objc",
+       (DescriptiveDeclKind, DeclName))
 NOTE(protocol_witness_async_conflict,none,
      "candidate is %select{not |}0'async', but protocol requirement is%select{| not}0",
      (bool))
@@ -4149,6 +4153,9 @@ ERROR(actor_isolated_self_independent_context,none,
         "actor-isolated %0 %1 can not be referenced from an "
         "'@actorIndependent' context",
         (DescriptiveDeclKind, DeclName))
+ERROR(actor_isolated_partial_apply,none,
+        "actor-isolated %0 %1 can not be partially applied",
+        (DescriptiveDeclKind, DeclName))
 WARNING(concurrent_access_local,none,
         "local %0 %1 is unsafe to reference in code that may execute "
         "concurrently",
@@ -4190,6 +4197,13 @@ ERROR(actorisolated_not_actor_member,none,
 ERROR(actorisolated_not_actor_instance_member,none,
       "'@actorIsolated' can only be applied to instance members of actors",
       ())
+
+ERROR(concurrency_lib_missing,none,
+      "missing '%0' declaration, probably because the '_Concurrency' "
+      "module was not imported", (StringRef))
+ERROR(enqueue_partial_task_not_in_context,none,
+      "'enqueue(partialTask:)' can only be implemented in the definition of "
+      "actor class %0", (Type))
 
 //------------------------------------------------------------------------------
 // MARK: Type Check Types
@@ -5202,8 +5216,6 @@ ERROR(property_wrapper_mutating_get_composed_to_get_only,none,
       "property wrapper %0 with a mutating getter cannot be composed inside "
       "get-only property wrapper %1", (TypeLoc, TypeLoc))
 
-ERROR(property_wrapper_local,none,
-      "property wrappers are not yet supported on local properties", ())
 ERROR(property_wrapper_top_level,none,
       "property wrappers are not yet supported in top-level code", ())
 ERROR(property_wrapper_let, none,

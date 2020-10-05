@@ -20,6 +20,7 @@
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DebuggerClient.h"
 #include "swift/AST/ExistentialLayout.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/Initializer.h"
@@ -44,7 +45,6 @@ using namespace swift::namelookup;
 
 void VisibleDeclConsumer::anchor() {}
 void VectorDeclConsumer::anchor() {}
-void NamedDeclConsumer::anchor() {}
 
 ValueDecl *LookupResultEntry::getBaseDecl() const {
   if (BaseDC == nullptr)
@@ -286,11 +286,27 @@ static void recordShadowedDeclsAfterTypeMatch(
       return false;
     };
 
+    auto isPrivateImport = [&](ModuleDecl *module) {
+      auto file = dc->getParentSourceFile();
+      if (!file) return false;
+      for (const auto &import : file->getImports()) {
+        if (import.importOptions.contains(
+                SourceFile::ImportFlags::PrivateImport)
+            && import.module.importedModule == module
+            && import.module.accessPath.matches(name))
+          return true;
+      }
+      return false;
+    };
+
+    bool firstPrivate = isPrivateImport(firstModule);
+
     for (unsigned secondIdx : range(firstIdx + 1, decls.size())) {
       // Determine whether one module takes precedence over another.
       auto secondDecl = decls[secondIdx];
       auto secondModule = secondDecl->getModuleContext();
       bool secondTopLevel = secondDecl->getDeclContext()->isModuleScopeContext();
+      bool secondPrivate = isPrivateImport(secondModule);
 
       // For member types, we skip most of the below rules. Instead, we allow
       // member types defined in a subclass to shadow member types defined in
@@ -344,6 +360,18 @@ static void recordShadowedDeclsAfterTypeMatch(
           shadowed.insert(firstDecl);
           break;
         } else if (isShadowed(secondPaths)) {
+          shadowed.insert(secondDecl);
+          continue;
+        }
+
+        // If neither module shadows the other, but one was imported with
+        // '@_private import' in dc, we want to favor that module. This makes
+        // name lookup in this file behave more like name lookup in the file we
+        // imported from, avoiding headaches for source-transforming tools.
+        if (!firstPrivate && secondPrivate) {
+          shadowed.insert(firstDecl);
+          break;
+        } else if (firstPrivate && !secondPrivate) {
           shadowed.insert(secondDecl);
           continue;
         }
@@ -2262,12 +2290,33 @@ SuperclassDeclRequest::evaluate(Evaluator &evaluator,
                                   inheritedTypes, modulesFound, anyObject);
 
     // Look for a class declaration.
+    ClassDecl *superclass = nullptr;
     for (auto inheritedNominal : inheritedNominalTypes) {
-      if (auto classDecl = dyn_cast<ClassDecl>(inheritedNominal))
-        return classDecl;
+      if (auto classDecl = dyn_cast<ClassDecl>(inheritedNominal)) {
+        superclass = classDecl;
+        break;
+      }
+    }
+
+    // If we found a superclass, ensure that we don't have a circular
+    // inheritance hierarchy by evaluating its superclass. This forces the
+    // diagnostic at this point and then suppresses the superclass failure.
+    if (superclass) {
+      auto result = Ctx.evaluator(SuperclassDeclRequest{superclass});
+      bool hadCycle = false;
+      if (auto err = result.takeError()) {
+        llvm::handleAllErrors(std::move(err),
+          [&hadCycle](const CyclicalRequestError<SuperclassDeclRequest> &E) {
+          hadCycle = true;
+          });
+
+        if (hadCycle)
+          return nullptr;
+      }
+
+      return superclass;
     }
   }
-
 
   return nullptr;
 }

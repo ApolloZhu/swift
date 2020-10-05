@@ -1167,7 +1167,7 @@ void ImportResolver::addCrossImportableModules(ImportedModuleDesc importDesc) {
 
     // Add the module's re-exports to worklist.
     nextImport.importedModule->getImportedModules(
-        importsWorklist, ModuleDecl::ImportFilterKind::Public);
+        importsWorklist, ModuleDecl::ImportFilterKind::Exported);
   }
 }
 

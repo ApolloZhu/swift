@@ -768,7 +768,6 @@ ArrayRef<Decl *> IterableDeclContext::getSemanticMembers() const {
 void IterableDeclContext::addMember(Decl *member, Decl *Hint) {
   // Add the member to the list of declarations without notification.
   addMemberSilently(member, Hint);
-  ++MemberCount;
 
   // Notify our parent declaration that we have added the member, which can
   // be used to update the lookup tables.
@@ -845,12 +844,6 @@ bool IterableDeclContext::hasUnparsedMembers() const {
   }
 
   return true;
-}
-
-unsigned IterableDeclContext::getMemberCount() const {
-  if (hasUnparsedMembers())
-    loadAllMembers();
-  return MemberCount;
 }
 
 void IterableDeclContext::loadAllMembers() const {
@@ -940,7 +933,7 @@ bool IterableDeclContext::areTokensHashedForThisBodyInsteadOfInterfaceHash()
   // corresponding to the fingerprinted nominal dependency node.
   if (isa<ExtensionDecl>(this))
     return false;
-  return getASTContext().LangOpts.EnableTypeFingerprints;
+  return true;
 }
 
 /// Return the DeclContext to compare when checking private access in

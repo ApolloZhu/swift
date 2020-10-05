@@ -22,6 +22,7 @@
 #include "swift/AST/AnyFunctionRef.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/DiagnosticsSema.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/KnownProtocols.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/NameLookup.h"
@@ -497,7 +498,11 @@ void typeCheckDecl(Decl *D);
 
 void addImplicitDynamicAttribute(Decl *D);
 void checkDeclAttributes(Decl *D);
-void checkParameterAttributes(ParameterList *params);
+void checkParameterList(ParameterList *params);
+
+void diagnoseDuplicateBoundVars(Pattern *pattern);
+
+void diagnoseDuplicateCaptureVars(CaptureListExpr *expr);
 
 Type checkReferenceOwnershipAttr(VarDecl *D, Type interfaceType,
                                  ReferenceOwnershipAttr *attr);

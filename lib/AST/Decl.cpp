@@ -891,115 +891,6 @@ bool Decl::isWeakImported(ModuleDecl *fromModule) const {
   return !fromContext.isContainedIn(containingContext);
 }
 
-
-SourceRange RequirementRepr::getSourceRange() const {
-  if (getKind() == RequirementReprKind::LayoutConstraint)
-    return SourceRange(FirstType->getSourceRange().Start,
-                       SecondLayout.getSourceRange().End);
-  return SourceRange(FirstType->getSourceRange().Start,
-                     SecondType->getSourceRange().End);
-}
-
-GenericParamList::GenericParamList(SourceLoc LAngleLoc,
-                                   ArrayRef<GenericTypeParamDecl *> Params,
-                                   SourceLoc WhereLoc,
-                                   MutableArrayRef<RequirementRepr> Requirements,
-                                   SourceLoc RAngleLoc)
-  : Brackets(LAngleLoc, RAngleLoc), NumParams(Params.size()),
-    WhereLoc(WhereLoc), Requirements(Requirements),
-    OuterParameters(nullptr)
-{
-  std::uninitialized_copy(Params.begin(), Params.end(),
-                          getTrailingObjects<GenericTypeParamDecl *>());
-}
-
-GenericParamList *
-GenericParamList::create(ASTContext &Context,
-                         SourceLoc LAngleLoc,
-                         ArrayRef<GenericTypeParamDecl *> Params,
-                         SourceLoc RAngleLoc) {
-  unsigned Size = totalSizeToAlloc<GenericTypeParamDecl *>(Params.size());
-  void *Mem = Context.Allocate(Size, alignof(GenericParamList));
-  return new (Mem) GenericParamList(LAngleLoc, Params, SourceLoc(),
-                                    MutableArrayRef<RequirementRepr>(),
-                                    RAngleLoc);
-}
-
-GenericParamList *
-GenericParamList::create(const ASTContext &Context,
-                         SourceLoc LAngleLoc,
-                         ArrayRef<GenericTypeParamDecl *> Params,
-                         SourceLoc WhereLoc,
-                         ArrayRef<RequirementRepr> Requirements,
-                         SourceLoc RAngleLoc) {
-  unsigned Size = totalSizeToAlloc<GenericTypeParamDecl *>(Params.size());
-  void *Mem = Context.Allocate(Size, alignof(GenericParamList));
-  return new (Mem) GenericParamList(LAngleLoc, Params,
-                                    WhereLoc,
-                                    Context.AllocateCopy(Requirements),
-                                    RAngleLoc);
-}
-
-GenericParamList *
-GenericParamList::clone(DeclContext *dc) const {
-  auto &ctx = dc->getASTContext();
-  SmallVector<GenericTypeParamDecl *, 2> params;
-  for (auto param : getParams()) {
-    auto *newParam = new (ctx) GenericTypeParamDecl(
-      dc, param->getName(), SourceLoc(),
-      GenericTypeParamDecl::InvalidDepth,
-      param->getIndex());
-    newParam->setImplicit(true);
-    params.push_back(newParam);
-  }
-
-  return GenericParamList::create(ctx, SourceLoc(), params, SourceLoc());
-}
-
-void GenericParamList::setDepth(unsigned depth) {
-  for (auto param : *this)
-    param->setDepth(depth);
-}
-
-void GenericParamList::setDeclContext(DeclContext *dc) {
-  for (auto param : *this)
-    param->setDeclContext(dc);
-}
-
-GenericTypeParamDecl *GenericParamList::lookUpGenericParam(
-    Identifier name) const {
-  for (const auto *innerParams = this;
-       innerParams != nullptr;
-       innerParams = innerParams->getOuterParameters()) {
-    for (auto *paramDecl : *innerParams) {
-      if (name == paramDecl->getName()) {
-        return const_cast<GenericTypeParamDecl *>(paramDecl);
-      }
-    }
-  }
-
-  return nullptr;
-}
-
-TrailingWhereClause::TrailingWhereClause(
-                       SourceLoc whereLoc,
-                       ArrayRef<RequirementRepr> requirements)
-  : WhereLoc(whereLoc),
-    NumRequirements(requirements.size())
-{
-  std::uninitialized_copy(requirements.begin(), requirements.end(),
-                          getTrailingObjects<RequirementRepr>());
-}
-
-TrailingWhereClause *TrailingWhereClause::create(
-                       ASTContext &ctx,
-                       SourceLoc whereLoc,
-                       ArrayRef<RequirementRepr> requirements) {
-  unsigned size = totalSizeToAlloc<RequirementRepr>(requirements.size());
-  void *mem = ctx.Allocate(size, alignof(TrailingWhereClause));
-  return new (mem) TrailingWhereClause(whereLoc, requirements);
-}
-
 GenericContext::GenericContext(DeclContextKind Kind, DeclContext *Parent,
                                GenericParamList *Params)
     : _GenericContext(), DeclContext(Kind, Parent) {
@@ -1556,14 +1447,9 @@ void PatternBindingEntry::setInit(Expr *E) {
 VarDecl *PatternBindingEntry::getAnchoringVarDecl() const {
   SmallVector<VarDecl *, 8> variables;
   getPattern()->collectVariables(variables);
-  assert(!variables.empty());
+  if (variables.empty())
+    return nullptr;
   return variables[0];
-}
-
-unsigned PatternBindingEntry::getNumBoundVariables() const {
-  unsigned varCount = 0;
-  getPattern()->forEachVariable([&](VarDecl *) { ++varCount; });
-  return varCount;
 }
 
 SourceLoc PatternBindingEntry::getLastAccessorEndLoc() const {
@@ -4154,13 +4040,6 @@ void NominalTypeDecl::synthesizeSemanticMembersIfNeeded(DeclName member) {
   }
 }
 
-bool ClassDecl::hasCircularInheritance() const {
-  auto &ctx = getASTContext();
-  auto *mutableThis = const_cast<ClassDecl *>(this);
-  return evaluateOrDefault(ctx.evaluator,
-                           HasCircularInheritanceRequest{mutableThis}, true);
-}
-
 ClassDecl::ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
                      MutableArrayRef<TypeLoc> Inherited,
                      GenericParamList *GenericParams, DeclContext *Parent)
@@ -4282,7 +4161,7 @@ bool ClassDecl::isIncompatibleWithWeakReferences() const {
 
 bool ClassDecl::inheritsSuperclassInitializers() const {
   // If there's no superclass, there's nothing to inherit.
-  if (!getSuperclass())
+  if (!getSuperclassDecl())
     return false;
 
   auto &ctx = getASTContext();
@@ -4300,19 +4179,11 @@ AncestryOptions ClassDecl::checkAncestry() const {
 AncestryFlags
 ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
                                     ClassDecl *value) const {
-  llvm::SmallPtrSet<const ClassDecl *, 8> visited;
-
   AncestryOptions result;
   const ClassDecl *CD = value;
   auto *M = value->getParentModule();
 
   do {
-    // If we hit circularity, we will diagnose at some point in typeCheckDecl().
-    // However we have to explicitly guard against that here because we get
-    // called as part of the interface type request.
-    if (!visited.insert(CD).second)
-      break;
-
     if (CD->isGenericContext())
       result |= AncestryFlags::Generic;
 
@@ -4502,10 +4373,9 @@ ClassDecl::findImplementingMethod(const AbstractFunctionDecl *Method) const {
 bool ClassDecl::walkSuperclasses(
     llvm::function_ref<TypeWalker::Action(ClassDecl *)> fn) const {
 
-  SmallPtrSet<ClassDecl *, 8> seen;
   auto *cls = const_cast<ClassDecl *>(this);
 
-  while (cls && seen.insert(cls).second) {
+  while (cls) {
     switch (fn(cls)) {
     case TypeWalker::Action::Stop:
       return true;
@@ -4966,12 +4836,13 @@ ProtocolDecl::findProtocolSelfReferences(const ValueDecl *value,
     return ::findProtocolSelfReferences(this, type,
                                         skipAssocTypes);
   } else {
-    if (::findProtocolSelfReferences(this, type,
-                                     skipAssocTypes)) {
-      return SelfReferenceKind::Other();
-    }
-    return SelfReferenceKind::None();
+    assert(isa<VarDecl>(value));
+
+    return ::findProtocolSelfReferences(this, type,
+                                        skipAssocTypes);
   }
+
+  return SelfReferenceKind::None();
 }
 
 bool ProtocolDecl::isAvailableInExistential(const ValueDecl *decl) const {
@@ -5052,7 +4923,8 @@ void ProtocolDecl::computeKnownProtocolKind() const {
   auto module = getModuleContext();
   if (module != module->getASTContext().getStdlibModule() &&
       !module->getName().is("Foundation") &&
-      !module->getName().is("_Differentiation")) {
+      !module->getName().is("_Differentiation") &&
+      !module->getName().is("_Concurrency")) {
     const_cast<ProtocolDecl *>(this)->Bits.ProtocolDecl.KnownProtocol = 1;
     return;
   }
@@ -5098,6 +4970,8 @@ Optional<KnownDerivableProtocolKind>
     return KnownDerivableProtocolKind::AdditiveArithmetic;
   case KnownProtocolKind::Differentiable:
     return KnownDerivableProtocolKind::Differentiable;
+  case KnownProtocolKind::Actor:
+    return KnownDerivableProtocolKind::Actor;
   default: return None;
   }
 }
@@ -5468,8 +5342,8 @@ bool VarDecl::isSettable(const DeclContext *UseDC,
     // If this is a convenience initializer (i.e. one that calls
     // self.init), then let properties are never mutable in it.  They are
     // only mutable in designated initializers.
-    if (CD->getDelegatingOrChainedInitKind(nullptr) ==
-        ConstructorDecl::BodyInitKind::Delegating)
+    auto initKindAndExpr = CD->getDelegatingOrChainedInitKind();
+    if (initKindAndExpr.initKind == BodyInitKind::Delegating)
       return false;
 
     return true;
@@ -5960,6 +5834,17 @@ VarDecl *VarDecl::getPropertyWrapperBackingProperty() const {
 
 VarDecl *VarDecl::getPropertyWrapperProjectionVar() const {
   return getPropertyWrapperBackingPropertyInfo().projectionVar;
+}
+
+void VarDecl::visitAuxiliaryDecls(llvm::function_ref<void(VarDecl *)> visit) const {
+  if (getDeclContext()->isTypeContext())
+    return;
+
+  if (auto *backingVar = getPropertyWrapperBackingProperty())
+    visit(backingVar);
+
+  if (auto *projectionVar = getPropertyWrapperProjectionVar())
+    visit(projectionVar);
 }
 
 VarDecl *VarDecl::getLazyStorageProperty() const {
@@ -6797,6 +6682,17 @@ bool AbstractFunctionDecl::isAsyncHandler() const {
                            false);
 }
 
+bool AbstractFunctionDecl::canBeAsyncHandler() const {
+  auto func = dyn_cast<FuncDecl>(this);
+  if (!func)
+    return false;
+
+  auto mutableFunc = const_cast<FuncDecl *>(func);
+  return evaluateOrDefault(getASTContext().evaluator,
+                           CanBeAsyncHandlerRequest{mutableFunc},
+                           false);
+}
+
 BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
   if ((getBodyKind() == BodyKind::Synthesize ||
        getBodyKind() == BodyKind::Unparsed) &&
@@ -7499,6 +7395,56 @@ bool FuncDecl::isMainTypeMainMethod() const {
          getParameters()->size() == 0;
 }
 
+bool FuncDecl::isEnqueuePartialTaskName(ASTContext &ctx, DeclName name) {
+  if (name.isCompoundName() && name.getBaseName() == ctx.Id_enqueue) {
+    auto argumentNames = name.getArgumentNames();
+    return argumentNames.size() == 1 && argumentNames[0] == ctx.Id_partialTask;
+  }
+
+  return false;
+}
+
+bool FuncDecl::isActorEnqueuePartialTaskWitness() const {
+  if (!isEnqueuePartialTaskName(getASTContext(), getName()))
+    return false;
+
+  auto classDecl = getDeclContext()->getSelfClassDecl();
+  if (!classDecl)
+    return false;
+
+  if (!classDecl->isActor())
+    return false;
+
+  ASTContext &ctx = getASTContext();
+  auto actorProto = ctx.getProtocol(KnownProtocolKind::Actor);
+  if (!actorProto)
+    return false;
+
+  FuncDecl *requirement = nullptr;
+  for (auto protoMember : actorProto->getParsedMembers()) {
+    if (auto protoFunc = dyn_cast<FuncDecl>(protoMember)) {
+      if (isEnqueuePartialTaskName(ctx, protoFunc->getName())) {
+        requirement = protoFunc;
+        break;
+      }
+    }
+  }
+
+  if (!requirement)
+    return false;
+
+  SmallVector<ProtocolConformance *, 1> conformances;
+  classDecl->lookupConformance(
+      classDecl->getModuleContext(), actorProto, conformances);
+  for (auto conformance : conformances) {
+    auto witness = conformance->getWitnessDecl(requirement);
+    if (witness == this)
+      return true;
+  }
+
+  return false;
+}
+
 ConstructorDecl::ConstructorDecl(DeclName Name, SourceLoc ConstructorLoc,
                                  bool Failable, SourceLoc FailabilityLoc,
                                  bool Throws,
@@ -7516,7 +7462,6 @@ ConstructorDecl::ConstructorDecl(DeclName Name, SourceLoc ConstructorLoc,
   if (BodyParams)
     setParameters(BodyParams);
   
-  Bits.ConstructorDecl.ComputedBodyInitKind = 0;
   Bits.ConstructorDecl.HasStubImplementation = 0;
   Bits.ConstructorDecl.Failable = Failable;
 
@@ -7744,169 +7689,17 @@ CtorInitializerKind ConstructorDecl::getInitKind() const {
     CtorInitializerKind::Designated);
 }
 
-ConstructorDecl::BodyInitKind
-ConstructorDecl::getDelegatingOrChainedInitKind(DiagnosticEngine *diags,
-                                                ApplyExpr **init) const {
+BodyInitKindAndExpr
+ConstructorDecl::getDelegatingOrChainedInitKind() const {
+  return evaluateOrDefault(getASTContext().evaluator,
+    BodyInitKindRequest{const_cast<ConstructorDecl *>(this)},
+    BodyInitKindAndExpr());
   assert(hasBody() && "Constructor does not have a definition");
+}
 
-  if (init)
-    *init = nullptr;
-
-  // If we already computed the result, return it.
-  if (Bits.ConstructorDecl.ComputedBodyInitKind) {
-    auto Kind = static_cast<BodyInitKind>(
-        Bits.ConstructorDecl.ComputedBodyInitKind - 1);
-    assert((Kind == BodyInitKind::None || !init) &&
-           "can't return cached result with the init expr");
-    return Kind;
-  }
-
-
-  struct FindReferenceToInitializer : ASTWalker {
-    const ConstructorDecl *Decl;
-    BodyInitKind Kind = BodyInitKind::None;
-    ApplyExpr *InitExpr = nullptr;
-    DiagnosticEngine *Diags;
-
-    FindReferenceToInitializer(const ConstructorDecl *decl,
-                               DiagnosticEngine *diags)
-        : Decl(decl), Diags(diags) { }
-
-    bool walkToDeclPre(class Decl *D) override {
-      // Don't walk into further nominal decls.
-      return !isa<NominalTypeDecl>(D);
-    }
-    
-    std::pair<bool, Expr*> walkToExprPre(Expr *E) override {
-      // Don't walk into closures.
-      if (isa<ClosureExpr>(E))
-        return { false, E };
-      
-      // Look for calls of a constructor on self or super.
-      auto apply = dyn_cast<ApplyExpr>(E);
-      if (!apply)
-        return { true, E };
-
-      auto Callee = apply->getSemanticFn();
-      
-      Expr *arg;
-
-      if (isa<OtherConstructorDeclRefExpr>(Callee)) {
-        arg = apply->getArg();
-      } else if (auto *CRE = dyn_cast<ConstructorRefCallExpr>(Callee)) {
-        arg = CRE->getArg();
-      } else if (auto *dotExpr = dyn_cast<UnresolvedDotExpr>(Callee)) {
-        if (dotExpr->getName().getBaseName() != DeclBaseName::createConstructor())
-          return { true, E };
-
-        arg = dotExpr->getBase();
-      } else {
-        // Not a constructor call.
-        return { true, E };
-      }
-
-      // Look for a base of 'self' or 'super'.
-      BodyInitKind myKind;
-      if (arg->isSuperExpr())
-        myKind = BodyInitKind::Chained;
-      else if (arg->isSelfExprOf(Decl, /*sameBase*/true))
-        myKind = BodyInitKind::Delegating;
-      else {
-        // We're constructing something else.
-        return { true, E };
-      }
-      
-      if (Kind == BodyInitKind::None) {
-        Kind = myKind;
-
-        // If we're not emitting diagnostics, we're done.
-        if (!Diags)
-          return { false, nullptr };
-
-        InitExpr = apply;
-        return { true, E };
-      }
-
-      assert(Diags && "Failed to abort traversal early");
-
-      // If the kind changed, complain.
-      if (Kind != myKind) {
-        // The kind changed. Complain.
-        Diags->diagnose(E->getLoc(), diag::init_delegates_and_chains);
-        Diags->diagnose(InitExpr->getLoc(), diag::init_delegation_or_chain,
-                        Kind == BodyInitKind::Chained);
-      }
-
-      return { true, E };
-    }
-  };
-  
-  FindReferenceToInitializer finder(this, diags);
-  getBody()->walk(finder);
-
-  // get the kind out of the finder.
-  auto Kind = finder.Kind;
-
-  auto *NTD = getDeclContext()->getSelfNominalTypeDecl();
-
-  // Protocol extension and enum initializers are always delegating.
-  if (Kind == BodyInitKind::None) {
-    if (isa<ProtocolDecl>(NTD) || isa<EnumDecl>(NTD)) {
-      Kind = BodyInitKind::Delegating;
-    }
-  }
-
-  // Struct initializers that cannot see the layout of the struct type are
-  // always delegating. This occurs if the struct type is not fixed layout,
-  // and the constructor is either inlinable or defined in another module.
-  if (Kind == BodyInitKind::None && isa<StructDecl>(NTD)) {
-    // Note: This is specifically not using isFormallyResilient. We relax this
-    // rule for structs in non-resilient modules so that they can have inlinable
-    // constructors, as long as those constructors don't reference private
-    // declarations.
-    if (NTD->isResilient() &&
-        getResilienceExpansion() == ResilienceExpansion::Minimal) {
-      Kind = BodyInitKind::Delegating;
-
-    } else if (isa<ExtensionDecl>(getDeclContext())) {
-      const ModuleDecl *containingModule = getParentModule();
-      // Prior to Swift 5, cross-module initializers were permitted to be
-      // non-delegating. However, if the struct isn't fixed-layout, we have to
-      // be delegating because, well, we don't know the layout.
-      // A dynamic replacement is permitted to be non-delegating.
-      if (NTD->isResilient() ||
-          (containingModule->getASTContext().isSwiftVersionAtLeast(5) &&
-           !getAttrs().getAttribute<DynamicReplacementAttr>())) {
-        if (containingModule != NTD->getParentModule())
-          Kind = BodyInitKind::Delegating;
-      }
-    }
-  }
-
-  // If we didn't find any delegating or chained initializers, check whether
-  // the initializer was explicitly marked 'convenience'.
-  if (Kind == BodyInitKind::None && getAttrs().hasAttribute<ConvenienceAttr>())
-    Kind = BodyInitKind::Delegating;
-
-  // If we still don't know, check whether we have a class with a superclass: it
-  // gets an implicit chained initializer.
-  if (Kind == BodyInitKind::None) {
-    if (auto classDecl = getDeclContext()->getSelfClassDecl()) {
-      if (classDecl->hasSuperclass())
-        Kind = BodyInitKind::ImplicitChained;
-    }
-  }
-
-  // Cache the result if it is trustworthy.
-  if (diags) {
-    auto *mutableThis = const_cast<ConstructorDecl *>(this);
-    mutableThis->Bits.ConstructorDecl.ComputedBodyInitKind =
-        static_cast<unsigned>(Kind) + 1;
-    if (init)
-      *init = finder.InitExpr;
-  }
-
-  return Kind;
+void ConstructorDecl::clearCachedDelegatingOrChainedInitKind() {
+  getASTContext().evaluator.clearCachedOutput(
+    BodyInitKindRequest{const_cast<ConstructorDecl *>(this)});
 }
 
 SourceRange DestructorDecl::getSourceRange() const {
@@ -8244,27 +8037,4 @@ void swift::simple_display(llvm::raw_ostream &out, AnyFunctionRef fn) {
     simple_display(out, func);
   else
     out << "closure";
-}
-
-bool Decl::isPrivateToEnclosingFile() const {
-  if (auto *VD = dyn_cast<ValueDecl>(this))
-    return VD->getFormalAccess() <= AccessLevel::FilePrivate;
-  switch (getKind()) {
-  case DeclKind::Import:
-  case DeclKind::PatternBinding:
-  case DeclKind::EnumCase:
-  case DeclKind::TopLevelCode:
-  case DeclKind::IfConfig:
-  case DeclKind::PoundDiagnostic:
-    return true;
-
-  case DeclKind::Extension:
-  case DeclKind::InfixOperator:
-  case DeclKind::PrefixOperator:
-  case DeclKind::PostfixOperator:
-    return false;
-
-  default:
-    llvm_unreachable("everything else is a ValueDecl");
-  }
 }

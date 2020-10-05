@@ -853,29 +853,6 @@ UnresolvedDeclRefExpr *Parser::parseExprOperator() {
   return new (Context) UnresolvedDeclRefExpr(name, refKind, DeclNameLoc(loc));
 }
 
-static VarDecl *getImplicitSelfDeclForSuperContext(Parser &P,
-                                                   DeclContext *DC,
-                                                   SourceLoc Loc) {
-  auto *methodContext = DC->getInnermostMethodContext();
-  if (!methodContext) {
-    P.diagnose(Loc, diag::super_not_in_class_method);
-    return nullptr;
-  }
-
-  // Do an actual lookup for 'self' in case it shows up in a capture list.
-  auto *methodSelf = methodContext->getImplicitSelfDecl();
-  auto *lookupSelf = P.lookupInScope(DeclNameRef(P.Context.Id_self));
-  if (lookupSelf && lookupSelf != methodSelf) {
-    // FIXME: This is the wrong diagnostic for if someone manually declares a
-    // variable named 'self' using backticks.
-    P.diagnose(Loc, diag::super_in_closure_with_capture);
-    P.diagnose(lookupSelf->getLoc(), diag::super_in_closure_with_capture_here);
-    return nullptr;
-  }
-
-  return methodSelf;
-}
-
 /// parseExprSuper
 ///
 ///   expr-super:
@@ -903,12 +880,8 @@ ParserResult<Expr> Parser::parseExprSuper() {
     return nullptr;
   }
 
-  VarDecl *selfDecl =
-      getImplicitSelfDeclForSuperContext(*this, CurDeclContext, superLoc);
-  if (!selfDecl)
-    return makeParserResult(new (Context) ErrorExpr(superLoc));
-
-  return makeParserResult(new (Context) SuperRefExpr(selfDecl, superLoc,
+  return makeParserResult(new (Context) SuperRefExpr(/*selfDecl=*/nullptr,
+                                                     superLoc,
                                                      /*Implicit=*/false));
 }
 
@@ -2235,27 +2208,30 @@ Expr *Parser::parseExprIdentifier() {
   // lookups, so disable this check when parsing for SwiftSyntax.
   if (!InPoundIfEnvironment && !Context.LangOpts.ParseForSyntaxTreeOnly) {
     D = lookupInScope(name);
-    // FIXME: We want this to work: "var x = { x() }", but for now it's better
-    // to disallow it than to crash.
-    if (D) {
-      for (auto activeVar : DisabledVars) {
-        if (activeVar == D) {
-          diagnose(loc.getBaseNameLoc(), DisabledVarReason);
-          return new (Context) ErrorExpr(loc.getSourceRange());
+
+    if (!Context.LangOpts.DisableParserLookup) {
+      // FIXME: We want this to work: "var x = { x() }", but for now it's better
+      // to disallow it than to crash.
+      if (D) {
+        for (auto activeVar : DisabledVars) {
+          if (activeVar == D) {
+            diagnose(loc.getBaseNameLoc(), DisabledVarReason);
+            return new (Context) ErrorExpr(loc.getSourceRange());
+          }
         }
-      }
-    } else {
-      for (auto activeVar : DisabledVars) {
-        if (activeVar->getName() == name.getFullName()) {
-          diagnose(loc.getBaseNameLoc(), DisabledVarReason);
-          return new (Context) ErrorExpr(loc.getSourceRange());
+      } else {
+        for (auto activeVar : DisabledVars) {
+          if (activeVar->getName() == name.getFullName()) {
+            diagnose(loc.getBaseNameLoc(), DisabledVarReason);
+            return new (Context) ErrorExpr(loc.getSourceRange());
+          }
         }
       }
     }
   }
   
   Expr *E;
-  if (D == nullptr) {
+  if (D == nullptr || D->getAttrs().hasAttribute<CustomAttr>()) {
     if (name.getBaseName().isEditorPlaceholder()) {
       IDSyntaxContext.setCreateSyntax(SyntaxKind::EditorPlaceholderExpr);
       return parseExprEditorPlaceholder(IdentTok, name.getBaseIdentifier());

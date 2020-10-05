@@ -206,15 +206,6 @@ private:
   /// of date.
   bool EnableIncrementalBuild;
 
-  /// When true, emit duplicated compilation record file whose filename is
-  /// suffixed with '~moduleonly'.
-  ///
-  /// This compilation record is used by '-emit-module'-only incremental builds
-  /// so that module-only builds do not affect compilation record file for
-  /// normal builds, while module-only incremental builds are able to use
-  /// artifacts of normal builds if they are already up to date.
-  bool OutputCompilationRecordForModuleOnlyBuild = false;
-
   /// Indicates whether groups of parallel frontend jobs should be merged
   /// together and run in composite "batch jobs" when possible, to reduce
   /// redundant work.
@@ -274,9 +265,6 @@ public:
   const bool OnlyOneDependencyFile;
 
 private:
-  /// Is the parser recording token hashes for each type body?
-  const bool EnableTypeFingerprints;
-
   /// Helpful for debugging, but slows down the driver. So, only turn on when
   /// needed.
   const bool VerifyFineGrainedDependencyGraphAfterEveryImport;
@@ -284,11 +272,11 @@ private:
   /// needed.
   const bool EmitFineGrainedDependencyDotFileAfterEveryImport;
 
-  /// Experiment with intrafile dependencies
-  const bool FineGrainedDependenciesIncludeIntrafileOnes;
-
   /// Experiment with source-range-based dependencies
   const bool EnableSourceRangeDependencies;
+
+  /// (experimental) Enable cross-module incremental build scheduling.
+  const bool EnableCrossModuleIncrementalBuild;
 
 public:
   /// Will contain a comparator if an argument demands it.
@@ -313,7 +301,6 @@ public:
               std::unique_ptr<llvm::opt::DerivedArgList> TranslatedArgs,
               InputFileList InputsWithTypes,
               std::string CompilationRecordPath,
-              bool OutputCompilationRecordForModuleOnlyBuild,
               StringRef ArgsHash, llvm::sys::TimePoint<> StartTime,
               llvm::sys::TimePoint<> LastBuildTime,
               size_t FilelistThreshold,
@@ -326,14 +313,12 @@ public:
               bool ShowDriverTimeCompilation = false,
               std::unique_ptr<UnifiedStatsReporter> Stats = nullptr,
               bool OnlyOneDependencyFile = false,
-              bool EnableTypeFingerprints =
-                LangOptions().EnableTypeFingerprints,
               bool VerifyFineGrainedDependencyGraphAfterEveryImport = false,
               bool EmitFineGrainedDependencyDotFileAfterEveryImport = false,
-              bool FineGrainedDependenciesIncludeIntrafileOnes = false,
               bool EnableSourceRangeDependencies = false,
               bool CompareIncrementalSchemes = false,
-              StringRef CompareIncrementalSchemesPath = "");
+              StringRef CompareIncrementalSchemesPath = "",
+              bool EnableCrossModuleIncrementalBuild = false);
   // clang-format on
   ~Compilation();
 
@@ -392,18 +377,12 @@ public:
   }
   void disableIncrementalBuild(Twine why);
 
-  bool getEnableTypeFingerprints() const { return EnableTypeFingerprints; }
-
   bool getVerifyFineGrainedDependencyGraphAfterEveryImport() const {
     return VerifyFineGrainedDependencyGraphAfterEveryImport;
   }
 
   bool getEmitFineGrainedDependencyDotFileAfterEveryImport() const {
     return EmitFineGrainedDependencyDotFileAfterEveryImport;
-  }
-
-  bool getFineGrainedDependenciesIncludeIntrafileOnes() const {
-    return FineGrainedDependenciesIncludeIntrafileOnes;
   }
 
   bool getEnableSourceRangeDependencies() const {
@@ -437,6 +416,10 @@ public:
 
   bool getShowDriverTimeCompilation() const {
     return ShowDriverTimeCompilation;
+  }
+
+  bool getEnableCrossModuleIncrementalBuild() const {
+    return EnableCrossModuleIncrementalBuild;
   }
 
   size_t getFilelistThreshold() const {

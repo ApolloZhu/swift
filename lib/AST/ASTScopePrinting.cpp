@@ -19,6 +19,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
@@ -55,10 +56,6 @@ void ASTScopeImpl::dumpOneScopeMapLocation(
                << "***\n";
   auto *locScope = findInnermostEnclosingScope(loc, &llvm::errs());
   locScope->print(llvm::errs(), 0, false, false);
-
-  // Dump the AST context, too.
-  if (auto *dc = locScope->getDeclContext().getPtrOrNull())
-    dc->printContext(llvm::errs());
 
   namelookup::ASTScopeDeclGatherer gatherer;
   // Print the local bindings introduced by this scope.
@@ -185,10 +182,6 @@ void ConditionalClauseScope::printSpecifics(llvm::raw_ostream &out) const {
 }
 
 void SubscriptDeclScope::printSpecifics(llvm::raw_ostream &out) const {
-  decl->dumpRef(out);
-}
-
-void VarDeclScope::printSpecifics(llvm::raw_ostream &out) const {
   decl->dumpRef(out);
 }
 

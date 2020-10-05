@@ -187,12 +187,17 @@ void SILGenFunction::emitCaptures(SILLocation loc,
   // Partial applications take ownership of the context parameters, so we'll
   // need to pass ownership rather than merely guaranteeing parameters.
   bool canGuarantee;
+  bool captureCanEscape = true;
   switch (purpose) {
   case CaptureEmission::PartialApplication:
     canGuarantee = false;
     break;
   case CaptureEmission::ImmediateApplication:
     canGuarantee = true;
+    break;
+  case CaptureEmission::AssignByWrapper:
+    canGuarantee = false;
+    captureCanEscape = false;
     break;
   }
 
@@ -381,7 +386,8 @@ void SILGenFunction::emitCaptures(SILLocation loc,
         } else {
           capturedArgs.push_back(emitManagedRetain(loc, Entry.box));
         }
-        escapesToMark.push_back(entryValue);
+        if (captureCanEscape)
+          escapesToMark.push_back(entryValue);
       } else {
         // Address only 'let' values are passed by box.  This isn't great, in
         // that a variable captured by multiple closures will be boxed for each
@@ -696,12 +702,10 @@ void SILGenFunction::emitArtificialTopLevel(Decl *mainDecl) {
     };
     auto NSApplicationMainType = SILFunctionType::get(
         nullptr,
-        SILFunctionType::ExtInfoBuilder()
-            // Should be C calling convention, but NSApplicationMain
-            // has an overlay to fix the type of argv.
-            .withRepresentation(SILFunctionType::Representation::Thin)
-            .build(),
-        SILCoroutineKind::None, ParameterConvention::Direct_Unowned, argTypes,
+        // Should be C calling convention, but NSApplicationMain
+        // has an overlay to fix the type of argv.
+        SILFunctionType::ExtInfo::getThin(), SILCoroutineKind::None,
+        ParameterConvention::Direct_Unowned, argTypes,
         /*yields*/ {},
         SILResultInfo(argc->getType().getASTType(), ResultConvention::Unowned),
         /*error result*/ None, SubstitutionMap(), SubstitutionMap(),

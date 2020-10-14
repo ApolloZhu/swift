@@ -401,6 +401,11 @@ def require_explicit_availability_target : Separate<["-"], "require-explicit-ava
   HelpText<"Suggest fix-its adding @available(<target>, *) to public declarations without availability">,
   MetaVarName<"<target>">;
 
+def define_availability : Separate<["-"], "define-availability">,
+  Flags<[FrontendOption, NoInteractiveOption]>,
+  HelpText<"Define an availability macro in the format 'macroName : iOS 13.0, macOS 10.15'">,
+  MetaVarName<"<macro>">;
+
 def module_name : Separate<["-"], "module-name">,
   Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Name of the module to build">;
@@ -573,6 +578,7 @@ def experimental_cxx_stdlib :
 
 def enable_experimental_cross_module_incremental_build :
   Flag<["-"], "enable-experimental-cross-module-incremental-build">,
+  Flags<[FrontendOption]>,
   HelpText<"(experimental) Enable cross-module incremental build metadata and "
            "driver scheduling">;
 

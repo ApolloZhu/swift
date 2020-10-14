@@ -512,6 +512,9 @@ def enable_throw_without_try : Flag<["-"], "enable-throw-without-try">,
 def import_module : Separate<["-"], "import-module">,
   HelpText<"Implicitly import the specified module">;
 
+def testable_import_module : Separate<["-"], "testable-import-module">,
+  HelpText<"Implicitly import the specified module with @testable">;
+
 def print_stats : Flag<["-"], "print-stats">,
   HelpText<"Print various statistics">;
 
@@ -758,4 +761,8 @@ def candidate_module_file
 def use_static_resource_dir
   : Flag<["-"], "use-static-resource-dir">,
     HelpText<"Use resources in the static resource directory">;
+
+def disable_building_interface
+  : Flag<["-"], "disable-building-interface">,
+    HelpText<"Disallow building binary module from textual interface">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

@@ -1895,7 +1895,9 @@ bool ASTContext::canImportModule(ImportPath::Module ModuleName) {
   if (getLoadedModule(ModuleName) != nullptr)
     return true;
 
-  auto ModuleNameStr = ModuleName.str();
+  SmallString<64> FullModuleName;
+  ModuleName.getString(FullModuleName);
+  auto ModuleNameStr = FullModuleName.str();
   // If we've failed loading this module before, don't look for it again.
   if (FailedModuleImportNames.count(ModuleNameStr))
     return false;

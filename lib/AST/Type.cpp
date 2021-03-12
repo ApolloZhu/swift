@@ -76,7 +76,7 @@ Type QuerySubstitutionMap::operator()(SubstitutableType *type) const {
 }
 
 void TypeLoc::setType(Type Ty) {
-  assert(!Ty || !Ty->hasTypeVariable() || !Ty->hasHole());
+  assert(!Ty || !Ty->hasTypeVariable() || !Ty->hasPlaceholder());
   this->Ty = Ty;
 }
 
@@ -153,7 +153,9 @@ bool TypeBase::isAny() {
   return isEqual(getASTContext().TheAnyType);
 }
 
-bool TypeBase::isHole() { return getCanonicalType()->is<HoleType>(); }
+bool TypeBase::isPlaceholder() {
+  return getCanonicalType()->is<PlaceholderType>();
+}
 
 bool TypeBase::isAnyClassReferenceType() {
   return getCanonicalType().isAnyClassReferenceType();
@@ -208,6 +210,9 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::BuiltinIntegerLiteral:
   case TypeKind::BuiltinFloat:
   case TypeKind::BuiltinRawPointer:
+  case TypeKind::BuiltinRawUnsafeContinuation:
+  case TypeKind::BuiltinJob:
+  case TypeKind::BuiltinDefaultActorStorage:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
   case TypeKind::Tuple:
@@ -219,7 +224,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::LValue:
   case TypeKind::InOut:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
   case TypeKind::SILToken:
@@ -353,6 +358,46 @@ bool CanType::isTypeErasedGenericClassTypeImpl(CanType type) {
   return false;
 }
 
+bool TypeBase::isActorType() {
+  // Nominal types: check whether the declaration is an actor.
+  if (auto nominal = getAnyNominal())
+    return nominal->isActor();
+
+  // Archetypes check for conformance to Actor.
+  if (auto archetype = getAs<ArchetypeType>()) {
+    auto actorProto = getASTContext().getProtocol(KnownProtocolKind::Actor);
+    if (!actorProto)
+      return false;
+
+    auto interfaceType = archetype->getInterfaceType();
+    auto genericEnv = archetype->getGenericEnvironment();
+    return genericEnv->getGenericSignature()->requiresProtocol(
+        interfaceType, actorProto);
+  }
+
+  // Existential types: check for Actor protocol.
+  if (isExistentialType()) {
+    auto actorProto = getASTContext().getProtocol(KnownProtocolKind::Actor);
+    if (!actorProto)
+      return false;
+
+    auto layout = getExistentialLayout();
+    if (auto superclass = layout.getSuperclass()) {
+      if (superclass->isActorType())
+        return true;
+    }
+
+    for (auto proto : layout.getProtocols()) {
+      if (proto->isActorType())
+        return true;
+    }
+
+    return false;
+  }
+
+  return false;
+}
+
 bool TypeBase::isSpecialized() {
   Type t = getCanonicalType();
 
@@ -442,13 +487,13 @@ Type TypeBase::addCurriedSelfType(const DeclContext *dc) {
   return FunctionType::get({selfParam}, type);
 }
 
-void
-TypeBase::getTypeVariables(SmallVectorImpl<TypeVariableType *> &typeVariables) {
+void TypeBase::getTypeVariables(
+    SmallPtrSetImpl<TypeVariableType *> &typeVariables) {
   // If we know we don't have any type variables, we're done.
   if (hasTypeVariable()) {
     auto addTypeVariables = [&](Type type) -> bool {
       if (auto tv = dyn_cast<TypeVariableType>(type.getPointer())) {
-        typeVariables.push_back(tv);
+        typeVariables.insert(tv);
       }
 
       return false;
@@ -809,13 +854,15 @@ Type TypeBase::getWithoutParens() {
 Type TypeBase::replaceCovariantResultType(Type newResultType,
                                           unsigned uncurryLevel) {
   if (uncurryLevel == 0) {
-    if (auto objectType = getOptionalObjectType()) {
-      assert(!newResultType->getOptionalObjectType());
-      return OptionalType::get(
+    bool isLValue = is<LValueType>();
+
+    auto loadedTy = getWithoutSpecifierType();
+    if (auto objectType = loadedTy->getOptionalObjectType()) {
+      newResultType = OptionalType::get(
           objectType->replaceCovariantResultType(newResultType, uncurryLevel));
     }
 
-    return newResultType;
+    return isLValue ? LValueType::get(newResultType) : newResultType;
   }
 
   // Determine the input and result types of this function.
@@ -866,6 +913,7 @@ ParameterListInfo::ParameterListInfo(
     const ValueDecl *paramOwner,
     bool skipCurriedSelf) {
   defaultArguments.resize(params.size());
+  propertyWrappers.resize(params.size());
 
   // No parameter owner means no parameter list means no default arguments
   // - hand back the zeroed bitvector.
@@ -913,6 +961,10 @@ ParameterListInfo::ParameterListInfo(
     if (allowsUnlabeledTrailingClosureParameter(param)) {
       acceptsUnlabeledTrailingClosures.set(i);
     }
+
+    if (param->hasAttachedPropertyWrapper()) {
+      propertyWrappers[i] = param;
+    }
   }
 }
 
@@ -925,6 +977,11 @@ bool ParameterListInfo::acceptsUnlabeledTrailingClosureArgument(
     unsigned paramIdx) const {
   return paramIdx >= acceptsUnlabeledTrailingClosures.size() ||
       acceptsUnlabeledTrailingClosures[paramIdx];
+}
+
+const ParamDecl *
+ParameterListInfo::getPropertyWrapperParam(unsigned paramIdx) const {
+  return paramIdx < propertyWrappers.size() ? propertyWrappers[paramIdx] : nullptr;
 }
 
 /// Turn a param list into a symbolic and printable representation that does not
@@ -1148,7 +1205,7 @@ CanType TypeBase::computeCanonicalType() {
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
     llvm_unreachable("these types are always canonical");
 
 #define SUGARED_TYPE(id, parent) \
@@ -2005,7 +2062,7 @@ public:
       if (req.getKind() != RequirementKind::Conformance) continue;
 
       auto canTy = req.getFirstType()->getCanonicalType();
-      auto *proto = req.getSecondType()->castTo<ProtocolType>()->getDecl();
+      auto *proto = req.getProtocolDecl();
       auto origConf = origSubMap.lookupConformance(canTy, proto);
       auto substConf = substSubMap.lookupConformance(canTy, proto);
 
@@ -3397,11 +3454,9 @@ Type ProtocolCompositionType::get(const ASTContext &C,
   SmallVector<Type, 4> CanTypes;
   if (Superclass)
     CanTypes.push_back(Superclass->getCanonicalType());
-  std::transform(Protocols.begin(), Protocols.end(),
-                 std::back_inserter(CanTypes),
-                 [](ProtocolDecl *Proto) {
-                   return Proto->getDeclaredInterfaceType();
-                 });
+  llvm::transform(
+      Protocols, std::back_inserter(CanTypes),
+      [](ProtocolDecl *Proto) { return Proto->getDeclaredInterfaceType(); });
 
   // TODO: Canonicalize away HasExplicitAnyObject if it is implied
   // by one of our member protocols.
@@ -3424,6 +3479,16 @@ ClangTypeInfo AnyFunctionType::getCanonicalClangTypeInfo() const {
   return getClangTypeInfo().getCanonical();
 }
 
+bool AnyFunctionType::hasNonDerivableClangType() {
+  auto clangTypeInfo = getClangTypeInfo();
+  if (clangTypeInfo.empty())
+    return false;
+  auto computedClangType = getASTContext().getClangFunctionType(
+      getParams(), getResult(), getRepresentation());
+  assert(computedClangType && "Failed to compute Clang type.");
+  return clangTypeInfo != ClangTypeInfo(computedClangType);
+}
+
 bool AnyFunctionType::hasSameExtInfoAs(const AnyFunctionType *otherFn) {
   return getExtInfo().isEqualTo(otherFn->getExtInfo(), useClangTypes(this));
 }
@@ -3435,6 +3500,20 @@ ClangTypeInfo SILFunctionType::getClangTypeInfo() const {
   assert(!info->empty() &&
          "If the ClangTypeInfo was empty, we shouldn't have stored it.");
   return *info;
+}
+
+bool SILFunctionType::hasNonDerivableClangType() {
+  auto clangTypeInfo = getClangTypeInfo();
+  if (clangTypeInfo.empty())
+    return false;
+  auto results = getResults();
+  auto computedClangType =
+      getASTContext().getCanonicalClangFunctionType(
+          getParameters(),
+          results.empty() ? None : Optional<SILResultInfo>(results[0]),
+          getRepresentation());
+  assert(computedClangType && "Failed to compute Clang type.");
+  return clangTypeInfo != ClangTypeInfo(computedClangType);
 }
 
 bool SILFunctionType::hasSameExtInfoAs(const SILFunctionType *otherFn) {
@@ -3759,7 +3838,7 @@ static Type substType(Type derivedType,
     // we want to structurally substitute the substitutions.
     if (auto boxTy = dyn_cast<SILBoxType>(type)) {
       auto subMap = boxTy->getSubstitutions();
-      auto newSubMap = subMap.subst(substitutions, lookupConformances);
+      auto newSubMap = subMap.subst(substitutions, lookupConformances, options);
 
       return SILBoxType::get(boxTy->getASTContext(),
                              boxTy->getLayout(),
@@ -4248,7 +4327,7 @@ case TypeKind::Id:
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
   case TypeKind::GenericTypeParam:
   case TypeKind::SILToken:
   case TypeKind::Module:
@@ -4286,16 +4365,29 @@ case TypeKind::Id:
   }
 
   case TypeKind::SILBox: {
+    bool changed = false;
+    auto boxTy = cast<SILBoxType>(base);
 #ifndef NDEBUG
     // This interface isn't suitable for updating the substitution map in a
     // generic SILBox.
-    auto boxTy = cast<SILBoxType>(base);
     for (Type type : boxTy->getSubstitutions().getReplacementTypes()) {
       assert(type->isEqual(type.transformRec(fn))
-             && "SILBoxType can't be transformed");
+             && "SILBoxType substitutions can't be transformed");
     }
 #endif
-    return base;
+    SmallVector<SILField, 4> newFields;
+    auto *l = boxTy->getLayout();
+    for (auto f : l->getFields()) {
+      auto fieldTy = f.getLoweredType();
+      auto transformed = fieldTy.transformRec(fn)->getCanonicalType();
+      changed |= fieldTy != transformed;
+      newFields.push_back(SILField(transformed, f.isMutable()));
+    }
+    boxTy = SILBoxType::get(Ptr->getASTContext(),
+                            SILLayout::get(Ptr->getASTContext(),
+                                           l->getGenericSignature(), newFields),
+                            boxTy->getSubstitutions());
+    return boxTy;
   }
   
   case TypeKind::SILFunction: {
@@ -4901,7 +4993,7 @@ bool UnownedStorageType::isLoadable(ResilienceExpansion resilience) const {
 }
 
 static ReferenceCounting getClassReferenceCounting(ClassDecl *theClass) {
-  return (theClass->checkAncestry(AncestryFlags::ClangImported)
+  return (theClass->usesObjCObjectModel()
           ? ReferenceCounting::ObjC
           : ReferenceCounting::Native);
 }
@@ -4976,6 +5068,9 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::BuiltinIntegerLiteral:
   case TypeKind::BuiltinFloat:
   case TypeKind::BuiltinRawPointer:
+  case TypeKind::BuiltinRawUnsafeContinuation:
+  case TypeKind::BuiltinJob:
+  case TypeKind::BuiltinDefaultActorStorage:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
   case TypeKind::Tuple:
@@ -4987,7 +5082,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::LValue:
   case TypeKind::InOut:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
   case TypeKind::SILToken:
@@ -5082,6 +5177,11 @@ AnyFunctionType *AnyFunctionType::getWithoutDifferentiability() const {
   assert(isa<GenericFunctionType>(this));
   return GenericFunctionType::get(getOptGenericSignature(), newParams,
                                   getResult(), nonDiffExtInfo);
+}
+
+AnyFunctionType *AnyFunctionType::getWithoutThrowing() const {
+  auto info = getExtInfo().intoBuilder().withThrows(false).build();
+  return withExtInfo(info);
 }
 
 Optional<TangentSpace>

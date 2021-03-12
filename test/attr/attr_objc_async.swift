@@ -23,10 +23,10 @@ class MyClass {
   // expected-error@-1{{asynchronous method returning 'Self' cannot be '@objc'}}
 }
 
-// Actor class exporting Objective-C entry points.
+// actor exporting Objective-C entry points.
 
-// CHECK: class MyActor
-actor class MyActor {
+// CHECK: actor MyActor
+actor MyActor {
   // CHECK: @objc func doBigJob() async -> Int
   // CHECK-DUMP: func_decl{{.*}}doBigJob{{.*}}foreign_async=@convention(block) (Int) -> (),completion_handler_param=0
   @objc func doBigJob() async -> Int { return 0 }
@@ -34,18 +34,27 @@ actor class MyActor {
   // CHECK: @objc func doBigJobOrFail(_: Int) async throws -> (AnyObject, Int)
   // CHECK-DUMP: func_decl{{.*}}doBigJobOrFail{{.*}}foreign_async=@convention(block) (Optional<AnyObject>, Int, Optional<Error>) -> (),completion_handler_param=1,error_param=2
   @objc func doBigJobOrFail(_: Int) async throws -> (AnyObject, Int) { return (self, 0) }
+  // expected-warning@-1{{cannot call function returning non-concurrent-value type '(AnyObject, Int)' across actors}}
 
   // Actor-isolated entities cannot be exposed to Objective-C.
   @objc func synchronousBad() { } // expected-error{{actor-isolated instance method 'synchronousBad()' cannot be @objc}}
-  // expected-note@-1{{add 'async' to function 'synchronousBad()' to make it asynchronous}}
-  // expected-note@-2{{add '@asyncHandler' to function 'synchronousBad()' to create an implicit asynchronous context}}
+  // expected-note@-1{{add 'async' to function 'synchronousBad()' to make it asynchronous}} {{30-30= async}}
+  // expected-note@-2{{add '@asyncHandler' to function 'synchronousBad()' to create an implicit asynchronous context}} {{3-3=@asyncHandler }}
 
   @objc var badProp: AnyObject { self } // expected-error{{actor-isolated property 'badProp' cannot be @objc}}
   @objc subscript(index: Int) -> AnyObject { self } // expected-error{{actor-isolated subscript 'subscript(_:)' cannot be @objc}}
 
-  // CHECK: @objc @actorIndependent func synchronousGood()
-  @objc @actorIndependent func synchronousGood() { }
+  // CHECK: @objc nonisolated func synchronousGood()
+  @objc nonisolated func synchronousGood() { }
 }
 
-// CHECK: @objc actor class MyObjCActor
-@objc actor class MyObjCActor: NSObject { }
+// CHECK: actor class MyActor2
+actor class MyActor2 { }
+// expected-warning@-1{{'actor class' has been renamed to 'actor'}}{{7-13=}}
+
+// CHECK: @objc actor MyObjCActor
+@objc actor MyObjCActor: NSObject { }
+
+// CHECK: @objc actor class MyObjCActor2
+@objc actor class MyObjCActor2: NSObject {}
+// expected-warning@-1{{'actor class' has been renamed to 'actor'}}{{13-19=}}

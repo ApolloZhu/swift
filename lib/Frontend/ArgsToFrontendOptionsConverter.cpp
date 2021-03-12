@@ -77,6 +77,7 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.EnableTesting |= Args.hasArg(OPT_enable_testing);
   Opts.EnablePrivateImports |= Args.hasArg(OPT_enable_private_imports);
   Opts.EnableLibraryEvolution |= Args.hasArg(OPT_enable_library_evolution);
+  Opts.FrontendParseableOutput |= Args.hasArg(OPT_frontend_parseable_output);
 
   // FIXME: Remove this flag
   Opts.EnableLibraryEvolution |= Args.hasArg(OPT_enable_resilience);
@@ -88,12 +89,22 @@ bool ArgsToFrontendOptionsConverter::convert(
         IntermoduleDepTrackingMode::IncludeSystem;
   }
 
+  if (const Arg *A = Args.getLastArg(OPT_bad_file_descriptor_retry_count)) {
+    unsigned limit;
+    if (StringRef(A->getValue()).getAsInteger(10, limit)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+      return true;
+    }
+    Opts.BadFileDescriptorRetryCount = limit;
+  }
+
   Opts.DisableImplicitModules |= Args.hasArg(OPT_disable_implicit_swift_modules);
 
   Opts.ImportPrescan |= Args.hasArg(OPT_import_prescan);
 
-  Opts.EnableExperimentalCrossModuleIncrementalBuild |=
-      Args.hasArg(OPT_enable_experimental_cross_module_incremental_build);
+  Opts.DisableCrossModuleIncrementalBuild |=
+      Args.hasArg(OPT_disable_incremental_imports);
 
   // Always track system dependencies when scanning dependencies.
   if (const Arg *ModeArg = Args.getLastArg(OPT_modes_Group)) {
@@ -128,6 +139,8 @@ bool ArgsToFrontendOptionsConverter::convert(
     Opts.VerifyGenericSignaturesInModule = A->getValue();
   }
 
+  Opts.AllowModuleWithCompilerErrors |= Args.hasArg(OPT_experimental_allow_module_with_compiler_errors);
+
   computeDumpScopeMapLocations();
 
   Optional<FrontendInputsAndOutputs> inputsAndOutputs =
@@ -148,6 +161,8 @@ bool ArgsToFrontendOptionsConverter::convert(
   } else {
     HaveNewInputsAndOutputs = true;
     Opts.InputsAndOutputs = std::move(inputsAndOutputs).getValue();
+    if (Opts.AllowModuleWithCompilerErrors)
+      Opts.InputsAndOutputs.setShouldRecoverMissingInputs();
   }
 
   if (Args.hasArg(OPT_parse_sil) || Opts.InputsAndOutputs.shouldTreatAsSIL()) {
@@ -193,14 +208,20 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (checkUnusedSupplementaryOutputPaths())
     return true;
 
-  if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction)
-      && Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies)) {
+  if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction) &&
+      (Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies) ||
+       Args.hasArg(OPT_experimental_skip_all_function_bodies) ||
+       Args.hasArg(
+         OPT_experimental_skip_non_inlinable_function_bodies_without_types))) {
     Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_skipping_function_bodies);
     return true;
   }
 
   if (const Arg *A = Args.getLastArg(OPT_module_link_name))
     Opts.ModuleLinkName = A->getValue();
+
+  if (const Arg *A = Args.getLastArg(OPT_access_notes_path))
+    Opts.AccessNotesPath = A->getValue();
 
   if (const Arg *A = Args.getLastArg(OPT_serialize_debugging_options,
                                      OPT_no_serialize_debugging_options)) {
@@ -218,6 +239,12 @@ bool ArgsToFrontendOptionsConverter::convert(
   computeImplicitImportModuleNames(OPT_import_module, /*isTestable=*/false);
   computeImplicitImportModuleNames(OPT_testable_import_module, /*isTestable=*/true);
   computeLLVMArgs();
+
+  Opts.EmitSymbolGraph |= Args.hasArg(OPT_emit_symbol_graph);
+  
+  if (const Arg *A = Args.getLastArg(OPT_emit_symbol_graph_dir)) {
+    Opts.SymbolGraphOutputDir = A->getValue();
+  }
 
   return false;
 }
@@ -374,8 +401,6 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::EmitImportedModules;
   if (Opt.matches(OPT_scan_dependencies))
     return FrontendOptions::ActionType::ScanDependencies;
-  if (Opt.matches(OPT_scan_clang_dependencies))
-    return FrontendOptions::ActionType::ScanClangDependencies;
   if (Opt.matches(OPT_parse))
     return FrontendOptions::ActionType::Parse;
   if (Opt.matches(OPT_resolve_imports))
@@ -413,7 +438,8 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::CompileModuleFromInterface;
   if (Opt.matches(OPT_typecheck_module_from_interface))
     return FrontendOptions::ActionType::TypecheckModuleFromInterface;
-
+  if (Opt.matches(OPT_emit_supported_features))
+    return FrontendOptions::ActionType::PrintFeature;
   llvm_unreachable("Unhandled mode option");
 }
 
@@ -488,8 +514,8 @@ bool ArgsToFrontendOptionsConverter::computeFallbackModuleName() {
     return false;
   }
   Optional<std::vector<std::string>> outputFilenames =
-      OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(Args,
-                                                                       Diags);
+      OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(
+        Args, Diags, options::OPT_o, options::OPT_output_filelist);
 
   std::string nameToStem =
       outputFilenames && outputFilenames->size() == 1 &&
@@ -505,14 +531,17 @@ bool ArgsToFrontendOptionsConverter::computeFallbackModuleName() {
 bool ArgsToFrontendOptionsConverter::
     computeMainAndSupplementaryOutputFilenames() {
   std::vector<std::string> mainOutputs;
+  std::vector<std::string> mainOutputForIndexUnits;
   std::vector<SupplementaryOutputPaths> supplementaryOutputs;
   const bool hadError = ArgsToFrontendOutputsConverter(
                             Args, Opts.ModuleName, Opts.InputsAndOutputs, Diags)
-                            .convert(mainOutputs, supplementaryOutputs);
+                            .convert(mainOutputs, mainOutputForIndexUnits,
+                                     supplementaryOutputs);
   if (hadError)
     return true;
   Opts.InputsAndOutputs.setMainAndSupplementaryOutputs(mainOutputs,
-                                                       supplementaryOutputs);
+                                                       supplementaryOutputs,
+                                                       mainOutputForIndexUnits);
   return false;
 }
 
@@ -527,16 +556,6 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
       && Opts.InputsAndOutputs.hasReferenceDependenciesPath()) {
     Diags.diagnose(SourceLoc(),
                    diag::error_mode_cannot_emit_reference_dependencies);
-    return true;
-  }
-  if (!FrontendOptions::canActionEmitSwiftRanges(Opts.RequestedAction) &&
-      Opts.InputsAndOutputs.hasSwiftRangesPath()) {
-    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_swift_ranges);
-    return true;
-  }
-  if (!FrontendOptions::canActionEmitCompiledSource(Opts.RequestedAction) &&
-      Opts.InputsAndOutputs.hasCompiledSourcePath()) {
-    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_compiled_source);
     return true;
   }
   if (!FrontendOptions::canActionEmitObjCHeader(Opts.RequestedAction) &&
@@ -575,6 +594,11 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
   if (!FrontendOptions::canActionEmitModuleSummary(Opts.RequestedAction) &&
       Opts.InputsAndOutputs.hasModuleSummaryOutputPath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_module_summary);
+    return true;
+  }
+  if (!FrontendOptions::canActionEmitModule(Opts.RequestedAction) &&
+      !Opts.SymbolGraphOutputDir.empty()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_symbol_graph);
     return true;
   }
   return false;

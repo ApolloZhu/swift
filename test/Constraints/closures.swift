@@ -168,7 +168,7 @@ func SR3671() {
   ;
 
   // Also a valid call (!!)
-  { $0 { $0 } } { $0 { 1 } }  // expected-error {{expression resolves to an unused function}}
+  { $0 { $0 } } { $0 { 1 } }  // expected-error {{function is unused}}
   consume(111)
 }
 
@@ -345,7 +345,7 @@ var afterMessageCount : Int?
 func uintFunc() -> UInt {}
 func takeVoidVoidFn(_ a : () -> ()) {}
 takeVoidVoidFn { () -> Void in
-  afterMessageCount = uintFunc()  // expected-error {{cannot assign value of type 'UInt' to type 'Int'}}
+  afterMessageCount = uintFunc()  // expected-error {{cannot assign value of type 'UInt' to type 'Int?'}} {{23-23=Int(}} {{33-33=)}}
 }
 
 // <rdar://problem/19997471> Swift: Incorrect compile error when calling a function inside a closure
@@ -475,7 +475,8 @@ func g_2994(arg: Int) -> Double {
 C_2994<S_2994>(arg: { (r: S_2994) in f_2994(arg: g_2994(arg: r.dataOffset)) }) // expected-error {{cannot convert value of type 'Double' to expected argument type 'String'}}
 
 let _ = { $0[$1] }(1, 1) // expected-error {{value of type 'Int' has no subscripts}}
-let _ = { $0 = ($0 = {}) } // expected-error {{assigning a variable to itself}}
+// FIXME: Better diagnostic here would be `assigning a variable to itself` but binding ordering change exposed a but in diagnostics
+let _ = { $0 = ($0 = {}) } // expected-error {{function produces expected type '()'; did you mean to call it with '()'?}}
 let _ = { $0 = $0 = 42 } // expected-error {{assigning a variable to itself}}
 
 // https://bugs.swift.org/browse/SR-403
@@ -907,7 +908,7 @@ do {
 // The funny error is because we infer the type of badResult as () -> ()
 // via the 'T -> U => T -> ()' implicit conversion.
 let badResult = { (fn: () -> ()) in fn }
-// expected-error@-1 {{expression resolves to an unused function}}
+// expected-error@-1 {{function is unused}}
 
 // rdar://problem/55102498 - closure's result type can't be inferred if the last parameter has a default value
 func test_trailing_closure_with_defaulted_last() {
@@ -1042,3 +1043,37 @@ let explicitUnboundResult2: (Array<Bool>) -> Array<Int> = {
 let explicitUnboundResult3: (Array<Bool>) -> Array<Int> = {
   (arr: Array) -> Array in [true]
 }
+
+// rdar://problem/71525503 - Assertion failed: (!shouldHaveDirectCalleeOverload(call) && "Should we have resolved a callee for this?")
+func test_inout_with_invalid_member_ref() {
+  struct S {
+    static func createS(_ arg: inout Int) -> S { S() }
+  }
+  class C {
+    static subscript(s: (Int) -> Void) -> Bool { get { return false } }
+  }
+
+  let _: Bool = C[{ .createS(&$0) }]
+  // expected-error@-1 {{value of tuple type 'Void' has no member 'createS'}}
+  // expected-error@-2 {{cannot pass immutable value as inout argument: '$0' is immutable}}
+}
+
+// rdar://problem/74435602 - failure to infer a type for @autoclosure parameter.
+func rdar_74435602(error: Error?) {
+  func accepts_autoclosure<T>(_ expression: @autoclosure () throws -> T) {}
+
+  accepts_autoclosure({
+    if let failure = error {
+      throw failure
+    }
+  })
+}
+
+// SR-14280
+let _: (@convention(block) () -> Void)? = Bool.random() ? nil : {} // OK
+let _: (@convention(thin) () -> Void)? = Bool.random() ? nil : {} // OK
+let _: (@convention(c) () -> Void)? = Bool.random() ? nil : {} // OK on type checking, diagnostics are deffered to SIL
+
+let _: (@convention(block) () -> Void)? = Bool.random() ? {} : {} // OK
+let _: (@convention(thin) () -> Void)? = Bool.random() ? {} : {} // OK
+let _: (@convention(c) () -> Void)? = Bool.random() ? {} : {} // OK on type checking, diagnostics are deffered to SIL

@@ -50,7 +50,7 @@ static bool canInlineBeginApply(BeginApplyInst *BA) {
   // potentially after the resumption site when there are un-mergeable
   // values alive across it.
   bool hasYield = false;
-  for (auto &B : BA->getReferencedFunctionOrNull()->getBlocks()) {
+  for (auto &B : *BA->getReferencedFunctionOrNull()) {
     if (isa<YieldInst>(B.getTerminator())) {
       if (hasYield) return false;
       hasYield = true;
@@ -314,8 +314,7 @@ protected:
     // of the input location.
     return Loc.hasValue()
                ? Loc.getValue()
-               : MandatoryInlinedLocation::getMandatoryInlinedLocation(
-                     (Decl *)nullptr);
+               : MandatoryInlinedLocation();
   }
 
   const SILDebugScope *remapScope(const SILDebugScope *DS) {
@@ -374,7 +373,7 @@ SILInlineCloner::SILInlineCloner(
     SILOpenedArchetypesTracker &openedArchetypesTracker,
     SILInliner::DeletionFuncTy deletionCallback)
     : SuperTy(*apply.getFunction(), *calleeFunction, applySubs,
-              openedArchetypesTracker, /*Inlining=*/true),
+              openedArchetypesTracker, /*DT=*/nullptr, /*Inlining=*/true),
       FuncBuilder(funcBuilder), IKind(inlineKind), Apply(apply),
       DeletionCallback(deletionCallback) {
 
@@ -392,10 +391,10 @@ SILInlineCloner::SILInlineCloner(
   // Compute the SILLocation which should be used by all the inlined
   // instructions.
   if (IKind == InlineKind::PerformanceInline)
-    Loc = InlinedLocation::getInlinedLocation(apply.getLoc());
+    Loc = InlinedLocation(apply.getLoc());
   else {
     assert(IKind == InlineKind::MandatoryInline && "Unknown InlineKind.");
-    Loc = MandatoryInlinedLocation::getMandatoryInlinedLocation(apply.getLoc());
+    Loc = MandatoryInlinedLocation(apply.getLoc());
   }
 
   auto applyScope = apply.getDebugScope();
@@ -467,7 +466,7 @@ SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
 
     // Create an argument on the return-to BB representing the returned value.
     auto *retArg =
-        ReturnToBB->createPhiArgument(AI->getType(), ValueOwnershipKind::Owned);
+        ReturnToBB->createPhiArgument(AI->getType(), OwnershipKind::Owned);
     // Replace all uses of the ApplyInst with the new argument.
     AI->replaceAllUsesWith(retArg);
     break;
@@ -598,8 +597,8 @@ void SILInlineCloner::fixUp(SILFunction *calleeFunction) {
 
 SILValue SILInlineCloner::borrowFunctionArgument(SILValue callArg,
                                                  FullApplySite AI) {
-  if (!AI.getFunction()->hasOwnership()
-      || callArg.getOwnershipKind() != ValueOwnershipKind::Owned) {
+  if (!AI.getFunction()->hasOwnership() ||
+      callArg.getOwnershipKind() != OwnershipKind::Owned) {
     return SILValue();
   }
 
@@ -688,6 +687,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::BaseAddrForOffsetInst:
   case SILInstructionKind::EndLifetimeInst:
   case SILInstructionKind::UncheckedOwnershipConversionInst:
+  case SILInstructionKind::BindMemoryInst:
     return InlineCost::Free;
 
   // Typed GEPs are free.
@@ -789,6 +789,11 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::GetAsyncContinuationInst:
     return InlineCost::Free;
 
+  // Unconditional branch is free in empty blocks.
+  case SILInstructionKind::BranchInst:
+    return (I.getIterator() == I.getParent()->begin())
+      ? InlineCost::Free : InlineCost::Expensive;
+
   case SILInstructionKind::AbortApplyInst:
   case SILInstructionKind::ApplyInst:
   case SILInstructionKind::TryApplyInst:
@@ -798,13 +803,11 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::AllocRefDynamicInst:
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::AllocValueBufferInst:
-  case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::BeginApplyInst:
   case SILInstructionKind::ValueMetatypeInst:
   case SILInstructionKind::WitnessMethodInst:
   case SILInstructionKind::AssignInst:
   case SILInstructionKind::AssignByWrapperInst:
-  case SILInstructionKind::BranchInst:
   case SILInstructionKind::CheckedCastBranchInst:
   case SILInstructionKind::CheckedCastValueBranchInst:
   case SILInstructionKind::CheckedCastAddrBranchInst:
@@ -891,6 +894,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::LinearFunctionExtractInst:
   case SILInstructionKind::DifferentiabilityWitnessFunctionInst:
   case SILInstructionKind::AwaitAsyncContinuationInst:
+  case SILInstructionKind::HopToExecutorInst:
 #define COMMON_ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name)          \
   case SILInstructionKind::Name##ToRefInst:                                    \
   case SILInstructionKind::RefTo##Name##Inst:                                  \

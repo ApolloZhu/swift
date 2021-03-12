@@ -16,12 +16,14 @@ import SwiftPrivateThreadExtras
 import SwiftPrivateLibcExtras
 
 #if canImport(Darwin)
+#if _runtime(_ObjC)
 import Foundation
+#endif
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #elseif os(Windows)
-import MSVCRT
+import CRT
 import WinSDK
 #endif
 
@@ -1729,9 +1731,19 @@ public final class TestSuite {
 }
 
 #if canImport(Darwin)
+#if _runtime(_ObjC)
 func _getSystemVersionPlistProperty(_ propertyName: String) -> String? {
   return NSDictionary(contentsOfFile: "/System/Library/CoreServices/SystemVersion.plist")?[propertyName] as? String
 }
+#else
+func _getSystemVersionPlistProperty(_ propertyName: String) -> String? {
+  var count = 0
+  sysctlbyname("kern.osproductversion", nil, &count, nil, 0)
+  var s = [CChar](repeating: 0, count: count)
+  sysctlbyname("kern.osproductversion", &s, &count, nil, 0)
+  return String(cString: &s)
+}
+#endif
 #endif
 
 public enum OSVersion : CustomStringConvertible {
@@ -3022,15 +3034,15 @@ struct Pair<T : Comparable> : Comparable {
 
   var first: T
   var second: T
-}
 
-func == <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
-  return lhs.first == rhs.first && lhs.second == rhs.second
-}
+  static func == <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
+    return lhs.first == rhs.first && lhs.second == rhs.second
+  }
 
-func < <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
-  return [lhs.first, lhs.second].lexicographicallyPrecedes(
-    [rhs.first, rhs.second])
+  static func < <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
+    return [lhs.first, lhs.second].lexicographicallyPrecedes(
+      [rhs.first, rhs.second])
+  }
 }
 
 public func expectEqualsUnordered<

@@ -176,6 +176,21 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define SWIFT_INDIRECT_RESULT
 #endif
 
+#if __has_attribute(swift_async_context)
+#define SWIFT_ASYNC_CONTEXT __attribute__((swift_async_context))
+#else
+#define SWIFT_ASYNC_CONTEXT
+#endif
+
+// SWIFT_CC(swiftasync) is the Swift async calling convention.
+// We assume that it supports mandatory tail call elimination.
+#if __has_feature(swiftasynccc) && USE_SWIFT_ASYNC_LOWERING && \
+    __has_attribute(swiftasynccall)
+#define SWIFT_CC_swiftasync __attribute__((swiftasynccall))
+#else
+#define SWIFT_CC_swiftasync SWIFT_CC_swift
+#endif
+
 // SWIFT_CC(PreserveMost) is used in the runtime implementation to prevent
 // register spills on the hot path.
 // It is not safe to use for external calls; the loader's lazy function
@@ -209,6 +224,30 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define __ptrauth_swift_dynamic_replacement_key                                \
   __ptrauth(ptrauth_key_process_independent_data, 1,                           \
             SpecialPointerAuthDiscriminators::DynamicReplacementKey)
+#define __ptrauth_swift_job_invoke_function                                    \
+  __ptrauth(ptrauth_key_function_pointer, 1,                                   \
+            SpecialPointerAuthDiscriminators::JobInvokeFunction)
+#define __ptrauth_swift_task_resume_function                                   \
+  __ptrauth(ptrauth_key_function_pointer, 1,                                   \
+            SpecialPointerAuthDiscriminators::TaskResumeFunction)
+#define __ptrauth_swift_task_resume_context                                    \
+  __ptrauth(ptrauth_key_process_independent_data, 1,                           \
+            SpecialPointerAuthDiscriminators::TaskResumeContext)
+#define __ptrauth_swift_async_context_parent                                   \
+  __ptrauth(ptrauth_key_process_independent_data, 1,                           \
+            SpecialPointerAuthDiscriminators::AsyncContextParent)
+#define __ptrauth_swift_async_context_resume                                   \
+  __ptrauth(ptrauth_key_function_pointer, 1,                                   \
+            SpecialPointerAuthDiscriminators::AsyncContextResume)
+#define __ptrauth_swift_async_context_yield                                    \
+  __ptrauth(ptrauth_key_function_pointer, 1,                                   \
+            SpecialPointerAuthDiscriminators::AsyncContextYield)
+#define __ptrauth_swift_cancellation_notification_function                     \
+  __ptrauth(ptrauth_key_function_pointer, 1,                                   \
+            SpecialPointerAuthDiscriminators::CancellationNotificationFunction)
+#define __ptrauth_swift_escalation_notification_function                       \
+  __ptrauth(ptrauth_key_function_pointer, 1,                                   \
+            SpecialPointerAuthDiscriminators::EscalationNotificationFunction)
 #define swift_ptrauth_sign_opaque_read_resume_function(__fn, __buffer)         \
   ptrauth_auth_and_resign(__fn, ptrauth_key_function_pointer, 0,               \
                           ptrauth_key_process_independent_code,                \
@@ -226,6 +265,14 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define __ptrauth_swift_protocol_witness_function_pointer(__declkey)
 #define __ptrauth_swift_value_witness_function_pointer(__key)
 #define __ptrauth_swift_type_metadata_instantiation_function
+#define __ptrauth_swift_job_invoke_function
+#define __ptrauth_swift_task_resume_function
+#define __ptrauth_swift_task_resume_context
+#define __ptrauth_swift_async_context_parent
+#define __ptrauth_swift_async_context_resume
+#define __ptrauth_swift_async_context_yield
+#define __ptrauth_swift_cancellation_notification_function
+#define __ptrauth_swift_escalation_notification_function
 #define __ptrauth_swift_runtime_function_entry
 #define __ptrauth_swift_runtime_function_entry_with_key(__key)
 #define __ptrauth_swift_runtime_function_entry_strip(__fn) (__fn)
@@ -276,6 +323,17 @@ static inline T swift_auth_data_non_address(T value, unsigned extra) {
   return (T)ptrauth_auth_data((void *)value,
                                ptrauth_key_process_independent_data,
                                extra);
+#else
+  return value;
+#endif
+}
+
+template <typename T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE static inline T
+swift_auth_code(T value, unsigned extra) {
+#if SWIFT_PTRAUTH
+  return (T)ptrauth_auth_function((void *)value,
+                                  ptrauth_key_process_independent_code, extra);
 #else
   return value;
 #endif

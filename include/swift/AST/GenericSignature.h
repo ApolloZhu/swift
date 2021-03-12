@@ -21,7 +21,6 @@
 #include "swift/AST/Requirement.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
-#include "swift/Basic/AnyValue.h"
 #include "swift/Basic/Debug.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FoldingSet.h"
@@ -234,13 +233,6 @@ class alignas(1 << TypeAlignInBits) GenericSignatureImpl final
   // the interface's invariants.
   mutable llvm::PointerUnion<const GenericSignatureImpl *, ASTContext *>
     CanonicalSignatureOrASTContext;
-
-  void buildConformanceAccessPath(
-      SmallVectorImpl<ConformanceAccessPath::Entry> &path,
-      ArrayRef<Requirement> reqs,
-      const void /*GenericSignatureBuilder::RequirementSource*/ *source,
-      ProtocolDecl *conformingProto, Type rootType,
-      ProtocolDecl *requirementSignatureProto) const;
 
   friend class ArchetypeType;
 

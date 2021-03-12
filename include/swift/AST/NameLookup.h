@@ -227,7 +227,7 @@ enum class UnqualifiedLookupFlags {
   IncludeOuterResults   = 1 << 4,
   // This lookup should include results that are @inlinable or
   // @usableFromInline.
-  IncludeInlineableAndUsableFromInline = 1 << 5,
+  IncludeUsableFromInline = 1 << 5,
 };
 
 using UnqualifiedLookupOptions = OptionSet<UnqualifiedLookupFlags>;
@@ -412,6 +412,23 @@ public:
 
   void foundDecl(ValueDecl *D, DeclVisibilityKind reason,
                  DynamicLookupInfo dynamicLookupInfo = {}) override;
+};
+
+/// Filters out decls that are not usable based on their source location, eg.
+/// a decl inside its own initializer or a non-type decl before its definition.
+class UsableFilteringDeclConsumer final : public VisibleDeclConsumer {
+  const SourceManager &SM;
+  const DeclContext *DC;
+  SourceLoc Loc;
+  VisibleDeclConsumer &ChainedConsumer;
+
+public:
+  UsableFilteringDeclConsumer(const SourceManager &SM, const DeclContext *DC,
+                              SourceLoc loc, VisibleDeclConsumer &consumer)
+      : SM(SM), DC(DC), Loc(loc), ChainedConsumer(consumer) {}
+
+  void foundDecl(ValueDecl *D, DeclVisibilityKind reason,
+                 DynamicLookupInfo dynamicLookupInfo) override;
 };
 
 /// Remove any declarations in the given set that were overridden by

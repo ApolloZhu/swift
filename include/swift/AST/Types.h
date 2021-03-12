@@ -67,6 +67,7 @@ class Identifier;
 class InOutType;
 class OpaqueTypeDecl;
 class OpenedArchetypeType;
+class PlaceholderTypeRepr;
 enum class ReferenceCounting : uint8_t;
 enum class ResilienceExpansion : unsigned;
 class SILModule;
@@ -75,10 +76,12 @@ class TypeAliasDecl;
 class TypeDecl;
 class NominalTypeDecl;
 class GenericTypeDecl;
+enum class EffectKind : uint8_t;
 class EnumDecl;
 class EnumElementDecl;
 class SILFunctionType;
 class StructDecl;
+class ParamDecl;
 class ProtocolDecl;
 class TypeVariableType;
 class ValueDecl;
@@ -126,7 +129,7 @@ public:
 
     /// This type expression contains an UnresolvedType.
     HasUnresolvedType    = 0x08,
-    
+
     /// Whether this type expression contains an unbound generic type.
     HasUnboundGeneric    = 0x10,
 
@@ -145,14 +148,14 @@ public:
 
     /// This type contains a DependentMemberType.
     HasDependentMember   = 0x200,
-    
+
     /// This type contains an OpaqueTypeArchetype.
     HasOpaqueArchetype   = 0x400,
 
-    /// This type contains a type hole.
-    HasTypeHole          = 0x800,
+    /// This type contains a type placeholder.
+    HasPlaceholder       = 0x800,
 
-    Last_Property = HasTypeHole
+    Last_Property = HasPlaceholder
   };
   enum { BitWidth = countBitsUsed(Property::Last_Property) };
 
@@ -207,9 +210,8 @@ public:
   /// generic type?
   bool hasUnboundGeneric() const { return Bits & HasUnboundGeneric; }
 
-  /// Does a type with these properties structurally contain a
-  /// type hole?
-  bool hasTypeHole() const { return Bits & HasTypeHole; }
+  /// Does a type with these properties structurally contain a placeholder?
+  bool hasPlaceholder() const { return Bits & HasPlaceholder; }
 
   /// Returns the set of properties present in either set.
   friend RecursiveTypeProperties operator|(Property lhs, Property rhs) {
@@ -315,8 +317,8 @@ class alignas(1 << TypeAlignInBits) TypeBase {
   }
 
 protected:
-  enum { NumAFTExtInfoBits = 9 };
-  enum { NumSILExtInfoBits = 9 };
+  enum { NumAFTExtInfoBits = 11 };
+  enum { NumSILExtInfoBits = 11 };
   union { uint64_t OpaqueBits;
 
   SWIFT_INLINE_BITFIELD_BASE(TypeBase, bitmax(NumTypeKindBits,8) +
@@ -546,7 +548,7 @@ public:
   /// Is this the 'Any' type?
   bool isAny();
 
-  bool isHole();
+  bool isPlaceholder();
 
   /// Does the type have outer parenthesis?
   bool hasParenSugar() const { return getKind() == TypeKind::Paren; }
@@ -580,8 +582,10 @@ public:
     return getRecursiveProperties().hasUnresolvedType();
   }
 
-  /// Determine whether this type involves a hole.
-  bool hasHole() const { return getRecursiveProperties().hasTypeHole(); }
+  /// Determine whether this type involves a \c PlaceholderType.
+  bool hasPlaceholder() const {
+    return getRecursiveProperties().hasPlaceholder();
+  }
 
   /// Determine whether the type involves a context-dependent archetype.
   bool hasArchetype() const {
@@ -632,7 +636,7 @@ public:
   ///
   /// \param typeVariables This vector is populated with the set of
   /// type variables referenced by this type.
-  void getTypeVariables(SmallVectorImpl<TypeVariableType *> &typeVariables);
+  void getTypeVariables(SmallPtrSetImpl<TypeVariableType *> &typeVariables);
 
   /// Determine whether this type is a type parameter, which is either a
   /// GenericTypeParamType or a DependentMemberType.
@@ -726,6 +730,9 @@ public:
 
   /// Break an existential down into a set of constraints.
   ExistentialLayout getExistentialLayout();
+
+  /// Determines whether this type is an actor type.
+  bool isActorType();
 
   /// Determines the element type of a known
   /// [Autoreleasing]Unsafe[Mutable][Raw]Pointer variant, or returns null if the
@@ -1390,6 +1397,51 @@ public:
   }
 };
 DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinRawPointerType, BuiltinType);
+
+/// BuiltinRawContinuationType - The builtin raw unsafe continuation type.
+/// In C, this is a non-null AsyncTask*.  This pointer is completely
+/// unmanaged (the unresumed task is self-owning), but has more spare bits
+/// than Builtin.RawPointer.
+class BuiltinRawUnsafeContinuationType : public BuiltinType {
+  friend class ASTContext;
+  BuiltinRawUnsafeContinuationType(const ASTContext &C)
+    : BuiltinType(TypeKind::BuiltinRawUnsafeContinuation, C) {}
+public:
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::BuiltinRawUnsafeContinuation;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinRawUnsafeContinuationType, BuiltinType);
+
+/// BuiltinJobType - The builtin job type.  In C, this is a
+/// non-null Job*.  This pointer is completely unmanaged (the unscheduled
+/// job is self-owning), but has more spare bits than Builtin.RawPointer.
+class BuiltinJobType : public BuiltinType {
+  friend class ASTContext;
+  BuiltinJobType(const ASTContext &C)
+    : BuiltinType(TypeKind::BuiltinJob, C) {}
+public:
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::BuiltinJob;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinJobType, BuiltinType);
+
+/// BuiltinDefaultActorStorageType - The type of the stored property
+/// that's added implicitly to default actors.  No C equivalent because
+/// the C types all include a heap-object header.  Similarly, this type
+/// generally does not appear in the AST/SIL around default actors;
+/// it's purely a convenience in IRGen.
+class BuiltinDefaultActorStorageType : public BuiltinType {
+  friend class ASTContext;
+  BuiltinDefaultActorStorageType(const ASTContext &C)
+    : BuiltinType(TypeKind::BuiltinDefaultActorStorage, C) {}
+public:
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::BuiltinDefaultActorStorage;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinDefaultActorStorageType, BuiltinType);
 
 /// BuiltinNativeObjectType - The builtin opaque object-pointer type.
 /// Useful for keeping an object alive when it is otherwise being
@@ -2926,6 +2978,24 @@ public:
   ClangTypeInfo getClangTypeInfo() const;
   ClangTypeInfo getCanonicalClangTypeInfo() const;
 
+  /// Returns true if the function type stores a Clang type that cannot
+  /// be derived from its Swift type. Returns false otherwise, including if
+  /// the function type is not @convention(c) or @convention(block).
+  ///
+  /// For example, if you have a function pointer from C getting imported with
+  /// the following type:
+  ///
+  /// @convention(c, cType: "void (*)(size_t (*)(size_t))")
+  ///   (@convention(c, cType: "size_t (*)(size_t)") (Int) -> Int)) -> Void
+  ///
+  /// The parameter's function type will have hasNonDerivableClangType() = true,
+  /// but the outer function type will have hasNonDerivableClangType() = false,
+  /// because the parameter and result type are sufficient to correctly derive
+  /// the Clang type for the outer function type. In terms of mangling,
+  /// the parameter type's mangling will incorporate the Clang type but the
+  /// outer function type's mangling doesn't need to duplicate that information.
+  bool hasNonDerivableClangType();
+
   ExtInfo getExtInfo() const {
     return ExtInfo(Bits.AnyFunctionType.ExtInfoBits, getClangTypeInfo());
   }
@@ -3076,15 +3146,24 @@ public:
 
   AnyFunctionType *getWithoutDifferentiability() const;
 
+  /// Return the function type without the throwing.
+  AnyFunctionType *getWithoutThrowing() const;
+
   /// True if the parameter declaration it is attached to is guaranteed
   /// to not persist the closure for longer than the duration of the call.
   bool isNoEscape() const {
     return getExtInfo().isNoEscape();
   }
 
+  bool isConcurrent() const {
+    return getExtInfo().isConcurrent();
+  }
+
   bool isAsync() const { return getExtInfo().isAsync(); }
 
   bool isThrowing() const { return getExtInfo().isThrowing(); }
+
+  bool hasEffect(EffectKind kind) const;
 
   bool isDifferentiable() const { return getExtInfo().isDifferentiable(); }
   DifferentiabilityKind getDifferentiabilityKind() const {
@@ -3208,6 +3287,7 @@ END_CAN_TYPE_WRAPPER(FunctionType, AnyFunctionType)
 struct ParameterListInfo {
   SmallBitVector defaultArguments;
   SmallBitVector acceptsUnlabeledTrailingClosures;
+  SmallVector<const ParamDecl *, 4> propertyWrappers;
 
 public:
   ParameterListInfo() { }
@@ -3221,6 +3301,10 @@ public:
   /// Whether the parameter accepts an unlabeled trailing closure argument
   /// according to the "forward-scan" rule.
   bool acceptsUnlabeledTrailingClosureArgument(unsigned paramIdx) const;
+
+  /// The ParamDecl at the given index if the parameter has an applied
+  /// property wrapper.
+  const ParamDecl *getPropertyWrapperParam(unsigned paramIdx) const;
 
   /// Retrieve the number of non-defaulted parameters.
   unsigned numNonDefaultedParameters() const {
@@ -4053,6 +4137,7 @@ public:
     return SILCoroutineKind(Bits.SILFunctionType.CoroutineKind);
   }
 
+  bool isConcurrent() const { return getExtInfo().isConcurrent(); }
   bool isAsync() const { return getExtInfo().isAsync(); }
 
   /// Return the array of all the yields.
@@ -4307,23 +4392,25 @@ public:
 
   ClangTypeInfo getClangTypeInfo() const;
 
+  /// Returns true if the function type stores a Clang type that cannot
+  /// be derived from its Swift type. Returns false otherwise, including if
+  /// the function type is not @convention(c) or @convention(block).
+  bool hasNonDerivableClangType();
+
   bool hasSameExtInfoAs(const SILFunctionType *otherFn);
 
-  /// Given that `this` is a `@differentiable` or `@differentiable(linear)`
-  /// function type, returns an `IndexSubset` corresponding to the
-  /// differentiability/linearity parameters (e.g. all parameters except the
-  /// `@noDerivative` ones).
+  /// Given that `this` is a `@differentiable` function type, returns an
+  /// `IndexSubset` corresponding to the differentiability parameters
+  /// (e.g. all parameters except the `@noDerivative` ones).
   IndexSubset *getDifferentiabilityParameterIndices();
 
-  /// Given that `this` is a `@differentiable` or `@differentiable(linear)`
-  /// function type, returns an `IndexSubset` corresponding to the
-  /// differentiability/linearity results (e.g. all results except the
-  /// `@noDerivative` ones).
+  /// Given that `this` is a `@differentiable` function type, returns an
+  /// `IndexSubset` corresponding to the differentiability results
+  /// (e.g. all results except the `@noDerivative` ones).
   IndexSubset *getDifferentiabilityResultIndices();
 
-  /// Returns the `@differentiable` or `@differentiable(linear)` function type
-  /// for the given differentiability kind and differentiability/linearity
-  /// parameter/result indices.
+  /// Returns the `@differentiable` function type for the given
+  /// differentiability kind and differentiability parameter/result indices.
   CanSILFunctionType getWithDifferentiability(DifferentiabilityKind kind,
                                               IndexSubset *parameterIndices,
                                               IndexSubset *resultIndices);
@@ -5196,6 +5283,10 @@ public:
   GenericEnvironment *getGenericEnvironment() const {
     return Environment;
   }
+
+  GenericTypeParamType *getInterfaceType() const {
+    return cast<GenericTypeParamType>(InterfaceType.getPointer());
+  }
       
   static bool classof(const TypeBase *T) {
     return T->getKind() == TypeKind::PrimaryArchetype;
@@ -5582,8 +5673,7 @@ public:
   }
 };
 BEGIN_CAN_TYPE_WRAPPER(DependentMemberType, Type)
-  static CanDependentMemberType get(CanType base, AssociatedTypeDecl *assocType,
-                                    const ASTContext &C) {
+  static CanDependentMemberType get(CanType base, AssociatedTypeDecl *assocType) {
     return CanDependentMemberType(DependentMemberType::get(base, assocType));
   }
 
@@ -5733,20 +5823,20 @@ public:
 };
 DEFINE_EMPTY_CAN_TYPE_WRAPPER(TypeVariableType, Type)
 
-/// HoleType - This represents a placeholder type for a type variable
+/// PlaceholderType - This represents a placeholder type for a type variable
 /// or dependent member type that cannot be resolved to a concrete type
 /// because the expression is ambiguous. This type is only used by the
 /// constraint solver and transformed into UnresolvedType to be used in AST.
-class HoleType : public TypeBase {
-  using Originator = llvm::PointerUnion<TypeVariableType *,
-                                        DependentMemberType *, VarDecl *,
-                                        ErrorExpr *>;
+class PlaceholderType : public TypeBase {
+  using Originator =
+      llvm::PointerUnion<TypeVariableType *, DependentMemberType *, VarDecl *,
+                         ErrorExpr *, PlaceholderTypeRepr *>;
 
   Originator O;
 
-  HoleType(ASTContext &C, Originator originator,
-           RecursiveTypeProperties properties)
-      : TypeBase(TypeKind::Hole, &C, properties), O(originator) {}
+  PlaceholderType(ASTContext &C, Originator originator,
+                  RecursiveTypeProperties properties)
+      : TypeBase(TypeKind::Placeholder, &C, properties), O(originator) {}
 
 public:
   static Type get(ASTContext &ctx, Originator originator);
@@ -5754,10 +5844,10 @@ public:
   Originator getOriginator() const { return O; }
 
   static bool classof(const TypeBase *T) {
-    return T->getKind() == TypeKind::Hole;
+    return T->getKind() == TypeKind::Placeholder;
   }
 };
-DEFINE_EMPTY_CAN_TYPE_WRAPPER(HoleType, Type)
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(PlaceholderType, Type)
 
 inline bool TypeBase::isTypeVariableOrMember() {
   if (is<TypeVariableType>())

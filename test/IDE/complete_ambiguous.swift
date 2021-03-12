@@ -1,11 +1,41 @@
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=SIMPLE | %FileCheck %s --check-prefix=SIMPLE
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=SIMPLE_EXTRAARG | %FileCheck %s --check-prefix=SIMPLE
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=SIMPLE_MEMBERS | %FileCheck %s --check-prefix=SIMPLE
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=SKIP_DUPLICATES > %t
+// RUN: %FileCheck %s --input-file %t --check-prefixes=SKIP_DUPLICATES,SKIP_DUPLICATES_PROPERTY
+// RUN: %FileCheck %s --input-file %t --check-prefixes=SKIP_DUPLICATES,SKIP_DUPLICATES_METHOD
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=SKIP_COMPOUND_DUPLICATES | %FileCheck %s --check-prefix=SKIP_COMPOUND_DUPLICATES
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=SKIP_CALLASFUNCTION_DUPLICATES | %FileCheck %s --check-prefix=SKIP_CALLASFUNCTION_DUPLICATES
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=RELATED | %FileCheck %s --check-prefix=RELATED
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=RELATED_EXTRAARG | %FileCheck %s --check-prefix=RELATED
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=RELATED_INERROREXPR | %FileCheck %s --check-prefix=RELATED
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=UNRESOLVED_AMBIGUOUS | %FileCheck %s --check-prefix=UNRESOLVED_AMBIGUOUS
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=UNRESOLVED_STILLAMBIGUOUS | %FileCheck %s --check-prefix=UNRESOLVED_AMBIGUOUS
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=UNRESOLVED_UNAMBIGUOUS | %FileCheck %s --check-prefix=UNRESOLVED_UNAMBIGUOUS
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=NOCALLBACK_FALLBACK | %FileCheck %s --check-prefix=RELATED
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=MULTICLOSURE_FALLBACK | %FileCheck %s --check-prefix=MULTICLOSURE_FALLBACK
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=UNAMBIGUOUSCLOSURE_ARG | %FileCheck %s --check-prefix=UNAMBIGUOUSCLOSURE_ARG
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=AMBIGUOUSCLOSURE_ARG | %FileCheck %s --check-prefix=AMBIGUOUSCLOSURE_ARG
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=AMBIGUOUSCLOSURE_ARG_RETURN | %FileCheck %s --check-prefix=AMBIGUOUSCLOSURE_ARG_RETURN
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_OPTIONAL | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_NESTED | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_ASSIGN | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_INDIRECT | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_INDIRECT_NESTED | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_INDIRECT_CALL | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_INDIRECT_CALL_OPT | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_INDIRECT_RETURN | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_GENERIC | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_KEY
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_TUPLE | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_TUPLE
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=PARSED_AS_ARRAY_ARRAY | %FileCheck %s --check-prefix=PARSED_AS_ARRAY_TUPLE
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDFUNC_FOO | %FileCheck %s --check-prefix=OVERLOADEDFUNC_FOO
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDFUNC_BAR | %FileCheck %s --check-prefix=OVERLOADEDFUNC_BAR
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDFUNC_MISSINGLABEL | %FileCheck %s --check-prefix=OVERLOADEDFUNC_BOTH
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDFUNC_MISSINGARG_AFTER | %FileCheck %s --check-prefix=OVERLOADEDFUNC_BOTH
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDMEMBER_MISSINGARG_AFTER | %FileCheck %s --check-prefix=OVERLOADEDFUNC_BOTH
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDFUNC_MISSINGARG_BEFORE | %FileCheck %s --check-prefix=OVERLOADEDFUNC_BAR
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=OVERLOADEDFUNC_MISSINGARG_BEFOREANDAFTER | %FileCheck %s --check-prefix=OVERLOADEDFUNC_BAR
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=ERROR_IN_BASE | %FileCheck %s --check-prefix=SIMPLE
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=GENERIC | %FileCheck %s --check-prefix=GENERIC
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=GENERIC_MISSINGARG | %FileCheck %s --check-prefix=NORESULTS
@@ -15,6 +45,13 @@
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=MULTICLOSURE_FUNCBUILDER | %FileCheck %s --check-prefix=POINT_MEMBER
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=MULTICLOSURE_FUNCBUILDER_ERROR | %FileCheck %s --check-prefix=POINT_MEMBER
 // RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=MULTICLOSURE_FUNCBUILDER_FIXME | %FileCheck %s --check-prefix=NORESULTS
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=REGULAR_MULTICLOSURE_APPLIED | %FileCheck %s --check-prefix=POINT_MEMBER
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=BEST_SOLUTION_FILTER | %FileCheck %s --check-prefix=BEST_SOLUTION_FILTER
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=BEST_SOLUTION_FILTER2 | %FileCheck %s --check-prefix=BEST_SOLUTION_FILTER
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=BEST_SOLUTION_FILTER_GEN | %FileCheck %s --check-prefix=BEST_SOLUTION_FILTER_GEN
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=MISSINGARG_INLINE | %FileCheck %s --check-prefix=MISSINGARG_INLINE
+// RUN: %swift-ide-test -code-completion  -source-filename %s -code-completion-token=MISSINGARG_TRAILING | %FileCheck %s --check-prefix=MISSINGARG_TRAILING
+
 
 struct A {
   func doAThings() -> A { return self }
@@ -40,6 +77,37 @@ HasMembers().overloadedReturn().#^SIMPLE_MEMBERS^#
 func givenErrorExpr(_ a: String) -> A {}
 func givenErrorExpr(_ b: Int) -> B {}
 
+func arrayWrapper<T>(a: T) -> [T]
+arrayWrapper(overloadedReturn()).#^SKIP_DUPLICATES^#
+
+// SKIP_DUPLICATES: Begin completions
+// SKIP_DUPLICATES_PROPERTY: Decl[InstanceVar]/CurrNominal/IsSystem: count[#Int#]{{; name=.+$}}
+// SKIP_DUPLICATES_PROPERTY-NOT: count[#Int#]
+// SKIP_DUPLICATES_METHOD: Decl[InstanceMethod]/Super/IsSystem: formIndex({#(i): &Int#}, {#offsetBy: Int#})[#Void#]{{; name=.+$}}
+// SKIP_DUPLICATES_METHOD-NOT: formIndex({#(i): &Int#}, {#offsetBy: Int#})[#Void#]
+// SKIP_DUPLICATES: End completions
+
+let x: (inout Int, Int) -> () = arrayWrapper(overloadedReturn()).#^SKIP_COMPOUND_DUPLICATES^#
+
+// SKIP_COMPOUND_DUPLICATES: Begin completions
+// SKIP_COMPOUND_DUPLICATES: Decl[InstanceMethod]/Super/IsSystem/TypeRelation[Identical]: formIndex(_:offsetBy:)[#(inout Int, Int) -> ()#]{{; name=.+$}}
+// SKIP_COMPOUND_DUPLICATES-NOT: formIndex(_:offsetBy:)[#(inout Int, Int) -> ()#]
+// SKIP_COMPOUND_DUPLICATES: End completions
+
+func testCallAsFunctionDeduplication() {
+  struct Test<T> {
+    func callAsFunction(x: Int) {}
+  }
+
+  func overloaded() -> Test<A> { fatalError() }
+  func overloaded() -> Test<B> { fatalError() }
+
+  overloaded()#^SKIP_CALLASFUNCTION_DUPLICATES^#
+}
+
+// FIXME: Update this to check the callAsFunction pattern only appears once when PostfixExpr completion is migrated to the solver-based implementation (which handles ambiguity).
+// SKIP_CALLASFUNCTION_DUPLICATES-NOT: Begin completions
+
 givenErrorExpr(undefined).#^ERROR_IN_BASE^#
 
 // SIMPLE: Begin completions, 4 items
@@ -59,16 +127,42 @@ let x: A = overloadedReturn(1).#^RELATED_EXTRAARG^#
 // RELATED-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: doBThings()[#Void#]{{; name=.+$}}
 // RELATED: End completions
 
-func takesA(_ callback: () -> A) -> B {}
+func takesClosureGivingA(_ callback: () -> A) -> B {}
 func takesB(_ item: B) {}
 
-takesB((takesA { return overloadedReturn().#^RELATED_INERROREXPR^# }).)
+takesB((takesClosureGivingA { return overloadedReturn().#^RELATED_INERROREXPR^# }).)
+
+func overloadedArg(_ arg: A) -> A {}
+func overloadedArg(_ arg: B) -> B {}
+
+overloadedArg(.#^UNRESOLVED_AMBIGUOUS^#)
+
+// UNRESOLVED_AMBIGUOUS: Begin completions, 4 items
+// UNRESOLVED_AMBIGUOUS-DAG: Decl[InstanceMethod]/CurrNominal: doAThings({#(self): A#})[#() -> A#]{{; name=.+$}}
+// UNRESOLVED_AMBIGUOUS-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: init()[#A#]{{; name=.+$}}
+// UNRESOLVED_AMBIGUOUS-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: doBThings({#(self): B#})[#() -> Void#]{{; name=.+$}}
+// UNRESOLVED_AMBIGUOUS-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: init()[#B#]{{; name=.+$}}
+// UNRESOLVED_AMBIGUOUS: End completions
+
+// Make sure we still offer A and B members as the user may intend to add a member on the end of the overloadedArg call later that has type B.
+takesB(overloadedArg(.#^UNRESOLVED_STILLAMBIGUOUS^#))
+
+func overloadedArg2(_ arg: A) -> Void {}
+func overloadedArg2(_ arg: A) -> Never {}
+func overloadedArg2(_ arg: B) -> B {}
+
+takesB(overloadedArg2(.#^UNRESOLVED_UNAMBIGUOUS^#))
+
+// UNRESOLVED_UNAMBIGUOUS: Begin completions, 2 items
+// UNRESOLVED_UNAMBIGUOUS-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: doBThings({#(self): B#})[#() -> Void#]{{; name=.+$}}
+// UNRESOLVED_UNAMBIGUOUS-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: init()[#B#]{{; name=.+$}}
+// UNRESOLVED_UNAMBIGUOUS: End completions
+
 
 switch undefined {
-  case takesA { return overloadedReturn().#^NOCALLBACK_FALLBACK^# }:
+  case takesClosureGivingA { return overloadedReturn().#^NOCALLBACK_FALLBACK^# }:
     break
 }
-
 
 func takesClosureA(_ arg: (A) -> ()) {}
 func takesClosureB(_ arg: (B) -> ()) {}
@@ -84,6 +178,193 @@ takesClosureA { arg in
 // MULTICLOSURE_FALLBACK-DAG: Keyword[self]/CurrNominal:        self[#B#]{{; name=.+$}}
 // MULTICLOSURE_FALLBACK-DAG: Decl[InstanceMethod]/CurrNominal: doBThings()[#Void#]{{; name=.+$}}
 // MULTICLOSURE_FALLBACK: End completions
+
+func takesAnonClosure(_ x: (A) -> A) { return A() }
+func takesAnonClosure(_ x: (B, A) -> B { return B() }
+func takesAnonClosure(_ x: () -> (A, B) { return (A(), B()) }
+
+struct TestRelations {
+  static let a = A()
+  static let b = B()
+  static let ab = (A(), B())
+}
+
+// test we consider both overloads as $0 or $1 may have just not been written yet
+takesAnonClosure { $1.#^UNAMBIGUOUSCLOSURE_ARG^# }
+// UNAMBIGUOUSCLOSURE_ARG: Begin completions, 2 items
+// UNAMBIGUOUSCLOSURE_ARG-DAG: Keyword[self]/CurrNominal: self[#A#]{{; name=.+$}}
+// UNAMBIGUOUSCLOSURE_ARG-DAG: Decl[InstanceMethod]/CurrNominal: doAThings()[#A#]{{; name=.+$}}
+// UNAMBIGUOUSCLOSURE_ARG: End completions
+
+takesAnonClosure { $0.#^AMBIGUOUSCLOSURE_ARG^# }
+// AMBIGUOUSCLOSURE_ARG: Begin completions, 4 items
+// AMBIGUOUSCLOSURE_ARG-DAG: Keyword[self]/CurrNominal: self[#A#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Identical]: doAThings()[#A#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG-DAG: Keyword[self]/CurrNominal: self[#B#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG-DAG: Decl[InstanceMethod]/CurrNominal: doBThings()[#Void#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG: End completions
+
+takesAnonClosure { TestRelations.#^AMBIGUOUSCLOSURE_ARG_RETURN^# }
+// AMBIGUOUSCLOSURE_ARG_RETURN: Begin completions, 6 items
+// AMBIGUOUSCLOSURE_ARG_RETURN-DAG: Keyword[self]/CurrNominal: self[#TestRelations.Type#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG_RETURN-DAG: Keyword/CurrNominal: Type[#TestRelations.Type#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG_RETURN-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: a[#A#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG_RETURN-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: b[#B#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG_RETURN-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: ab[#(A, B)#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG_RETURN-DAG: Decl[Constructor]/CurrNominal: init()[#TestRelations#]{{; name=.+$}}
+// AMBIGUOUSCLOSURE_ARG_RETURN: End completions
+
+func takesDictAB(_ x: [A: B]) {}
+func takesOptDictAB(_ x: [A: B]?) {}
+func overloadedGivesAorB(_ x: A) -> A {}
+func overloadedGivesAorB(_ x: B) -> B {}
+var assignDict: [A : B] = [:]
+
+let _: [A : B] = [TestRelations.#^PARSED_AS_ARRAY^#]
+let _: [A : B]? = [TestRelations.#^PARSED_AS_ARRAY_OPTIONAL^#]
+let _: [[A : B]] = [[TestRelations.#^PARSED_AS_ARRAY_NESTED^#]]
+assignDict = [TestRelations.#^PARSED_AS_ARRAY_ASSIGN^#]
+let _: [A: B] = [overloadedGivesAorB(TestRelations.#^PARSED_AS_ARRAY_INDIRECT^#)]
+let _: [[A: B]] = [[overloadedGivesAorB(TestRelations.#^PARSED_AS_ARRAY_INDIRECT_NESTED^#)]]
+takesDictAB([overloadedGivesAorB(TestRelations.#^PARSED_AS_ARRAY_INDIRECT_CALL^#)]);
+takesOptDictAB([overloadedGivesAorB(TestRelations.#^PARSED_AS_ARRAY_INDIRECT_CALL_OPT^#)]);
+func testReturnLiteralMismatch() -> [A: B] { return [overloadedGivesAorB(TestRelations.#^PARSED_AS_ARRAY_INDIRECT_RETURN^#)] }
+func arrayLiteralDictionaryMismatch<T>(a: inout T) where T: ExpressibleByDictionaryLiteral, T.Key == A, T.Value == B {
+  a = [TestRelations.#^PARSED_AS_ARRAY_GENERIC^#]
+}
+
+// PARSED_AS_ARRAY_KEY: Begin completions, 6 items
+// PARSED_AS_ARRAY_KEY-DAG: Keyword[self]/CurrNominal: self[#TestRelations.Type#]{{; name=.+$}}
+// PARSED_AS_ARRAY_KEY-DAG: Keyword/CurrNominal: Type[#TestRelations.Type#]{{; name=.+$}}
+// PARSED_AS_ARRAY_KEY-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: a[#A#]{{; name=.+$}}
+// PARSED_AS_ARRAY_KEY-DAG: Decl[StaticVar]/CurrNominal: b[#B#]{{; name=.+$}}
+// PARSED_AS_ARRAY_KEY-DAG: Decl[StaticVar]/CurrNominal: ab[#(A, B)#]{{; name=.+$}}
+// PARSED_AS_ARRAY_KEY-DAG: Decl[Constructor]/CurrNominal: init()[#TestRelations#]{{; name=.+$}}
+// PARSED_AS_ARRAY_KEY: End completions
+
+let _: [(A, B) : B] = [TestRelations.#^PARSED_AS_ARRAY_TUPLE^#]
+let _: [(A, B)] = [TestRelations.#^PARSED_AS_ARRAY_ARRAY^#]
+// PARSED_AS_ARRAY_TUPLE: Begin completions, 6 items
+// PARSED_AS_ARRAY_TUPLE-DAG: Keyword[self]/CurrNominal: self[#TestRelations.Type#]{{; name=.+$}}
+// PARSED_AS_ARRAY_TUPLE-DAG: Keyword/CurrNominal: Type[#TestRelations.Type#]{{; name=.+$}}
+// PARSED_AS_ARRAY_TUPLE-DAG: Decl[StaticVar]/CurrNominal: a[#A#]{{; name=.+$}}
+// PARSED_AS_ARRAY_TUPLE-DAG: Decl[StaticVar]/CurrNominal: b[#B#]{{; name=.+$}}
+// PARSED_AS_ARRAY_TUPLE-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: ab[#(A, B)#]{{; name=.+$}}
+// PARSED_AS_ARRAY_TUPLE-DAG: Decl[Constructor]/CurrNominal: init()[#TestRelations#]{{; name=.+$}}
+// PARSED_AS_ARRAY_TUPLE: End completions
+
+
+func testMissingArgs() {
+  enum Foo { case foo }
+  enum Bar { case bar }
+
+  struct Test {
+    static let foo = Foo.foo
+    static let bar = Bar.bar
+  }
+
+  func test(foo: Foo) {}
+  func test(bar: Bar) {}
+
+  func test2(first: Bar, second: Int) {}
+  func test2(first: Foo) {}
+
+  func test3(skipMe: Int, after: Foo) {}
+  func test3(after: Bar) {}
+
+  func test4(skipMe: Int, both: Foo, skipMeToo: Int) {}
+  func test4(both: Bar, skipMeTo: Int) {}
+
+
+  test(foo: Test.#^OVERLOADEDFUNC_FOO^#)
+  // OVERLOADEDFUNC_FOO: Begin completions, 5 items
+  // OVERLOADEDFUNC_FOO-DAG: Keyword[self]/CurrNominal: self[#Test.Type#]{{; name=.+$}}
+  // OVERLOADEDFUNC_FOO-DAG: Keyword/CurrNominal: Type[#Test.Type#]{{; name=.+$}}
+  // OVERLOADEDFUNC_FOO-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: foo[#Foo#]{{; name=.+$}}
+  // OVERLOADEDFUNC_FOO-DAG: Decl[StaticVar]/CurrNominal: bar[#Bar#]{{; name=.+$}}
+  // OVERLOADEDFUNC_FOO-DAG: Decl[Constructor]/CurrNominal: init()[#Test#]{{; name=.+$}}
+  // OVERLOADEDFUNC_FOO: End completions
+
+  test(bar: Test.#^OVERLOADEDFUNC_BAR^#)
+  // OVERLOADEDFUNC_BAR: Begin completions, 5 items
+  // OVERLOADEDFUNC_BAR-DAG: Keyword[self]/CurrNominal: self[#Test.Type#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BAR-DAG: Keyword/CurrNominal: Type[#Test.Type#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BAR-DAG: Decl[StaticVar]/CurrNominal: foo[#Foo#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BAR-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: bar[#Bar#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BAR-DAG: Decl[Constructor]/CurrNominal: init()[#Test#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BAR: End completions
+
+  test(Test.#^OVERLOADEDFUNC_MISSINGLABEL^#, extraArg: 2)
+  test2(first: Test.#^OVERLOADEDFUNC_MISSINGARG_AFTER^#)
+
+  // Also check ambiguous member functions
+  struct TestStruct {
+    func test2(first: Bar, second: Int) {}
+    func test2(first: Foo) {}
+  }
+
+  TestStruct().test2(first: Test.#^OVERLOADEDMEMBER_MISSINGARG_AFTER^#)
+
+  // TODO: Should we insert the missing label in the completion text for OVERLOADEDFUNC_MISSINGLABEL?
+  // OVERLOADEDFUNC_BOTH: Begin completions, 5 items
+  // OVERLOADEDFUNC_BOTH-DAG: Keyword[self]/CurrNominal: self[#Test.Type#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BOTH-DAG: Keyword/CurrNominal: Type[#Test.Type#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BOTH-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: foo[#Foo#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BOTH-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: bar[#Bar#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BOTH-DAG: Decl[Constructor]/CurrNominal: init()[#Test#]{{; name=.+$}}
+  // OVERLOADEDFUNC_BOTH: End completions
+
+  test3(after: Test.#^OVERLOADEDFUNC_MISSINGARG_BEFORE^#);
+  test4(both: Test.#^OVERLOADEDFUNC_MISSINGARG_BEFOREANDAFTER^#)
+
+  enum Bop { case bop }
+  enum Bix { case bix }
+  enum Blu { case blu }
+  enum Baz { case baz }
+  enum Boy { case boy }
+
+  func trailing(x: Int, _ y: () -> Foo, z: () -> ())  {}
+  func trailing(x: Int, _ y: () -> Bar, z: (() -> ())?)  {}
+  func trailing(x: Int, _ y: () -> Bop, z: Any)  {}
+  func trailing<T>(x: Int, _ y: () -> Bix, z: T) {}
+  func trailing<T>(x: Int, _ y: () -> Boy, z: T?) {}
+  func trailing<T>(x: Int, _ y: () -> Blu, z: [T]?) {}
+  func trailing(x: Int, _ y: () -> Blu, z: inout Any)  {}
+  func trailing(x: Int, _ y: () -> Baz, z: Int)  {}
+
+  trailing(x: 2, { .#^MISSINGARG_INLINE^# })
+  trailing(x: 2) { .#^MISSINGARG_TRAILING^# }
+
+  // MISSINGARG_INLINE: Begin completions, 14 items
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: foo[#Foo#]; name=foo
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Foo#})[#(into: inout Hasher) -> Void#]; name=hash(self: Foo)
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: bar[#Bar#]; name=bar
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Bar#})[#(into: inout Hasher) -> Void#]; name=hash(self: Bar)
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: bop[#Bop#]; name=bop
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Bop#})[#(into: inout Hasher) -> Void#]; name=hash(self: Bop)
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: bix[#Bix#]; name=bix
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Bix#})[#(into: inout Hasher) -> Void#]; name=hash(self: Bix)
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: boy[#Boy#]; name=boy
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Boy#})[#(into: inout Hasher) -> Void#]; name=hash(self: Boy)
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: blu[#Blu#]; name=blu
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Blu#})[#(into: inout Hasher) -> Void#]; name=hash(self: Blu)
+  // MISSINGARG_INLINE-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: baz[#Baz#]; name=baz
+  // MISSINGARG_INLINE-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Baz#})[#(into: inout Hasher) -> Void#]; name=hash(self: Baz)
+  // MISSINGARG_INLINE: End completions
+
+  // MISSINGARG_TRAILING: Begin completions, 10 items
+  // MISSINGARG_TRAILING-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: foo[#Foo#]; name=foo
+  // MISSINGARG_TRAILING-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Foo#})[#(into: inout Hasher) -> Void#]; name=hash(self: Foo)
+  // MISSINGARG_TRAILING-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: bar[#Bar#]; name=bar
+  // MISSINGARG_TRAILING-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Bar#})[#(into: inout Hasher) -> Void#]; name=hash(self: Bar)
+  // MISSINGARG_TRAILING-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: bop[#Bop#]; name=bop
+  // MISSINGARG_TRAILING-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Bop#})[#(into: inout Hasher) -> Void#]; name=hash(self: Bop)
+  // MISSINGARG_TRAILING-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: bix[#Bix#]; name=bix
+  // MISSINGARG_TRAILING-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Bix#})[#(into: inout Hasher) -> Void#]; name=hash(self: Bix)
+  // MISSINGARG_TRAILING-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Identical]: boy[#Boy#]; name=boy
+  // MISSINGARG_TRAILING-DAG: Decl[InstanceMethod]/CurrNominal:   hash({#(self): Boy#})[#(into: inout Hasher) -> Void#]; name=hash(self: Boy)
+  // MISSINGARG_TRAILING: End completions
+}
 
 protocol C {
   associatedtype Element
@@ -153,7 +434,7 @@ _ = testing([Point(4, 89)]) { arg in
 struct Thing {
     init(_ block: (Point) -> Void) {}
 }
-@_functionBuilder
+@resultBuilder
 struct ThingBuilder {
     static func buildBlock(_ x: Thing...) -> [Thing] { x }
 }
@@ -189,7 +470,7 @@ CreateThings {
     }
 }
 
-// FIXME: No results in multi-statement closure with erroreous sibling function builder element
+// FIXME: No results in multi-statement closure with erroreous sibling result builder element
 CreateThings {
     Thing { point in
       print("hello")
@@ -198,3 +479,46 @@ CreateThings {
     Thing. // ErrorExpr
 }
 
+
+func takesClosureOfPoint(_: (Point)->()) {}
+func overloadedWithDefaulted(_: ()->()) {}
+func overloadedWithDefaulted(_: ()->(), _ defaulted: Int = 10) {}
+
+takesClosureOfPoint { p in
+  overloadedWithDefaulted {
+    if p.#^REGULAR_MULTICLOSURE_APPLIED^# {}
+  }
+}
+
+enum Enum123 {
+    case enumElem
+}
+struct Struct123: Equatable {
+    var structMem = Enum123.enumElem
+}
+func testBestSolutionFilter() {
+  let a = Struct123();
+  let b = [Struct123]().first(where: { $0 == a && 1 + 90 * 5 / 8 == 45 * -10 })?.structMem != .#^BEST_SOLUTION_FILTER^#
+  let c = min(10.3, 10 / 10.4) < 6 / 7 ? true : Optional(a)?.structMem != .#^BEST_SOLUTION_FILTER2^#
+}
+
+// BEST_SOLUTION_FILTER: Begin completions
+// BEST_SOLUTION_FILTER-DAG: Decl[EnumElement]/ExprSpecific/TypeRelation[Convertible]: enumElem[#Enum123#]{{; name=.+$}}
+// BEST_SOLUTION_FILTER-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): Enum123#})[#(into: inout Hasher) -> Void#]{{; name=.+$}}
+// BEST_SOLUTION_FILTER-DAG: Keyword[nil]/None/Erase[1]/TypeRelation[Identical]: nil[#Enum123?#]{{; name=.+$}}
+// BEST_SOLUTION_FILTER-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Identical]: none[#Optional<Enum123>#]{{; name=.+$}}
+// BEST_SOLUTION_FILTER-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Identical]: some({#Enum123#})[#Optional<Enum123>#]{{; name=.+$}}
+// BEST_SOLUTION_FILTER: End completions
+
+func testBestSolutionGeneric() {
+  struct Test1 {}
+  func genAndInt(_ x: Int) -> Int { return 1 }
+  func genAndInt<T>(_ x: T) -> Test1 { return Test1() }
+
+  genAndInt(2).#^BEST_SOLUTION_FILTER_GEN^#
+}
+
+// BEST_SOLUTION_FILTER_GEN: Begin completions
+// BEST_SOLUTION_FILTER_GEN-DAG: Keyword[self]/CurrNominal:     self[#Int#]; name=self
+// BEST_SOLUTION_FILTER_GEN-DAG: Keyword[self]/CurrNominal:     self[#Test1#]; name=self
+// BEST_SOLUTION_FILTER_GEN: End completions

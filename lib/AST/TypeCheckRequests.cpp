@@ -490,17 +490,22 @@ bool PropertyWrapperBackingPropertyTypeRequest::isCached() const {
 
 bool PropertyWrapperBackingPropertyInfoRequest::isCached() const {
   auto var = std::get<0>(getStorage());
-  return !var->getAttrs().isEmpty();
+  return !var->getAttrs().isEmpty() || var->hasImplicitPropertyWrapper();
+}
+
+bool PropertyWrapperWrappedValueVarRequest::isCached() const {
+  auto var = std::get<0>(getStorage());
+  return !var->getAttrs().isEmpty() || var->hasImplicitPropertyWrapper();
 }
 
 bool PropertyWrapperMutabilityRequest::isCached() const {
   auto var = std::get<0>(getStorage());
-  return !var->getAttrs().isEmpty();
+  return !var->getAttrs().isEmpty() || var->hasImplicitPropertyWrapper();
 }
 
 bool PropertyWrapperLValuenessRequest::isCached() const {
   auto var = std::get<0>(getStorage());
-  return !var->getAttrs().isEmpty();
+  return !var->getAttrs().isEmpty() || var->hasImplicitPropertyWrapper();
 }
 
 void swift::simple_display(
@@ -593,10 +598,10 @@ void swift::simple_display(llvm::raw_ostream &out,
 }
 
 //----------------------------------------------------------------------------//
-// FunctionBuilder-related requests.
+// ResultBuilder-related requests.
 //----------------------------------------------------------------------------//
 
-bool AttachedFunctionBuilderRequest::isCached() const {
+bool AttachedResultBuilderRequest::isCached() const {
   // Only needs to be cached if there are any custom attributes.
   auto var = std::get<0>(getStorage());
   return var->getAttrs().hasAttribute<CustomAttr>();
@@ -614,6 +619,20 @@ Optional<SelfAccessKind> SelfAccessKindRequest::getCachedResult() const {
 void SelfAccessKindRequest::cacheResult(SelfAccessKind value) const {
   auto *funcDecl = std::get<0>(getStorage());
   funcDecl->setSelfAccessKind(value);
+}
+
+//----------------------------------------------------------------------------//
+// IsAsyncHandlerRequest computation.
+//----------------------------------------------------------------------------//
+
+Optional<bool> IsAsyncHandlerRequest::getCachedResult() const {
+  auto *funcDecl = std::get<0>(getStorage());
+  return funcDecl->getCachedIsAsyncHandler();
+}
+
+void IsAsyncHandlerRequest::cacheResult(bool value) const {
+  auto *funcDecl = std::get<0>(getStorage());
+  funcDecl->setIsAsyncHandler(value);
 }
 
 //----------------------------------------------------------------------------//
@@ -991,7 +1010,7 @@ void InterfaceTypeRequest::cacheResult(Type type) const {
   auto *decl = std::get<0>(getStorage());
   if (type) {
     assert(!type->hasTypeVariable() && "Type variable in interface type");
-    assert(!type->hasHole() && "Type hole in interface type");
+    assert(!type->hasPlaceholder() && "Type placeholder in interface type");
     assert(!type->is<InOutType>() && "Interface type must be materializable");
     assert(!type->hasArchetype() && "Archetype in interface type");
   }
@@ -1105,19 +1124,19 @@ void ValueWitnessRequest::cacheResult(Witness type) const {
 }
 
 //----------------------------------------------------------------------------//
-// PreCheckFunctionBuilderRequest computation.
+// PreCheckResultBuilderRequest computation.
 //----------------------------------------------------------------------------//
 
 void swift::simple_display(llvm::raw_ostream &out,
-                           FunctionBuilderBodyPreCheck value) {
+                           ResultBuilderBodyPreCheck value) {
   switch (value) {
-  case FunctionBuilderBodyPreCheck::Okay:
+  case ResultBuilderBodyPreCheck::Okay:
     out << "okay";
     break;
-  case FunctionBuilderBodyPreCheck::HasReturnStmt:
+  case ResultBuilderBodyPreCheck::HasReturnStmt:
     out << "has return statement";
     break;
-  case FunctionBuilderBodyPreCheck::Error:
+  case ResultBuilderBodyPreCheck::Error:
     out << "error";
     break;
   }
@@ -1276,7 +1295,7 @@ void CheckRedeclarationRequest::writeDependencySink(
 
 void LookupAllConformancesInContextRequest::writeDependencySink(
     evaluator::DependencyCollector &tracker,
-    ProtocolConformanceLookupResult conformances) const {
+    const ProtocolConformanceLookupResult &conformances) const {
   for (auto conformance : conformances) {
     tracker.addPotentialMember(conformance->getProtocol());
   }
@@ -1467,8 +1486,12 @@ void swift::simple_display(llvm::raw_ostream &out, CustomAttrTypeKind value) {
     out << "non-generic";
     return;
 
-  case CustomAttrTypeKind::PropertyDelegate:
-    out << "property-delegate";
+  case CustomAttrTypeKind::PropertyWrapper:
+    out << "property-wrapper";
+    return;
+
+  case CustomAttrTypeKind::GlobalActor:
+    out << "global-actor";
     return;
   }
   llvm_unreachable("bad kind");
@@ -1487,6 +1510,36 @@ void CustomAttrTypeRequest::cacheResult(Type value) const {
   attr->setType(value);
 }
 
+bool ActorIsolation::requiresSubstitution() const {
+  switch (kind) {
+  case ActorInstance:
+  case Independent:
+  case IndependentUnsafe:
+  case Unspecified:
+    return false;
+
+  case GlobalActor:
+  case GlobalActorUnsafe:
+    return getGlobalActor()->hasTypeParameter();
+  }
+  llvm_unreachable("unhandled actor isolation kind!");
+}
+
+ActorIsolation ActorIsolation::subst(SubstitutionMap subs) const {
+  switch (kind) {
+  case ActorInstance:
+  case Independent:
+  case IndependentUnsafe:
+  case Unspecified:
+    return *this;
+
+  case GlobalActor:
+  case GlobalActorUnsafe:
+    return forGlobalActor(
+        getGlobalActor().subst(subs), kind == GlobalActorUnsafe);
+  }
+  llvm_unreachable("unhandled actor isolation kind!");
+}
 
 void swift::simple_display(
     llvm::raw_ostream &out, const ActorIsolation &state) {
@@ -1499,13 +1552,21 @@ void swift::simple_display(
       out << "actor-independent";
       break;
 
+    case ActorIsolation::IndependentUnsafe:
+      out << "actor-independent (unsafe)";
+      break;
+
     case ActorIsolation::Unspecified:
       out << "unspecified actor isolation";
       break;
 
     case ActorIsolation::GlobalActor:
+    case ActorIsolation::GlobalActorUnsafe:
       out << "actor-isolated to global actor "
           << state.getGlobalActor().getString();
+
+      if (state == ActorIsolation::GlobalActorUnsafe)
+        out << "(unsafe)";
       break;
   }
 }

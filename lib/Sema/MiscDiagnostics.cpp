@@ -19,9 +19,11 @@
 #include "TypeCheckConcurrency.h"
 #include "TypeChecker.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
@@ -64,6 +66,7 @@ static Expr *isImplicitPromotionToOptional(Expr *E) {
 ///   - Warn about promotions to optional in specific syntactic forms.
 ///   - Error about collection literals that default to Any collections in
 ///     invalid positions.
+///   - Marker protocols cannot occur as the type of an as? or is expression.
 ///
 static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
                                          bool isExprStmt) {
@@ -310,9 +313,31 @@ static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
         }
       }
 
+      // Diagnose checked casts that involve marker protocols.
+      if (auto cast = dyn_cast<CheckedCastExpr>(E)) {
+        checkCheckedCastExpr(cast);
+      }
+      
       return { true, E };
     }
 
+    void checkCheckedCastExpr(CheckedCastExpr *cast) {
+      if (!isa<ConditionalCheckedCastExpr>(cast) && !isa<IsExpr>(cast))
+        return;
+
+      Type castType = cast->getCastType();
+      if (!castType || !castType->isExistentialType())
+        return;
+
+      auto layout = castType->getExistentialLayout();
+      for (auto proto : layout.getProtocols()) {
+        if (proto->getDecl()->isMarkerProtocol()) {
+          Ctx.Diags.diagnose(cast->getLoc(), diag::marker_protocol_cast,
+                             proto->getDecl()->getName());
+        }
+      }
+    }
+    
     /// Visit the argument/s represented by either a ParenExpr or TupleExpr,
     /// unshuffling if needed. If any other kind of expression, will pass it
     /// straight back.
@@ -653,9 +678,9 @@ static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
           .fixItInsert(DRE->getStartLoc(), "self.");
       }
 
-      DeclContext *topLevelContext = DC->getModuleScopeContext();
+      DeclContext *topLevelSubcontext = DC->getModuleScopeContext();
       auto descriptor = UnqualifiedLookupDescriptor(
-          DeclNameRef(VD->getBaseName()), topLevelContext, SourceLoc());
+          DeclNameRef(VD->getBaseName()), topLevelSubcontext, SourceLoc());
       auto lookup = evaluateOrDefault(Ctx.evaluator,
                                       UnqualifiedLookupRequest{descriptor}, {});
 
@@ -1460,14 +1485,31 @@ static void diagnoseImplicitSelfUseInClosure(const Expr *E,
             Closures.push_back(ACE);
         }
 
+    static bool isEnclosingSelfReference(VarDecl *var,
+                                   const AbstractClosureExpr *inClosure) {
+      if (var->isSelfParameter())
+        return true;
+
+      // Capture variables have a DC of the parent function.
+      if (inClosure && var->isSelfParamCapture() &&
+          var->getDeclContext() != inClosure->getParent())
+        return true;
+
+      return false;
+    }
+
     /// Return true if this is an implicit reference to self which is required
     /// to be explicit in an escaping closure. Metatype references and value
     /// type references are excluded.
-    static bool isImplicitSelfParamUseLikelyToCauseCycle(Expr *E) {
+    static bool isImplicitSelfParamUseLikelyToCauseCycle(Expr *E,
+                                   const AbstractClosureExpr *inClosure) {
       auto *DRE = dyn_cast<DeclRefExpr>(E);
 
-      if (!DRE || !DRE->isImplicit() || !isa<VarDecl>(DRE->getDecl()) ||
-          !cast<VarDecl>(DRE->getDecl())->isSelfParameter())
+      if (!DRE || !DRE->isImplicit())
+        return false;
+
+      auto var = dyn_cast<VarDecl>(DRE->getDecl());
+      if (!var || !isEnclosingSelfReference(var, inClosure))
         return false;
 
       // Defensive check for type. If the expression doesn't have type here, it
@@ -1495,8 +1537,16 @@ static void diagnoseImplicitSelfUseInClosure(const Expr *E,
                   const AbstractClosureExpr *CE) {
       // If the closure's type was inferred to be noescape, then it doesn't
       // need qualification.
-      return !AnyFunctionRef(const_cast<AbstractClosureExpr *>(CE))
-               .isKnownNoEscape();
+      if (AnyFunctionRef(const_cast<AbstractClosureExpr *>(CE))
+               .isKnownNoEscape())
+        return false;
+
+      if (auto autoclosure = dyn_cast<AutoClosureExpr>(CE)) {
+        if (autoclosure->getThunkKind() == AutoClosureExpr::Kind::AsyncLet)
+          return false;
+      }
+
+      return true;
     }
 
 
@@ -1535,7 +1585,7 @@ static void diagnoseImplicitSelfUseInClosure(const Expr *E,
       
       SourceLoc memberLoc = SourceLoc();
       if (auto *MRE = dyn_cast<MemberRefExpr>(E))
-        if (isImplicitSelfParamUseLikelyToCauseCycle(MRE->getBase())) {
+        if (isImplicitSelfParamUseLikelyToCauseCycle(MRE->getBase(), ACE)) {
           auto baseName = MRE->getMember().getDecl()->getBaseName();
           memberLoc = MRE->getLoc();
           Diags.diagnose(memberLoc,
@@ -1545,7 +1595,7 @@ static void diagnoseImplicitSelfUseInClosure(const Expr *E,
 
       // Handle method calls with a specific diagnostic + fixit.
       if (auto *DSCE = dyn_cast<DotSyntaxCallExpr>(E))
-        if (isImplicitSelfParamUseLikelyToCauseCycle(DSCE->getBase()) &&
+        if (isImplicitSelfParamUseLikelyToCauseCycle(DSCE->getBase(), ACE) &&
             isa<DeclRefExpr>(DSCE->getFn())) {
           auto MethodExpr = cast<DeclRefExpr>(DSCE->getFn());
           memberLoc = DSCE->getLoc();
@@ -1560,7 +1610,7 @@ static void diagnoseImplicitSelfUseInClosure(const Expr *E,
       }
       
       // Catch any other implicit uses of self with a generic diagnostic.
-      if (isImplicitSelfParamUseLikelyToCauseCycle(E))
+      if (isImplicitSelfParamUseLikelyToCauseCycle(E, ACE))
         Diags.diagnose(E->getLoc(), diag::implicit_use_of_self_in_closure);
 
       return { true, E };
@@ -2023,6 +2073,9 @@ static void diagnoseUnownedImmediateDeallocationImpl(ASTContext &ctx,
 
   if (varDecl->getDeclContext()->isTypeContext())
     storageKind = SK_Property;
+
+  // TODO: The DiagnoseLifetimeIssuesPass prints a similiar warning in this
+  // situation. We should only print one warning.
 
   ctx.Diags.diagnose(diagLoc, diag::unowned_assignment_immediate_deallocation,
                      varDecl->getName(), ownershipAttr->get(),
@@ -3418,39 +3471,6 @@ static void checkStmtConditionTrailingClosure(ASTContext &ctx, const Stmt *S) {
   }
 }
 
-static Optional<ObjCSelector>
-parseObjCSelector(ASTContext &ctx, StringRef string) {
-  // Find the first colon.
-  auto colonPos = string.find(':');
-
-  // If there is no colon, we have a nullary selector.
-  if (colonPos == StringRef::npos) {
-    if (string.empty() || !Lexer::isIdentifier(string)) return None;
-    return ObjCSelector(ctx, 0, { ctx.getIdentifier(string) });
-  }
-
-  SmallVector<Identifier, 2> pieces;
-  do {
-    // Check whether we have a valid selector piece.
-    auto piece = string.substr(0, colonPos);
-    if (piece.empty()) {
-      pieces.push_back(Identifier());
-    } else {
-      if (!Lexer::isIdentifier(piece)) return None;
-      pieces.push_back(ctx.getIdentifier(piece));
-    }
-
-    // Move to the next piece.
-    string = string.substr(colonPos+1);
-    colonPos = string.find(':');
-  } while (colonPos != StringRef::npos);
-
-  // If anything remains of the string, it's not a selector.
-  if (!string.empty()) return None;
-
-  return ObjCSelector(ctx, pieces.size(), pieces);
-}
-
 
 namespace {
 
@@ -3618,7 +3638,7 @@ public:
 
     // Try to parse the string literal as an Objective-C selector, and complain
     // if it isn't one.
-    auto selector = parseObjCSelector(Ctx, stringLiteral->getValue());
+    auto selector = ObjCSelector::parse(Ctx, stringLiteral->getValue());
     if (!selector) {
       auto diag = Ctx.Diags.diagnose(stringLiteral->getLoc(),
                                      diag::selector_literal_invalid);
@@ -4600,14 +4620,15 @@ void swift::performSyntacticExprDiagnostics(const Expr *E,
   if (!ctx.isSwiftVersionAtLeast(5))
     diagnoseDeprecatedWritableKeyPath(E, DC);
   if (!ctx.LangOpts.DisableAvailabilityChecking)
-    diagAvailability(E, const_cast<DeclContext*>(DC));
+    diagnoseExprAvailability(E, const_cast<DeclContext*>(DC));
   if (ctx.LangOpts.EnableObjCInterop)
     diagDeprecatedObjCSelectors(DC, E);
   diagnoseConstantArgumentRequirement(E, DC);
-  checkActorIsolation(E, DC);
 }
 
-void swift::performStmtDiagnostics(ASTContext &ctx, const Stmt *S) {
+void swift::performStmtDiagnostics(const Stmt *S, DeclContext *DC) {
+  auto &ctx = DC->getASTContext();
+
   TypeChecker::checkUnsupportedProtocolType(ctx, const_cast<Stmt *>(S));
     
   if (auto switchStmt = dyn_cast<SwitchStmt>(S))
@@ -4619,6 +4640,9 @@ void swift::performStmtDiagnostics(ASTContext &ctx, const Stmt *S) {
   if (auto *lcs = dyn_cast<LabeledConditionalStmt>(S))
     for (const auto &elt : lcs->getCond())
       checkImplicitPromotionsInCondition(elt, ctx);
+
+  if (!ctx.LangOpts.DisableAvailabilityChecking)
+    diagnoseStmtAvailability(S, const_cast<DeclContext*>(DC));
 }
 
 //===----------------------------------------------------------------------===//
@@ -4862,7 +4886,8 @@ Optional<DeclName> TypeChecker::omitNeedlessWords(AbstractFunctionDecl *afd) {
                                 getTypeNameForOmission(resultType),
                                 getTypeNameForOmission(contextType),
                                 paramTypes, returnsSelf, false,
-                                /*allPropertyNames=*/nullptr, scratch))
+                                /*allPropertyNames=*/nullptr,
+                                None, None, scratch))
     return None;
 
   /// Retrieve a replacement identifier.
@@ -4917,7 +4942,7 @@ Optional<Identifier> TypeChecker::omitNeedlessWords(VarDecl *var) {
   OmissionTypeName contextTypeName = getTypeNameForOmission(contextType);
   if (::omitNeedlessWords(name, { }, "", typeName, contextTypeName, { },
                           /*returnsSelf=*/false, true,
-                          /*allPropertyNames=*/nullptr, scratch)) {
+                          /*allPropertyNames=*/nullptr, None, None, scratch)) {
     return Context.getIdentifier(name);
   }
 

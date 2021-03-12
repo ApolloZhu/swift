@@ -89,4 +89,43 @@
 #define SWIFT_ATTRIBUTE_NORETURN
 #endif
 
+#ifndef SWIFT_BUG_REPORT_URL
+#define SWIFT_BUG_REPORT_URL "https://swift.org/contributing/#reporting-bugs"
+#endif
+
+#define SWIFT_BUG_REPORT_MESSAGE_BASE \
+  "submit a bug report (" SWIFT_BUG_REPORT_URL \
+  ") and include the project"
+
+#define SWIFT_BUG_REPORT_MESSAGE \
+  "please " SWIFT_BUG_REPORT_MESSAGE_BASE
+
+#define SWIFT_CRASH_BUG_REPORT_MESSAGE \
+  "Please " SWIFT_BUG_REPORT_MESSAGE_BASE " and the crash backtrace."
+
+// Conditionally exclude declarations or statements that are only needed for
+// assertions from release builds (NDEBUG) without cluttering the surrounding
+// code by #ifdefs.
+//
+// struct DoThings  {
+//   SWIFT_ASSERT_ONLY_DECL(unsigned verifyCount = 0);
+//   DoThings() {
+//     SWIFT_ASSERT_ONLY(verifyCount = getNumberOfThingsToDo());
+//   }
+//   void doThings() {
+//     do {
+//       // ... do each thing
+//       SWIFT_ASSERT_ONLY(--verifyCount);
+//     } while (!done());
+//     assert(verifyCount == 0 && "did not do everything");
+//   }
+// };
+#ifdef NDEBUG
+#define SWIFT_ASSERT_ONLY_DECL(...)
+#define SWIFT_ASSERT_ONLY(...) do { } while (false)
+#else
+#define SWIFT_ASSERT_ONLY_DECL(...) __VA_ARGS__
+#define SWIFT_ASSERT_ONLY(...) do { __VA_ARGS__; } while (false)
+#endif
+
 #endif // SWIFT_BASIC_COMPILER_H

@@ -17,6 +17,8 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Stmt.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/SIL/BasicBlockData.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
@@ -67,12 +69,12 @@ static void InsertCFGDiamond(SILValue Cond, SILLocation Loc, SILBuilder &B,
   ContBB = StartBB->split(B.getInsertionPoint());
 
   TrueBB = StartBB->getParent()->createBasicBlock();
-  B.moveBlockTo(TrueBB, ContBB);
+  TrueBB->getParent()->moveBlockBefore(TrueBB, ContBB->getIterator());
   B.setInsertionPoint(TrueBB);
   B.createBranch(Loc, ContBB);
 
   FalseBB = StartBB->getParent()->createBasicBlock();
-  B.moveBlockTo(FalseBB, ContBB);
+  FalseBB->getParent()->moveBlockBefore(FalseBB, ContBB->getIterator());
   B.setInsertionPoint(FalseBB);
   B.createBranch(Loc, ContBB);
 
@@ -136,7 +138,12 @@ namespace {
     //   T,F -> Partial
     SmallBitVector Data;
   public:
-    AvailabilitySet(unsigned NumElts) {
+    AvailabilitySet() {}
+  
+    AvailabilitySet(unsigned NumElts) { init(NumElts); }
+    
+    void init(unsigned NumElts) {
+      Data.set();
       Data.resize(NumElts*2, true);
     }
 
@@ -270,11 +277,15 @@ namespace {
     /// plus the information merged-in from the predecessor blocks.
     Optional<DIKind> OutSelfInitialized;
 
-    LiveOutBlockState(unsigned NumElements)
-      : HasNonLoadUse(false),
-        isInWorkList(false),
-        LocalAvailability(NumElements),
-        OutAvailability(NumElements) {
+    LiveOutBlockState() { init(0); }
+
+    void init(unsigned NumElements) {
+      HasNonLoadUse = false;
+      isInWorkList = false;
+      LocalAvailability.init(NumElements);
+      OutAvailability.init(NumElements);
+      LocalSelfInitialized = None;
+      OutSelfInitialized = None;
     }
 
     /// Sets all unknown elements to not-available.
@@ -371,9 +382,8 @@ namespace {
     DIKind SelfInitialized;
   };
 
-} // end anonymous namespace
+  using BlockStates = BasicBlockData<LiveOutBlockState>;
 
-namespace {
   /// LifetimeChecker - This is the main heavy lifting for definite
   /// initialization checking of a memory object.
   class LifetimeChecker {
@@ -390,7 +400,8 @@ namespace {
     SmallVector<unsigned, 8> NeedsUpdateForInitState;
     std::vector<ConditionalDestroy> ConditionalDestroys;
 
-    llvm::SmallDenseMap<SILBasicBlock*, LiveOutBlockState, 32> PerBlockInfo;
+    BlockStates &blockStates;
+    BasicBlockFlag blockStateInitialized;
 
     /// This is a map of uses that are not loads (i.e., they are Stores,
     /// InOutUses, and Escapes), to their entry in Uses.
@@ -427,7 +438,8 @@ namespace {
     
   public:
     LifetimeChecker(const DIMemoryObjectInfo &TheMemory,
-                    DIElementUseInfo &UseInfo);
+                    DIElementUseInfo &UseInfo,
+                    BlockStates &blockStates);
 
     void doIt();
 
@@ -436,9 +448,10 @@ namespace {
     void emitSelfConsumedDiagnostic(SILInstruction *Inst);
 
     LiveOutBlockState &getBlockInfo(SILBasicBlock *BB) {
-      return PerBlockInfo
-          .insert({BB, LiveOutBlockState(TheMemory.getNumElements())})
-          .first->second;
+      auto &state = blockStates.get(BB, []() { return LiveOutBlockState(); });
+      if (!blockStateInitialized.testAndSet(BB))
+        state.init(TheMemory.getNumElements());
+      return state;
     }
 
     AvailabilitySet getLivenessAtInst(SILInstruction *Inst, unsigned FirstElt,
@@ -460,6 +473,7 @@ namespace {
     void handleStoreUse(unsigned UseID);
     void handleLoadUse(const DIMemoryUse &Use);
     void handleLoadForTypeOfSelfUse(DIMemoryUse &Use);
+    void handleTypeOfSelfUse(DIMemoryUse &Use);
     void handleInOutUse(const DIMemoryUse &Use);
     void handleEscapeUse(const DIMemoryUse &Use);
 
@@ -513,10 +527,12 @@ namespace {
 } // end anonymous namespace
 
 LifetimeChecker::LifetimeChecker(const DIMemoryObjectInfo &TheMemory,
-                                 DIElementUseInfo &UseInfo)
+                                 DIElementUseInfo &UseInfo,
+                                 BlockStates &blockStates)
     : F(TheMemory.getFunction()), Module(TheMemory.getModule()),
       TheMemory(TheMemory), Uses(UseInfo.Uses),
-      StoresToSelf(UseInfo.StoresToSelf), Destroys(UseInfo.Releases) {
+      StoresToSelf(UseInfo.StoresToSelf), Destroys(UseInfo.Releases),
+      blockStates(blockStates), blockStateInitialized(&F) {
 
   // The first step of processing an element is to collect information about the
   // element into data structures we use later.
@@ -530,6 +546,7 @@ LifetimeChecker::LifetimeChecker(const DIMemoryObjectInfo &TheMemory,
     switch (Use.Kind) {
     case DIUseKind::Load:
     case DIUseKind::LoadForTypeOfSelf:
+    case DIUseKind::TypeOfSelf:
     case DIUseKind::Escape:
       continue;
     case DIUseKind::Assign:
@@ -622,6 +639,22 @@ bool LifetimeChecker::shouldEmitError(const SILInstruction *Inst) {
         return L.getSourceLoc() == InstLoc.getSourceLoc();
       }))
     return false;
+
+  // Ignore loads used only by an assign_by_wrapper setter. This
+  // is safe to ignore because assign_by_wrapper will only be
+  // re-written to use the setter if the value is fully initialized.
+  if (auto *load = dyn_cast<SingleValueInstruction>(Inst)) {
+    if (auto Op = load->getSingleUse()) {
+      if (auto PAI = dyn_cast<PartialApplyInst>(Op->getUser())) {
+        if (std::find_if(PAI->use_begin(), PAI->use_end(),
+                         [](auto PAIUse) {
+                           return isa<AssignByWrapperInst>(PAIUse->getUser());
+                         }) != PAI->use_end()) {
+          return false;
+        }
+      }
+    }
+  }
 
   EmittedErrorLocs.push_back(InstLoc);
   return true;
@@ -787,6 +820,9 @@ void LifetimeChecker::doIt() {
     case DIUseKind::LoadForTypeOfSelf:
       handleLoadForTypeOfSelfUse(Use);
       break;
+    case DIUseKind::TypeOfSelf:
+      handleTypeOfSelfUse(Use);
+      break;
     }
   }
 
@@ -835,6 +871,36 @@ void LifetimeChecker::handleLoadUse(const DIMemoryUse &Use) {
     return handleLoadUseFailure(Use, IsSuperInitComplete, FailedSelfUse);
 }
 
+static void replaceValueMetatypeInstWithMetatypeArgument(
+    ValueMetatypeInst *valueMetatype) {
+  SILValue metatypeArgument = valueMetatype->getFunction()->getSelfArgument();
+
+  // SILFunction parameter types never have a DynamicSelfType, since it only
+  // makes sense in the context of a given method's body. Since the
+  // value_metatype instruction might produce a DynamicSelfType we have to
+  // cast the metatype argument.
+  //
+  // FIXME: Semantically, we're "opening" the class metatype here to produce
+  // the "opened" DynamicSelfType. Ideally it would be modeled as an opened
+  // archetype associated with the original metatype or class instance value,
+  // instead of as a "global" type.
+  auto metatypeSelfType = metatypeArgument->getType()
+      .castTo<MetatypeType>().getInstanceType();
+  auto valueSelfType = valueMetatype->getType()
+      .castTo<MetatypeType>().getInstanceType();
+  if (metatypeSelfType != valueSelfType) {
+    assert(metatypeSelfType ==
+           cast<DynamicSelfType>(valueSelfType).getSelfType());
+
+    SILBuilderWithScope B(valueMetatype);
+    metatypeArgument = B.createUncheckedTrivialBitCast(
+        valueMetatype->getLoc(), metatypeArgument,
+        valueMetatype->getType());
+  }
+  InstModCallbacks callbacks;
+  replaceAllSimplifiedUsesAndErase(valueMetatype, metatypeArgument, callbacks);
+}
+
 void LifetimeChecker::handleLoadForTypeOfSelfUse(DIMemoryUse &Use) {
   bool IsSuperInitComplete, FailedSelfUse;
   // If the value is not definitively initialized, replace the
@@ -849,32 +915,7 @@ void LifetimeChecker::handleLoadForTypeOfSelfUse(DIMemoryUse &Use) {
       if (valueMetatype)
         break;
     }
-    assert(valueMetatype);
-    SILValue metatypeArgument = load->getFunction()->getSelfMetadataArgument();
-
-    // SILFunction parameter types never have a DynamicSelfType, since it only
-    // makes sense in the context of a given method's body. Since the
-    // value_metatype instruction might produce a DynamicSelfType we have to
-    // cast the metatype argument.
-    //
-    // FIXME: Semantically, we're "opening" the class metatype here to produce
-    // the "opened" DynamicSelfType. Ideally it would be modeled as an opened
-    // archetype associated with the original metatype or class instance value,
-    // instead of as a "global" type.
-    auto metatypeSelfType = metatypeArgument->getType()
-        .castTo<MetatypeType>().getInstanceType();
-    auto valueSelfType = valueMetatype->getType()
-        .castTo<MetatypeType>().getInstanceType();
-    if (metatypeSelfType != valueSelfType) {
-      assert(metatypeSelfType ==
-             cast<DynamicSelfType>(valueSelfType).getSelfType());
-
-      SILBuilderWithScope B(valueMetatype);
-      metatypeArgument = B.createUncheckedTrivialBitCast(
-          valueMetatype->getLoc(), metatypeArgument,
-          valueMetatype->getType());
-    }
-    replaceAllSimplifiedUsesAndErase(valueMetatype, metatypeArgument);
+    replaceValueMetatypeInstWithMetatypeArgument(valueMetatype);
 
     // Dead loads for type-of-self must be removed.
     // Otherwise it's a violation of memory lifetime.
@@ -884,6 +925,20 @@ void LifetimeChecker::handleLoadForTypeOfSelfUse(DIMemoryUse &Use) {
     }
     assert(load->use_empty());
     load->eraseFromParent();
+    // Clear the Inst pointer just to be sure to avoid use-after-free.
+    Use.Inst = nullptr;
+  }
+}
+
+void LifetimeChecker::handleTypeOfSelfUse(DIMemoryUse &Use) {
+  bool IsSuperInitComplete, FailedSelfUse;
+  // If the value is not definitively initialized, replace the
+  // value_metatype instruction with the metatype argument that was passed into
+  // the initializer.
+  if (!isInitializedAtUse(Use, &IsSuperInitComplete, &FailedSelfUse)) {
+    auto *valueMetatype = cast<ValueMetatypeInst>(Use.Inst);
+    replaceValueMetatypeInstWithMetatypeArgument(valueMetatype);
+
     // Clear the Inst pointer just to be sure to avoid use-after-free.
     Use.Inst = nullptr;
   }
@@ -1818,20 +1873,6 @@ void LifetimeChecker::handleLoadUseFailure(const DIMemoryUse &Use,
       TheMemory.isAnyInitSelf() && !TheMemory.isClassInitSelf()) {
     if (!shouldEmitError(Inst)) return;
 
-    // Ignore loads used only for a set-by-value (nonmutating) setter
-    // since it will be deleted by lowering anyway.
-    auto load = cast<SingleValueInstruction>(Inst);
-    if (auto Op = load->getSingleUse()) {
-      if (auto PAI = dyn_cast<PartialApplyInst>(Op->getUser())) {
-        if (std::find_if(PAI->use_begin(), PAI->use_end(),
-                         [](auto PAIUse) {
-                           return isa<AssignByWrapperInst>(PAIUse->getUser());
-                         }) != PAI->use_end()) {
-          return;
-        }
-      }
-    }
-
     diagnose(Module, Inst->getLoc(), diag::use_of_self_before_fully_init);
     noteUninitializedMembers(Use);
     return;
@@ -1971,16 +2012,13 @@ void LifetimeChecker::updateInstructionForInitState(unsigned UseID) {
 
     switch (Use.Kind) {
     case DIUseKind::Initialization:
-      AI->setAssignInfo(AssignOwnershipQualifier::Init,
-                        AssignByWrapperInst::Destination::BackingWrapper);
+      AI->setMode(AssignByWrapperInst::Initialization);
       break;
     case DIUseKind::Assign:
-      AI->setAssignInfo(AssignOwnershipQualifier::Reassign,
-                        AssignByWrapperInst::Destination::BackingWrapper);
+      AI->setMode(AssignByWrapperInst::Assign);
       break;
     case DIUseKind::AssignWrappedValue:
-      AI->setAssignInfo(AssignOwnershipQualifier::Reassign,
-                        AssignByWrapperInst::Destination::WrappedValue);
+      AI->setMode(AssignByWrapperInst::AssignWrappedValue);
       break;
     default:
       llvm_unreachable("Wrong use kind for assign_by_wrapper");
@@ -2001,6 +2039,18 @@ void LifetimeChecker::processUninitializedReleaseOfBox(
   SILBuilderWithScope B(Release);
   B.setInsertionPoint(InsertPt);
   Destroys.push_back(B.createDeallocBox(Release->getLoc(), MUI));
+}
+
+static void emitDefaultActorDestroy(SILBuilder &B, SILLocation loc,
+                                    SILValue self) {
+  auto builtinName = B.getASTContext().getIdentifier(
+    getBuiltinName(BuiltinValueKind::DestroyDefaultActor));
+  auto resultTy = B.getModule().Types.getEmptyTupleType();
+
+  self = B.createBeginBorrow(loc, self);
+  B.createBuiltin(loc, builtinName, resultTy, /*subs*/{},
+                  { self });
+  B.createEndBorrow(loc, self);
 }
 
 void LifetimeChecker::processUninitializedRelease(SILInstruction *Release,
@@ -2052,6 +2102,15 @@ void LifetimeChecker::processUninitializedRelease(SILInstruction *Release,
       Metatype = B.createValueMetatype(Loc, SILMetatypeTy, Pointer);
     else
       Metatype = B.createMetatype(Loc, SILMetatypeTy);
+
+    // If this is a root default actor, destroy the default-actor state.
+    // SILGen ensures that this is unconditionally initialized, so we
+    // don't need to track it specially.
+    if (!TheMemory.isDelegatingInit()) {
+      auto classDecl = TheMemory.getASTType().getClassOrBoundGenericClass();
+      if (classDecl && classDecl->isRootDefaultActor())
+        emitDefaultActorDestroy(B, Loc, Pointer);
+    }
 
     // We've already destroyed any instance variables initialized by this
     // constructor, now destroy instance variables initialized by subclass
@@ -3040,7 +3099,8 @@ bool LifetimeChecker::isInitializedAtUse(const DIMemoryUse &Use,
 //                           Top Level Driver
 //===----------------------------------------------------------------------===//
 
-static void processMemoryObject(MarkUninitializedInst *I) {
+static void processMemoryObject(MarkUninitializedInst *I,
+                                BlockStates &blockStates) {
   LLVM_DEBUG(llvm::dbgs() << "*** Definite Init looking at: " << *I << "\n");
   DIMemoryObjectInfo MemInfo(I);
 
@@ -3050,7 +3110,7 @@ static void processMemoryObject(MarkUninitializedInst *I) {
   // Walk the use list of the pointer, collecting them into the Uses array.
   collectDIElementUsesFrom(MemInfo, UseInfo);
 
-  LifetimeChecker(MemInfo, UseInfo).doIt();
+  LifetimeChecker(MemInfo, UseInfo, blockStates).doIt();
 }
 
 /// Check that all memory objects that require initialization before use are
@@ -3060,6 +3120,8 @@ static bool checkDefiniteInitialization(SILFunction &Fn) {
   LLVM_DEBUG(llvm::dbgs() << "*** Definite Init visiting function: "
                           <<  Fn.getName() << "\n");
   bool Changed = false;
+
+  BlockStates blockStates(&Fn);
 
   for (auto &BB : Fn) {
     for (auto I = BB.begin(), E = BB.end(); I != E;) {
@@ -3072,7 +3134,7 @@ static bool checkDefiniteInitialization(SILFunction &Fn) {
       }
 
       // Then process the memory object.
-      processMemoryObject(MUI);
+      processMemoryObject(MUI, blockStates);
 
       // Move off of the MUI only after we have processed memory objects. The
       // lifetime checker may rewrite instructions, so it is important to not

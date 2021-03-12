@@ -177,6 +177,16 @@ enum class ConstraintKind : char {
   /// - Handled specially by binding inference, specifically contributes
   ///   to the bindings only if there are no contextual types available.
   DefaultClosureType,
+  /// The first type represents a result of an unresolved member chain,
+  /// and the second type is its base type. This constraint acts almost
+  /// like `Equal` but also enforces following semantics:
+  ///
+  /// - It's possible to infer a base from a result type by looking through
+  ///   this constraint, but it's only solved when both types are bound.
+  ///
+  /// - If base is a protocol metatype, this constraint becomes a conformance
+  ///   check instead of an equality.
+  UnresolvedMemberChainBase,
 };
 
 /// Classification of the different kinds of constraints.
@@ -381,43 +391,45 @@ class Constraint final : public llvm::ilist_node<Constraint>,
   void *operator new(size_t) = delete;
 
   Constraint(ConstraintKind kind, ArrayRef<Constraint *> constraints,
-             ConstraintLocator *locator, ArrayRef<TypeVariableType *> typeVars);
+             ConstraintLocator *locator,
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a new constraint.
   Constraint(ConstraintKind kind, Type first, Type second,
              ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a new constraint.
   Constraint(ConstraintKind kind, Type first, Type second, Type third,
              ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a new member constraint.
   Constraint(ConstraintKind kind, Type first, Type second, DeclNameRef member,
              DeclContext *useDC, FunctionRefKind functionRefKind,
              ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a new value witness constraint.
   Constraint(ConstraintKind kind, Type first, Type second,
              ValueDecl *requirement, DeclContext *useDC,
              FunctionRefKind functionRefKind, ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a new overload-binding constraint, which might have a fix.
   Constraint(Type type, OverloadChoice choice, DeclContext *useDC,
              ConstraintFix *fix, ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a restricted constraint.
   Constraint(ConstraintKind kind, ConversionRestrictionKind restriction,
              Type first, Type second, ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
-  
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
+
   /// Construct a relational constraint with a fix.
   Constraint(ConstraintKind kind, ConstraintFix *fix, Type first, Type second,
-             ConstraintLocator *locator, ArrayRef<TypeVariableType *> typeVars);
+             ConstraintLocator *locator,
+             SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Retrieve the type variables buffer, for internal mutation.
   MutableArrayRef<TypeVariableType *> getTypeVariablesBuffer() {
@@ -568,6 +580,7 @@ public:
     case ConstraintKind::OneWayEqual:
     case ConstraintKind::OneWayBindParam:
     case ConstraintKind::DefaultClosureType:
+    case ConstraintKind::UnresolvedMemberChainBase:
       return ConstraintClassification::Relational;
 
     case ConstraintKind::ValueMember:
@@ -672,14 +685,22 @@ public:
     return Nested;
   }
 
-  unsigned countActiveNestedConstraints() const {
-    unsigned count = 0;
-    for (auto *constraint : Nested)
-      if (!constraint->isDisabled())
-        count++;
-
-    return count;
+  unsigned countFavoredNestedConstraints() const {
+    return llvm::count_if(Nested, [](const Constraint *constraint) {
+      return constraint->isFavored() && !constraint->isDisabled();
+    });
   }
+
+  unsigned countActiveNestedConstraints() const {
+    return llvm::count_if(Nested, [](const Constraint *constraint) {
+      return !constraint->isDisabled();
+    });
+  }
+
+  /// Returns the number of resolved argument types for an applied disjunction
+  /// constriant. This is always zero for disjunctions that do not represent
+  /// an applied overload.
+  unsigned countResolvedArgumentTypes(ConstraintSystem &cs) const;
 
   /// Determine if this constraint represents explicit conversion,
   /// e.g. coercion constraint "as X" which forms a disjunction.

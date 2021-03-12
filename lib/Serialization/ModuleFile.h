@@ -465,6 +465,12 @@ public:
     return Core->Bits.IsImplicitDynamicEnabled;
   }
 
+  /// Whether this module is compiled while allowing errors
+  /// ('-experimental-allow-module-with-compiler-errors').
+  bool isAllowModuleWithCompilerErrorsEnabled() const {
+    return Core->Bits.IsAllowModuleWithCompilerErrorsEnabled;
+  }
+
   /// \c true if this module has incremental dependency information.
   bool hasIncrementalInfo() const { return Core->hasIncrementalInfo(); }
 
@@ -480,10 +486,14 @@ public:
   /// This does not include diagnostics about \e this file failing to load,
   /// but rather other things that might be imported as part of bringing the
   /// file into the AST.
+  /// \param recoverFromIncompatibility Whether to associate the file
+  /// regardless of the compatibility with the AST module. Still returns the
+  /// underlying error for diagnostic purposes but does not set the error bit.
   ///
   /// \returns any error that occurred during association, such as being
   /// compiled for a different OS.
-  Status associateWithFileContext(FileUnit *file, SourceLoc diagLoc);
+  Status associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
+                                  bool recoverFromIncompatibility);
 
   /// Returns `true` if there is a buffer that might contain source code where
   /// other parts of the compiler could have emitted diagnostics, to indicate
@@ -605,6 +615,8 @@ public:
          SmallVectorImpl<Decl*> &Results,
          llvm::function_ref<bool(DeclAttributes)> matchAttributes = nullptr);
 
+  void getExportedPrespecializations(SmallVectorImpl<Decl *> &results);
+
   /// Adds all operators to the given vector.
   void getOperatorDecls(SmallVectorImpl<OperatorDecl *> &Results);
 
@@ -685,6 +697,10 @@ public:
   Optional<StringRef> getGroupNameByUSR(StringRef USR) const;
   Optional<BasicDeclLocs> getBasicDeclLocsForDecl(const Decl *D) const;
   Identifier getDiscriminatorForPrivateValue(const ValueDecl *D);
+  Optional<Fingerprint> loadFingerprint(const IterableDeclContext *IDC) const;
+  void collectBasicSourceFileInfo(
+      llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const;
+
 
   // MARK: Deserialization interface
 
@@ -793,8 +809,11 @@ public:
   llvm::Expected<NormalProtocolConformance *>
   readNormalConformanceChecked(serialization::NormalConformanceID id);
 
-  /// Reads a foreign error conformance from \c DeclTypeCursor, if present.
+  /// Reads a foreign error convention from \c DeclTypeCursor, if present.
   Optional<ForeignErrorConvention> maybeReadForeignErrorConvention();
+
+  /// Reads a foreign async convention from \c DeclTypeCursor, if present.
+  Optional<ForeignAsyncConvention> maybeReadForeignAsyncConvention();
 
   /// Reads inlinable body text from \c DeclTypeCursor, if present.
   Optional<StringRef> maybeReadInlinableBodyText();

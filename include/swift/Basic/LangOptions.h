@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -18,18 +18,19 @@
 #ifndef SWIFT_BASIC_LANGOPTIONS_H
 #define SWIFT_BASIC_LANGOPTIONS_H
 
-#include "swift/Config.h"
+#include "swift/Basic/FunctionBodySkipping.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
+#include "swift/Config.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Support/Regex.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/VersionTuple.h"
+#include "llvm/Support/raw_ostream.h"
 #include <string>
 #include <vector>
 
@@ -81,6 +82,9 @@ namespace swift {
     /// The target variant SDK version, if known.
     Optional<llvm::VersionTuple> VariantSDKVersion;
 
+    /// The alternate name to use for the entry point instead of main.
+    std::string entryPointFunctionName = "main";
+
     ///
     /// Language features
     ///
@@ -93,6 +97,9 @@ namespace swift {
 
     /// Disable API availability checking.
     bool DisableAvailabilityChecking = false;
+
+    /// Should conformance availability violations be diagnosed as errors?
+    bool EnableConformanceAvailabilityErrors = false;
 
     /// Maximum number of typo corrections we are allowed to perform.
     /// This is disabled by default until we can get typo-correction working within acceptable performance bounds.
@@ -112,7 +119,7 @@ namespace swift {
     std::string RequireExplicitAvailabilityTarget;
 
     // Availability macros definitions to be expanded at parsing.
-    SmallVector<StringRef, 4> AvailabilityMacros;
+    SmallVector<std::string, 4> AvailabilityMacros;
 
     /// If false, '#file' evaluates to the full path rather than a
     /// human-readable string.
@@ -124,6 +131,9 @@ namespace swift {
     /// Emit a remark when import resolution implicitly adds a cross-import
     /// overlay.
     bool EnableCrossImportRemarks = false;
+
+    /// Emit a remark after loading a module.
+    bool EnableModuleLoadingRemarks = false;
 
     ///
     /// Support for alternate usage modes
@@ -211,18 +221,11 @@ namespace swift {
     /// Enable named lazy member loading.
     bool NamedLazyMemberLoading = true;
     
-    /// The path to which we should emit GraphViz output for the complete
-    /// request-evaluator graph.
-    std::string RequestEvaluatorGraphVizPath;
-    
+    /// Whether to record request references for incremental builds.
+    bool RecordRequestReferences = true;
+
     /// Whether to dump debug info for request evaluator cycles.
     bool DebugDumpCycles = false;
-
-    /// Whether to build a request dependency graph for debugging.
-    bool BuildRequestDependencyGraph = false;
-
-    /// Enable SIL type lowering
-    bool EnableSubstSILFunctionTypesForFunctionValues = true;
 
     /// Whether to diagnose an ephemeral to non-ephemeral conversion as an
     /// error.
@@ -235,11 +238,29 @@ namespace swift {
     /// optimized custom allocator, so that memory debugging tools can be used.
     bool UseMalloc = false;
 
+    /// Provide additional warnings about code that is unsafe in the
+    /// eventual Swift concurrency model, and will eventually become errors
+    /// in a future Swift language version, but are too noisy for existing
+    /// language modes.
+    bool WarnConcurrency = false;
+
     /// Enable experimental #assert feature.
     bool EnableExperimentalStaticAssert = false;
 
     /// Enable experimental concurrency model.
     bool EnableExperimentalConcurrency = false;
+
+    /// Enable experimental flow-sensitive concurrent captures.
+    bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
+
+    /// Enable inference of ConcurrentValue conformances for public types.
+    bool EnableInferPublicConcurrentValue = false;
+
+    /// Enable experimental derivation of `Codable` for enums.
+    bool EnableExperimentalEnumCodableDerivation = false;
+
+    /// Disable the implicit import of the _Concurrency module.
+    bool DisableImplicitConcurrencyModuleImport = false;
 
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
@@ -250,9 +271,6 @@ namespace swift {
     ///
     /// This is a staging flag; eventually it will be removed.
     bool EnableDeserializationRecovery = true;
-
-    /// Someday, ASTScopeLookup will supplant lookup in the parser
-    bool DisableParserLookup = false;
 
     /// Whether to enable the new operator decl and precedencegroup lookup
     /// behavior. This is a staging flag, and will be removed in the future.
@@ -359,6 +377,24 @@ namespace swift {
     /// recovery issues won't bring down the debugger.
     /// TODO: remove this when @_implementationOnly modules are robust enough.
     bool AllowDeserializingImplementationOnly = false;
+
+    // Allow errors during module generation. See corresponding option in
+    // FrontendOptions.
+    bool AllowModuleWithCompilerErrors = false;
+
+    /// A helper enum to represent whether or not we customized the default
+    /// ASTVerifier behavior via a frontend flag. By default, we do not
+    /// customize.
+    ///
+    /// NOTE: The default behavior is to run the ASTVerifier only when asserts
+    /// are enabled. This just allows for one to customize that behavior.
+    enum class ASTVerifierOverrideKind {
+      NoOverride = 0,
+      EnableVerifier = 1,
+      DisableVerifier = 2,
+    };
+    ASTVerifierOverrideKind ASTVerifierOverride =
+        ASTVerifierOverrideKind::NoOverride;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -489,9 +525,8 @@ namespace swift {
     /// dumped to llvm::errs().
     bool DebugTimeExpressions = false;
 
-    /// Indicate that the type checker should skip type-checking non-inlinable
-    /// function bodies.
-    bool SkipNonInlinableFunctionBodies = false;
+    /// Controls the function bodies to skip during type-checking.
+    FunctionBodySkipping SkipFunctionBodies = FunctionBodySkipping::None;
 
     ///
     /// Flags for developers
@@ -538,13 +573,12 @@ namespace swift {
     /// Disable constraint system performance hacks.
     bool DisableConstraintSolverPerformanceHacks = false;
 
-    /// Enable constraint solver support for experimental
-    ///        operator protocol designator feature.
-    bool SolverEnableOperatorDesignatedTypes = false;
-
     /// Enable experimental support for one-way constraints for the
     /// parameters of closures.
     bool EnableOneWayClosureParameters = false;
+
+    /// See \ref FrontendOptions.PrintFullConvention
+    bool PrintFullConvention = false;
   };
 
   /// Options for controlling the behavior of the Clang importer.

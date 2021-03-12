@@ -18,6 +18,7 @@
 #include "CodeSynthesis.h"
 #include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
 #include "TypeCheckType.h"
 #include "swift/AST/ASTContext.h"
@@ -144,15 +145,10 @@ StoredPropertiesRequest::evaluate(Evaluator &evaluator,
   if (isa<SourceFile>(decl->getModuleScopeContext()))
     computeLoweredStoredProperties(decl);
 
-  ASTContext &ctx = decl->getASTContext();
   for (auto *member : decl->getMembers()) {
     if (auto *var = dyn_cast<VarDecl>(member))
       if (!var->isStatic() && var->hasStorage()) {
-        // Actor storage always goes at the beginning.
-        if (var->getName() == ctx.Id_actorStorage)
-          results.insert(results.begin(), var);
-        else
-          results.push_back(var);
+        results.push_back(var);
       }
   }
 
@@ -721,10 +717,16 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
       // Adjust the self type of the access to refer to the relevant superclass.
       auto *baseClass = override->getDeclContext()->getSelfClassDecl();
       selfTypeForAccess = selfTypeForAccess->getSuperclassForDecl(baseClass);
-      subs =
-        selfTypeForAccess->getContextSubstitutionMap(
-          accessor->getParentModule(),
-          baseClass);
+
+      // Error recovery path. We get an ErrorType here if getSuperclassForDecl()
+      // fails (because, for instance, a generic parameter of a generic nominal
+      // type cannot be resolved).
+      if (!selfTypeForAccess->is<ErrorType>()) {
+        subs =
+          selfTypeForAccess->getContextSubstitutionMap(
+            accessor->getParentModule(),
+            baseClass);
+      }
 
       storage = override;
 
@@ -785,10 +787,11 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
         if (accessor->getAccessorKind() == AccessorKind::Get ||
             accessor->getAccessorKind() == AccessorKind::Read) {
           if (wrappedValue->getAttrs().getUnavailable(ctx)) {
+            ExportContext where = ExportContext::forDeclSignature(var);
             diagnoseExplicitUnavailability(
                 wrappedValue,
                 var->getAttachedPropertyWrappers()[i]->getRangeWithAt(),
-                var->getDeclContext(), nullptr);
+                where, nullptr);
           }
         }
 
@@ -1327,7 +1330,8 @@ synthesizeLazyGetterBody(AccessorDecl *Get, VarDecl *VD, VarDecl *Storage,
 
   // Recontextualize any closure declcontexts nested in the initializer to
   // realize that they are in the getter function.
-  Get->getImplicitSelfDecl()->setDeclContext(Get);
+  if (Get->hasImplicitSelfDecl())
+    Get->getImplicitSelfDecl()->setDeclContext(Get);
 
   InitValue->walk(RecontextualizeClosures(Get));
 
@@ -1360,7 +1364,8 @@ synthesizeLazyGetterBody(AccessorDecl *Get, VarDecl *VD, VarDecl *Storage,
 
   Body.push_back(new (Ctx) ReturnStmt(SourceLoc(), Tmp2DRE, /*implicit*/true));
 
-  return { BraceStmt::create(Ctx, VD->getLoc(), Body, VD->getLoc(),
+  auto Range = InitValue->getSourceRange();
+  return { BraceStmt::create(Ctx, Range.Start, Body, Range.End,
                              /*implicit*/true),
            /*isTypeChecked=*/true };
 }
@@ -1897,6 +1902,7 @@ static AccessorDecl *createGetterPrototype(AbstractStorageDecl *storage,
       getterParams,
       Type(),
       storage->getDeclContext());
+  getter->setSynthesized();
 
   // If we're stealing the 'self' from a lazy initializer, set it now.
   // Note that we don't re-parent the 'self' declaration to be part of
@@ -1946,6 +1952,7 @@ static AccessorDecl *createSetterPrototype(AbstractStorageDecl *storage,
       genericParams, params,
       Type(),
       storage->getDeclContext());
+  setter->setSynthesized();
 
   if (isMutating)
     setter->setSelfAccessKind(SelfAccessKind::Mutating);
@@ -2056,7 +2063,8 @@ createCoroutineAccessorPrototype(AbstractStorageDecl *storage,
       /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
       /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
       genericParams, params, retTy, dc);
-  
+  accessor->setSynthesized();
+
   if (isMutating)
     accessor->setSelfAccessKind(SelfAccessKind::Mutating);
   else
@@ -2307,6 +2315,8 @@ IsAccessorTransparentRequest::evaluate(Evaluator &evaluator,
       // Anything else should not have a synthesized setter.
       LLVM_FALLTHROUGH;
     case WriteImplKind::Immutable:
+      if (accessor->getASTContext().LangOpts.AllowModuleWithCompilerErrors)
+        return false;
       llvm_unreachable("should not be synthesizing accessor in this case");
 
     case WriteImplKind::StoredWithObservers:
@@ -2429,14 +2439,19 @@ static VarDecl *synthesizePropertyWrapperProjectionVar(
 
   // Compute the name of the storage type.
   SmallString<64> nameBuf;
-  nameBuf = "$";
-  nameBuf += var->getName().str();
+  if (var->getName().hasDollarPrefix()) {
+    nameBuf = var->getName().str();
+  } else {
+    nameBuf = "$";
+    nameBuf += var->getName().str();
+  }
   Identifier name = ctx.getIdentifier(nameBuf);
 
   // Determine the type of the property.
-  Type propertyType = wrapperType->getTypeOfMember(
-      var->getModuleContext(), wrapperVar,
-      wrapperVar->getValueInterfaceType());
+  Type propertyType;
+  if (wrapperType)
+    propertyType = wrapperType->getTypeOfMember(var->getModuleContext(), wrapperVar,
+                                                wrapperVar->getValueInterfaceType());
 
   // Form the property.
   auto dc = var->getDeclContext();
@@ -2444,7 +2459,8 @@ static VarDecl *synthesizePropertyWrapperProjectionVar(
                                         VarDecl::Introducer::Var,
                                         var->getLoc(),
                                         name, dc);
-  property->setInterfaceType(propertyType);
+  if (propertyType)
+    property->setInterfaceType(propertyType);
   property->setImplicit();
   property->setOriginalWrappedProperty(var);
   addMemberToContextIfNeeded(property, dc, var);
@@ -2466,16 +2482,23 @@ static VarDecl *synthesizePropertyWrapperProjectionVar(
   property->overwriteSetterAccess(var->getSetterFormalAccess());
 
   // Add the accessors we need.
-  bool hasSetter = wrapperVar->isSettable(nullptr) &&
-      wrapperVar->isSetterAccessibleFrom(var->getInnermostDeclContext());
-  if (hasSetter)
-    property->setImplInfo(StorageImplInfo::getMutableComputed());
-  else
+  if (var->hasImplicitPropertyWrapper()) {
+    // FIXME: This can have a setter, but we need a resolved type first
+    // to figure it out.
     property->setImplInfo(StorageImplInfo::getImmutableComputed());
+  } else {
+    bool hasSetter = wrapperVar->isSettable(nullptr) &&
+    wrapperVar->isSetterAccessibleFrom(var->getInnermostDeclContext());
+    if (hasSetter)
+      property->setImplInfo(StorageImplInfo::getMutableComputed());
+    else
+      property->setImplInfo(StorageImplInfo::getImmutableComputed());
+  }
 
-  var->getAttrs().add(
-      new (ctx) ProjectedValuePropertyAttr(name, SourceLoc(), SourceRange(),
-                                            /*Implicit=*/true));
+  if (!isa<ParamDecl>(var))
+    var->getAttrs().add(
+        new (ctx) ProjectedValuePropertyAttr(name, SourceLoc(), SourceRange(),
+                                             /*Implicit=*/true));
   return property;
 }
 
@@ -2505,7 +2528,6 @@ static void typeCheckSynthesizedWrapperInitializer(
           dyn_cast_or_null<Initializer>(pbd->getInitContext(i))) {
     TypeChecker::contextualizeInitializer(initializerContext, initializer);
   }
-  TypeChecker::checkPropertyWrapperEffects(pbd, initializer);
 }
 
 static PropertyWrapperMutability::Value
@@ -2673,102 +2695,155 @@ PropertyWrapperLValuenessRequest::evaluate(Evaluator &,
 PropertyWrapperBackingPropertyInfo
 PropertyWrapperBackingPropertyInfoRequest::evaluate(Evaluator &evaluator,
                                                     VarDecl *var) const {
-  // Determine the type of the backing property.
-  auto wrapperType = var->getPropertyWrapperBackingPropertyType();
-  if (!wrapperType || wrapperType->hasError())
+  if (!var->hasAttachedPropertyWrapper())
     return PropertyWrapperBackingPropertyInfo();
 
   auto wrapperInfo = var->getAttachedPropertyWrapperTypeInfo(0);
-  if (!wrapperInfo)
-    return PropertyWrapperBackingPropertyInfo();
 
   // Compute the name of the storage type.
   ASTContext &ctx = var->getASTContext();
   SmallString<64> nameBuf;
   nameBuf = "_";
-  nameBuf += var->getName().str();
+  if (var->getName().hasDollarPrefix())
+    nameBuf += var->getName().str().drop_front();
+  else
+    nameBuf += var->getName().str();
   Identifier name = ctx.getIdentifier(nameBuf);
 
-  // Determine the type of the storage.
   auto dc = var->getDeclContext();
+  VarDecl *backingVar = nullptr;
+  VarDecl *projectionVar = nullptr;
+
+  if (auto *param = dyn_cast<ParamDecl>(var)) {
+    backingVar = ParamDecl::cloneWithoutType(ctx, param);
+    backingVar->setName(name);
+    Type wrapperType;
+
+    // If this is a function parameter, compute the backing
+    // type now. For closure parameters, let the constraint
+    // system infer the backing type.
+    if (!var->getInterfaceType()->hasError()) {
+      wrapperType = var->getPropertyWrapperBackingPropertyType();
+      if (!wrapperType || wrapperType->hasError())
+        return PropertyWrapperBackingPropertyInfo();
+
+      backingVar->setInterfaceType(wrapperType);
+    }
+
+    if (wrapperInfo.projectedValueVar || var->getName().hasDollarPrefix()) {
+      projectionVar =
+          synthesizePropertyWrapperProjectionVar(ctx, var, wrapperType,
+                                                 wrapperInfo.projectedValueVar);
+    }
+  }
+
+  if (!wrapperInfo)
+    return PropertyWrapperBackingPropertyInfo(backingVar, projectionVar);
+
+  // Determine the type of the storage.
+  auto wrapperType = var->getPropertyWrapperBackingPropertyType();
+  if (!wrapperType || wrapperType->hasError())
+    return PropertyWrapperBackingPropertyInfo(backingVar, projectionVar);
+
   Type storageInterfaceType = wrapperType;
   Type storageType = dc->mapTypeIntoContext(storageInterfaceType);
 
   // Create the backing storage property and note it in the cache.
-  VarDecl *backingVar = new (ctx) VarDecl(/*IsStatic=*/var->isStatic(),
-                                          VarDecl::Introducer::Var,
-                                          var->getLoc(),
-                                          name, dc);
-  backingVar->setInterfaceType(storageInterfaceType);
-  backingVar->setImplicit();
-  backingVar->setOriginalWrappedProperty(var);
+  PatternBindingDecl *pbd = nullptr;
+  if (!backingVar) {
+    backingVar = new (ctx) VarDecl(/*IsStatic=*/var->isStatic(),
+                                   VarDecl::Introducer::Var,
+                                   var->getLoc(),
+                                   name, dc);
+    backingVar->setInterfaceType(storageInterfaceType);
+    backingVar->setImplicit();
+    backingVar->setOriginalWrappedProperty(var);
 
-  // The backing storage is 'private'.
-  backingVar->overwriteAccess(AccessLevel::Private);
-  backingVar->overwriteSetterAccess(AccessLevel::Private);
+    // The backing storage is 'private'.
+    backingVar->overwriteAccess(AccessLevel::Private);
+    backingVar->overwriteSetterAccess(AccessLevel::Private);
 
-  addMemberToContextIfNeeded(backingVar, dc, var);
+    addMemberToContextIfNeeded(backingVar, dc, var);
 
-  // Create the pattern binding declaration for the backing property.
-  Pattern *pbdPattern = NamedPattern::createImplicit(ctx, backingVar);
-  pbdPattern->setType(storageType);
-  pbdPattern = TypedPattern::createImplicit(ctx, pbdPattern, storageType);
-  auto pbd = PatternBindingDecl::createImplicit(
-      ctx, var->getCorrectStaticSpelling(), pbdPattern,
-      /*init*/ nullptr, dc, SourceLoc());
-  addMemberToContextIfNeeded(pbd, dc, var);
-  pbd->setStatic(var->isStatic());
-
-  // Take the initializer from the original property.
-  auto parentPBD = var->getParentPatternBinding();
-  unsigned patternNumber = parentPBD->getPatternEntryIndexForVarDecl(var);
-  
-  // Force the default initializer to come into existence, if there is one,
-  // and the wrapper doesn't provide its own.
-  if (!parentPBD->isInitialized(patternNumber)
-      && parentPBD->isDefaultInitializable(patternNumber)
-      && !wrapperInfo.defaultInit) {
-    auto ty = parentPBD->getPattern(patternNumber)->getType();
-    if (auto defaultInit = TypeChecker::buildDefaultInitializer(ty))
-      parentPBD->setInit(patternNumber, defaultInit);
-  }
-  
-  if (parentPBD->isInitialized(patternNumber) &&
-      !parentPBD->isInitializerChecked(patternNumber)) {
-    TypeChecker::typeCheckPatternBinding(parentPBD, patternNumber);
+    // Create the pattern binding declaration for the backing property.
+    Pattern *pbdPattern = NamedPattern::createImplicit(ctx, backingVar);
+    pbdPattern->setType(storageType);
+    pbdPattern = TypedPattern::createImplicit(ctx, pbdPattern, storageType);
+    pbd = PatternBindingDecl::createImplicit(ctx, var->getCorrectStaticSpelling(), pbdPattern,
+                                             /*init*/ nullptr, dc, SourceLoc());
+    addMemberToContextIfNeeded(pbd, dc, var);
+    pbd->setStatic(var->isStatic());
   }
 
   Expr *initializer = nullptr;
   PropertyWrapperValuePlaceholderExpr *wrappedValue = nullptr;
 
-  if ((initializer = parentPBD->getInit(patternNumber))) {
-    pbd->setInit(0, initializer);
-    pbd->setInitializerChecked(0);
-    wrappedValue = findWrappedValuePlaceholder(initializer);
-  } else {
-    if (!parentPBD->isInitialized(patternNumber) && wrapperInfo.defaultInit) {
-      // FIXME: Record this expression somewhere so that DI can perform the
-      // initialization itself.
-      Expr *initializer = nullptr;
-      typeCheckSynthesizedWrapperInitializer(pbd, backingVar, parentPBD,
-                                             initializer);
-      pbd->setInit(0, initializer);
-      pbd->setInitializerChecked(0);
-    } else if (var->hasObservers() && !dc->isTypeContext()) {
-      var->diagnose(diag::observingprop_requires_initializer);
+  // Take the initializer from the original property.
+  if (!isa<ParamDecl>(var)) {
+    auto parentPBD = var->getParentPatternBinding();
+    unsigned patternNumber = parentPBD->getPatternEntryIndexForVarDecl(var);
+
+    // Force the default initializer to come into existence, if there is one,
+    // and the wrapper doesn't provide its own.
+    if (!parentPBD->isInitialized(patternNumber)
+        && parentPBD->isDefaultInitializable(patternNumber)
+        && !wrapperInfo.defaultInit) {
+      auto ty = parentPBD->getPattern(patternNumber)->getType();
+      if (auto defaultInit = TypeChecker::buildDefaultInitializer(ty))
+        parentPBD->setInit(patternNumber, defaultInit);
     }
 
-    if (var->getOpaqueResultTypeDecl()) {
-      var->diagnose(diag::opaque_type_var_no_underlying_type);
+    if (parentPBD->isInitialized(patternNumber) &&
+        !parentPBD->isInitializerChecked(patternNumber)) {
+      TypeChecker::typeCheckPatternBinding(parentPBD, patternNumber);
+    }
+
+    if ((initializer = parentPBD->getInit(patternNumber))) {
+      pbd->setInit(0, initializer);
+      pbd->setInitializerChecked(0);
+      wrappedValue = findWrappedValuePlaceholder(initializer);
+    } else {
+      if (!parentPBD->isInitialized(patternNumber) && wrapperInfo.defaultInit) {
+        // FIXME: Record this expression somewhere so that DI can perform the
+        // initialization itself.
+        Expr *initializer = nullptr;
+        typeCheckSynthesizedWrapperInitializer(pbd, backingVar, parentPBD,
+                                               initializer);
+        pbd->setInit(0, initializer);
+        pbd->setInitializerChecked(0);
+      } else if (var->hasObservers() && !dc->isTypeContext()) {
+        var->diagnose(diag::observingprop_requires_initializer);
+      }
+
+      if (var->getOpaqueResultTypeDecl()) {
+        var->diagnose(diag::opaque_type_var_no_underlying_type);
+      }
     }
   }
 
   // If there is a projection property (projectedValue) in the wrapper,
   // synthesize a computed property for '$foo'.
-  VarDecl *storageVar = nullptr;
+  Expr *projectedValueInit = nullptr;
   if (wrapperInfo.projectedValueVar) {
-    storageVar = synthesizePropertyWrapperProjectionVar(
-        ctx, var, storageInterfaceType, wrapperInfo.projectedValueVar);
+    if (!projectionVar) {
+      projectionVar = synthesizePropertyWrapperProjectionVar(ctx, var, storageInterfaceType,
+                                                             wrapperInfo.projectedValueVar);
+    }
+
+    // Projected-value initialization is currently only supported for parameters.
+    if (wrapperInfo.hasProjectedValueInit && isa<ParamDecl>(var)) {
+      auto *param = dyn_cast<ParamDecl>(var);
+      auto *placeholder = PropertyWrapperValuePlaceholderExpr::create(
+          ctx, var->getSourceRange(), projectionVar->getType(), /*projectedValue=*/nullptr);
+      projectedValueInit = buildPropertyWrapperInitCall(var, backingVar->getType(),
+          placeholder, PropertyWrapperInitKind::ProjectedValue);
+      TypeChecker::typeCheckExpression(projectedValueInit, dc);
+
+      // Check initializer effects.
+      auto *initContext = new (ctx) PropertyWrapperInitializer(
+          dc, param, PropertyWrapperInitializer::Kind::ProjectedValue);
+      TypeChecker::checkInitializerEffects(initContext, projectedValueInit);
+    }
   }
 
   // If no initial wrapped value was provided via '=' and either:
@@ -2779,22 +2854,87 @@ PropertyWrapperBackingPropertyInfoRequest::evaluate(Evaluator &evaluator,
   // value.
   if (!wrappedValue && (!var->allAttachedPropertyWrappersHaveWrappedValueInit() ||
                         initializer)) {
-    return PropertyWrapperBackingPropertyInfo(
-        backingVar, storageVar, nullptr, nullptr);
+    return PropertyWrapperBackingPropertyInfo(backingVar, projectionVar, nullptr,
+                                              projectedValueInit);
   }
 
   // Form the initialization of the backing property from a value of the
   // original property's type.
-  if (!initializer) {
-    initializer = PropertyWrapperValuePlaceholderExpr::create(
+  Expr *wrappedValueInit = initializer;
+  if (!wrappedValueInit) {
+    wrappedValueInit = PropertyWrapperValuePlaceholderExpr::create(
         ctx, var->getSourceRange(), var->getType(), /*wrappedValue=*/nullptr);
-    typeCheckSynthesizedWrapperInitializer(
-        pbd, backingVar, parentPBD, initializer);
-    wrappedValue = findWrappedValuePlaceholder(initializer);
+
+    if (auto *param = dyn_cast<ParamDecl>(var)) {
+      wrappedValueInit = buildPropertyWrapperInitCall(var, backingVar->getType(), wrappedValueInit,
+                                                      PropertyWrapperInitKind::WrappedValue);
+      TypeChecker::typeCheckExpression(wrappedValueInit, dc);
+
+      // Check initializer effects.
+      auto *initContext = new (ctx) PropertyWrapperInitializer(
+          dc, param, PropertyWrapperInitializer::Kind::WrappedValue);
+      TypeChecker::contextualizeInitializer(initContext, wrappedValueInit);
+      checkInitializerActorIsolation(initContext, wrappedValueInit);
+      TypeChecker::checkInitializerEffects(initContext, wrappedValueInit);
+    } else {
+      typeCheckSynthesizedWrapperInitializer(
+          pbd, backingVar, var->getParentPatternBinding(), wrappedValueInit);
+    }
   }
 
-  return PropertyWrapperBackingPropertyInfo(backingVar, storageVar,
-                                            initializer, wrappedValue);
+  return PropertyWrapperBackingPropertyInfo(backingVar, projectionVar,
+                                            wrappedValueInit,
+                                            projectedValueInit);
+}
+
+VarDecl *
+PropertyWrapperWrappedValueVarRequest::evaluate(Evaluator &evaluator,
+                                                VarDecl *var) const {
+  auto wrapperInfo = var->getPropertyWrapperBackingPropertyInfo();
+  if (!wrapperInfo || !isa<ParamDecl>(var))
+    return nullptr;
+
+  auto dc = var->getDeclContext();
+  auto &ctx = var->getASTContext();
+
+  SmallString<64> nameBuf;
+  if (var->getName().hasDollarPrefix()) {
+    nameBuf = var->getName().str().drop_front();
+  } else {
+    nameBuf = var->getName().str();
+  }
+  Identifier name = ctx.getIdentifier(nameBuf);
+
+  VarDecl *localVar = new (ctx) VarDecl(/*IsStatic=*/false,
+                                        VarDecl::Introducer::Var,
+                                        var->getLoc(), name, dc);
+  if (!var->hasImplicitPropertyWrapper())
+    localVar->setInterfaceType(var->getInterfaceType());
+  localVar->setImplicit();
+  localVar->getAttrs() = var->getAttrs();
+  localVar->overwriteAccess(var->getFormalAccess());
+
+  if (var->hasImplicitPropertyWrapper()) {
+    // FIXME: This can have a setter, but we need a resolved wrapper type
+    // to figure it out.
+    localVar->setImplInfo(StorageImplInfo::getImmutableComputed());
+  } else {
+    auto mutability = *var->getPropertyWrapperMutability();
+    if (mutability.Getter == PropertyWrapperMutability::Mutating) {
+      ctx.Diags.diagnose(var->getLoc(), diag::property_wrapper_param_mutating);
+      return nullptr;
+    }
+
+    if (mutability.Setter == PropertyWrapperMutability::Nonmutating) {
+      localVar->setImplInfo(StorageImplInfo::getMutableComputed());
+    } else {
+      localVar->setImplInfo(StorageImplInfo::getImmutableComputed());
+    }
+  }
+
+  evaluator.cacheOutput(PropertyWrapperBackingPropertyInfoRequest{localVar},
+                        std::move(wrapperInfo));
+  return localVar;
 }
 
 /// Given a storage declaration in a protocol, set it up with the right
@@ -2804,7 +2944,7 @@ static void finishProtocolStorageImplInfo(AbstractStorageDecl *storage,
   if (auto *var = dyn_cast<VarDecl>(storage)) {
     SourceLoc typeLoc;
     if (auto *repr = var->getTypeReprOrParentPatternTypeRepr())
-      typeLoc = repr->getLoc();
+      typeLoc = repr->getEndLoc();
     
     if (info.hasStorage()) {
       // Protocols cannot have stored properties.
@@ -2911,7 +3051,7 @@ static void finishPropertyWrapperImplInfo(VarDecl *var,
     return;
   }
 
-  if (var->hasObservers()) {
+  if (var->hasObservers() || var->getDeclContext()->isLocalContext()) {
     info = StorageImplInfo::getMutableComputed();
   } else {
     info = StorageImplInfo(ReadImplKind::Get, WriteImplKind::Set,

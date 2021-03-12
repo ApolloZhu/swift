@@ -637,15 +637,18 @@ DebugValueAddrInst *SILBuilder::createDebugValueAddr(SILLocation Loc,
 
 void SILBuilder::emitScopedBorrowOperation(SILLocation loc, SILValue original,
                                            function_ref<void(SILValue)> &&fun) {
-  if (original->getType().isAddress()) {
-    original = createLoadBorrow(loc, original);
+  SILValue value = original;
+  if (value->getType().isAddress()) {
+    value = createLoadBorrow(loc, value);
   } else {
-    original = createBeginBorrow(loc, original);
+    value = emitBeginBorrowOperation(loc, value);
   }
 
-  fun(original);
+  fun(value);
 
-  createEndBorrow(loc, original);
+  // If we actually inserted a borrowing operation... insert the end_borrow.
+  if (value != original)
+    createEndBorrow(loc, value);
 }
 
 CheckedCastBranchInst *SILBuilder::createCheckedCastBranch(
@@ -653,11 +656,37 @@ CheckedCastBranchInst *SILBuilder::createCheckedCastBranch(
     SILType destLoweredTy, CanType destFormalTy,
     SILBasicBlock *successBB, SILBasicBlock *failureBB,
     ProfileCounter target1Count, ProfileCounter target2Count) {
+  return createCheckedCastBranch(Loc, isExact, op, destLoweredTy, destFormalTy,
+                                 successBB, failureBB, op.getOwnershipKind(),
+                                 target1Count, target2Count);
+}
+
+CheckedCastBranchInst *SILBuilder::createCheckedCastBranch(
+    SILLocation Loc, bool isExact, SILValue op, SILType destLoweredTy,
+    CanType destFormalTy, SILBasicBlock *successBB, SILBasicBlock *failureBB,
+    ValueOwnershipKind forwardingOwnershipKind, ProfileCounter target1Count,
+    ProfileCounter target2Count) {
   assert((!hasOwnership() || !failureBB->getNumArguments() ||
           failureBB->getArgument(0)->getType() == op->getType()) &&
          "failureBB's argument doesn't match incoming argument type");
   return insertTerminator(CheckedCastBranchInst::create(
-      getSILDebugLocation(Loc), isExact, op,
-      destLoweredTy, destFormalTy, successBB, failureBB,
-      getFunction(), C.OpenedArchetypes, target1Count, target2Count));
+      getSILDebugLocation(Loc), isExact, op, destLoweredTy, destFormalTy,
+      successBB, failureBB, getFunction(), C.OpenedArchetypes, target1Count,
+      target2Count, forwardingOwnershipKind));
+}
+
+void SILBuilderWithScope::insertAfter(SILInstruction *inst,
+                                      function_ref<void(SILBuilder &)> func) {
+  if (isa<TermInst>(inst)) {
+    for (const SILSuccessor &succ : inst->getParent()->getSuccessors()) {
+      SILBasicBlock *succBlock = succ;
+      assert(succBlock->getSinglePredecessorBlock() == inst->getParent() &&
+             "the terminator instruction must not have critical successors");
+      SILBuilderWithScope builder(succBlock->begin());
+      func(builder);
+    }
+  } else {
+    SILBuilderWithScope builder(std::next(inst->getIterator()));
+    func(builder);
+  }
 }

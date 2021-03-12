@@ -17,6 +17,7 @@
 #ifndef SWIFT_AST_EXPR_H
 #define SWIFT_AST_EXPR_H
 
+#include "swift/AST/Attr.h"
 #include "swift/AST/CaptureInfo.h"
 #include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/DeclContext.h"
@@ -165,8 +166,9 @@ protected:
 
   SWIFT_INLINE_BITFIELD_EMPTY(LiteralExpr, Expr);
   SWIFT_INLINE_BITFIELD_EMPTY(IdentityExpr, Expr);
-  SWIFT_INLINE_BITFIELD(LookupExpr, Expr, 1,
-    IsSuper : 1
+  SWIFT_INLINE_BITFIELD(LookupExpr, Expr, 1+1,
+    IsSuper : 1,
+    IsImplicitlyAsync : 1
   );
   SWIFT_INLINE_BITFIELD_EMPTY(DynamicLookupExpr, LookupExpr);
 
@@ -192,9 +194,10 @@ protected:
     LiteralCapacity : 32
   );
 
-  SWIFT_INLINE_BITFIELD(DeclRefExpr, Expr, 2+2,
+  SWIFT_INLINE_BITFIELD(DeclRefExpr, Expr, 2+2+1,
     Semantics : 2, // an AccessSemantics
-    FunctionRefKind : 2
+    FunctionRefKind : 2,
+    IsImplicitlyAsync : 1
   );
 
   SWIFT_INLINE_BITFIELD(UnresolvedDeclRefExpr, Expr, 2+2,
@@ -334,9 +337,11 @@ protected:
     NumCaptures : 32
   );
 
-  SWIFT_INLINE_BITFIELD(ApplyExpr, Expr, 1+1,
+  SWIFT_INLINE_BITFIELD(ApplyExpr, Expr, 1+1+1+1,
     ThrowsIsSet : 1,
-    Throws : 1
+    Throws : 1,
+    ImplicitlyAsync : 1,
+    NoAsync : 1
   );
 
   SWIFT_INLINE_BITFIELD_FULL(CallExpr, ApplyExpr, 1+1+16,
@@ -1188,6 +1193,7 @@ public:
     Bits.DeclRefExpr.FunctionRefKind =
       static_cast<unsigned>(Loc.isCompound() ? FunctionRefKind::Compound
                                              : FunctionRefKind::Unapplied);
+    Bits.DeclRefExpr.IsImplicitlyAsync = false;
   }
 
   /// Retrieve the declaration to which this expression refers.
@@ -1199,6 +1205,16 @@ public:
   /// getter or setter.
   AccessSemantics getAccessSemantics() const {
     return (AccessSemantics) Bits.DeclRefExpr.Semantics;
+  }
+
+  /// Determine whether this reference needs to happen asynchronously, i.e.,
+  /// guarded by hop_to_executor
+  bool isImplicitlyAsync() const { return Bits.DeclRefExpr.IsImplicitlyAsync; }
+
+  /// Set whether this reference needs to happen asynchronously, i.e.,
+  /// guarded by hop_to_executor
+  void setImplicitlyAsync(bool isImplicitlyAsync) {
+    Bits.DeclRefExpr.IsImplicitlyAsync = isImplicitlyAsync;
   }
 
   /// Retrieve the concrete declaration reference.
@@ -1516,6 +1532,7 @@ protected:
                           bool Implicit)
       : Expr(Kind, Implicit), Base(base), Member(member) {
     Bits.LookupExpr.IsSuper = false;
+    Bits.LookupExpr.IsImplicitlyAsync = false;
     assert(Base);
   }
 
@@ -1544,6 +1561,16 @@ public:
 
   /// Set whether this reference refers to the superclass's property.
   void setIsSuper(bool isSuper) { Bits.LookupExpr.IsSuper = isSuper; }
+
+  /// Determine whether this reference needs to happen asynchronously, i.e.,
+  /// guarded by hop_to_executor
+  bool isImplicitlyAsync() const { return Bits.LookupExpr.IsImplicitlyAsync; }
+
+  /// Set whether this reference needs to happen asynchronously, i.e.,
+  /// guarded by hop_to_executor
+  void setImplicitlyAsync(bool isImplicitlyAsync) {
+    Bits.LookupExpr.IsImplicitlyAsync = isImplicitlyAsync;
+  }
 
   static bool classof(const Expr *E) {
     return E->getKind() >= ExprKind::First_LookupExpr &&
@@ -3116,29 +3143,14 @@ public:
 class LoadExpr : public ImplicitConversionExpr {
 public:
   LoadExpr(Expr *subExpr, Type type)
-    : ImplicitConversionExpr(ExprKind::Load, subExpr, type) {}
+    : ImplicitConversionExpr(ExprKind::Load, subExpr, type) { }
 
   static bool classof(const Expr *E) { return E->getKind() == ExprKind::Load; }
-};
-
-/// This is a conversion from an expression of UnresolvedType to an arbitrary
-/// other type, and from an arbitrary type to UnresolvedType.  This node does
-/// not appear in valid code, only in code involving diagnostics.
-class UnresolvedTypeConversionExpr : public ImplicitConversionExpr {
-public:
-  UnresolvedTypeConversionExpr(Expr *subExpr, Type type)
-  : ImplicitConversionExpr(ExprKind::UnresolvedTypeConversion, subExpr, type) {}
-
-  static bool classof(const Expr *E) {
-    return E->getKind() == ExprKind::UnresolvedTypeConversion;
-  }
 };
 
 /// FunctionConversionExpr - Convert a function to another function type,
 /// which might involve renaming the parameters or handling substitutions
 /// of subtypes (in the return) or supertypes (in the input).
-///
-/// FIXME: This should be a CapturingExpr.
 class FunctionConversionExpr : public ImplicitConversionExpr {
 public:
   FunctionConversionExpr(Expr *subExpr, Type type)
@@ -3553,6 +3565,79 @@ public:
   }
 };
 
+/// Actor isolation for a closure.
+class ClosureActorIsolation {
+public:
+  enum Kind {
+    /// The closure is independent of any actor.
+    Independent,
+
+    /// The closure is tied to the actor instance described by the given
+    /// \c VarDecl*, which is the (captured) `self` of an actor.
+    ActorInstance,
+
+    /// The closure is tied to the global actor described by the given type.
+    GlobalActor,
+  };
+
+private:
+    /// The actor to which this closure is isolated.
+    ///
+    /// There are three possible states:
+    ///   - NULL: The closure is independent of any actor.
+    ///   - VarDecl*: The 'self' variable for the actor instance to which
+    ///     this closure is isolated. It will always have a type that conforms
+    ///     to the \c Actor protocol.
+    ///   - Type: The type of the global actor on which
+  llvm::PointerUnion<VarDecl *, Type> storage;
+
+  ClosureActorIsolation(VarDecl *selfDecl) : storage(selfDecl) { }
+  ClosureActorIsolation(Type globalActorType) : storage(globalActorType) { }
+
+public:
+  ClosureActorIsolation() : storage() { }
+
+  static ClosureActorIsolation forIndependent() {
+    return ClosureActorIsolation();
+  }
+
+  static ClosureActorIsolation forActorInstance(VarDecl *selfDecl) {
+    return ClosureActorIsolation(selfDecl);
+  }
+
+  static ClosureActorIsolation forGlobalActor(Type globalActorType) {
+    return ClosureActorIsolation(globalActorType);
+  }
+
+  /// Determine the kind of isolation.
+  Kind getKind() const {
+    if (storage.isNull())
+      return Kind::Independent;
+
+    if (storage.is<VarDecl *>())
+      return Kind::ActorInstance;
+
+    return Kind::GlobalActor;
+  }
+
+  /// Whether the closure is isolated at all.
+  explicit operator bool() const {
+    return getKind() != Kind::Independent;
+  }
+
+  /// Whether the closure is isolated at all.
+  operator Kind() const {
+    return getKind();
+  }
+
+  VarDecl *getActorInstance() const {
+    return storage.dyn_cast<VarDecl *>();
+  }
+
+  Type getGlobalActor() const {
+    return storage.dyn_cast<Type>();
+  }
+};
 
 /// A base class for closure expressions.
 class AbstractClosureExpr : public DeclContext, public Expr {
@@ -3560,6 +3645,9 @@ class AbstractClosureExpr : public DeclContext, public Expr {
 
   /// The set of parameters.
   ParameterList *parameterList;
+
+  /// Actor isolation of the closure.
+  ClosureActorIsolation actorIsolation;
 
 public:
   AbstractClosureExpr(ExprKind Kind, Type FnType, bool Implicit,
@@ -3624,6 +3712,12 @@ public:
   ///
   /// Only valid when \c hasSingleExpressionBody() is true.
   Expr *getSingleExpressionBody() const;
+
+  ClosureActorIsolation getActorIsolation() const { return actorIsolation; }
+
+  void setActorIsolation(ClosureActorIsolation actorIsolation) {
+    this->actorIsolation = actorIsolation;
+  }
 
   static bool classof(const Expr *E) {
     return E->getKind() >= ExprKind::First_AbstractClosureExpr &&
@@ -3695,7 +3789,7 @@ public:
     ReadyForTypeChecking,
 
     /// The body was typechecked with the enclosing closure.
-    /// i.e. single expression closure or function builder closure.
+    /// i.e. single expression closure or result builder closure.
     TypeCheckedWithSignature,
 
     /// The body was type checked separately from the enclosing closure.
@@ -3703,6 +3797,9 @@ public:
   };
 
 private:
+  /// The attributes attached to the closure.
+  DeclAttributes Attributes;
+
   /// The range of the brackets of the capture list, if present.
   SourceRange BracketRange;
     
@@ -3735,13 +3832,14 @@ private:
   /// was originally just a single expression.
   llvm::PointerIntPair<BraceStmt *, 1, bool> Body;
 public:
-  ClosureExpr(SourceRange bracketRange, VarDecl *capturedSelfDecl,
+  ClosureExpr(const DeclAttributes &attributes,
+              SourceRange bracketRange, VarDecl *capturedSelfDecl,
               ParameterList *params, SourceLoc asyncLoc, SourceLoc throwsLoc,
               SourceLoc arrowLoc, SourceLoc inLoc, TypeExpr *explicitResultType,
               unsigned discriminator, DeclContext *parent)
     : AbstractClosureExpr(ExprKind::Closure, Type(), /*Implicit=*/false,
                           discriminator, parent),
-      BracketRange(bracketRange),
+      Attributes(attributes), BracketRange(bracketRange),
       CapturedSelfDecl(capturedSelfDecl),
       AsyncLoc(asyncLoc), ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc),
       InLoc(inLoc),
@@ -3761,6 +3859,9 @@ public:
     Body.setPointer(S);
     Body.setInt(isSingleExpression);
   }
+
+  DeclAttributes &getAttrs() { return Attributes; }
+  const DeclAttributes &getAttrs() const { return Attributes; }
 
   /// Determine whether the parameters of this closure are actually
   /// anonymous closure variables.
@@ -3903,7 +4004,10 @@ public:
 
     // An autoclosure with type (Self) -> (Args...) -> Result. Formed from type
     // checking a partial application.
-    DoubleCurryThunk = 2
+    DoubleCurryThunk = 2,
+
+    // An autoclosure with type () -> Result that was formed for an async let.
+    AsyncLet = 3,
   };
 
   AutoClosureExpr(Expr *Body, Type ResultTy, unsigned Discriminator,
@@ -4149,6 +4253,62 @@ public:
   }
 };
 
+/// An implicit applied property wrapper expression.
+class AppliedPropertyWrapperExpr final : public Expr {
+public:
+  enum class ValueKind {
+    WrappedValue,
+    ProjectedValue
+  };
+
+private:
+  /// The concrete callee which owns the property wrapper.
+  ConcreteDeclRef Callee;
+
+  /// The owning declaration.
+  const ParamDecl *Param;
+
+  /// The source location of the argument list.
+  SourceLoc Loc;
+
+  /// The value to which the property wrapper is applied for initialization.
+  Expr *Value;
+
+  /// The kind of value that the property wrapper is applied to.
+  ValueKind Kind;
+
+  AppliedPropertyWrapperExpr(ConcreteDeclRef callee, const ParamDecl *param, SourceLoc loc,
+                             Type Ty, Expr *value, ValueKind kind)
+      : Expr(ExprKind::AppliedPropertyWrapper, /*Implicit=*/true, Ty),
+        Callee(callee), Param(param), Loc(loc), Value(value), Kind(kind) {}
+
+public:
+  static AppliedPropertyWrapperExpr *
+  create(ASTContext &ctx, ConcreteDeclRef callee, const ParamDecl *param, SourceLoc loc,
+         Type Ty, Expr *value, ValueKind kind);
+
+  SourceRange getSourceRange() const { return Loc; }
+
+  ConcreteDeclRef getCallee() { return Callee; }
+
+  /// Returns the parameter declaration with the attached property wrapper.
+  const ParamDecl *getParamDecl() const { return Param; };
+
+  /// Returns the value that the property wrapper is applied to.
+  Expr *getValue() { return Value; }
+
+  /// Sets the value that the property wrapper is applied to.
+  void setValue(Expr *value) { Value = value; }
+
+  /// Returns the kind of value, between wrapped value and projected
+  /// value, the property wrapper is applied to.
+  ValueKind getValueKind() const { return Kind; }
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::AppliedPropertyWrapper;
+  }
+};
+
 /// An expression referring to a default argument left unspecified at the
 /// call site.
 ///
@@ -4223,6 +4383,8 @@ protected:
     assert(classof((Expr*)this) && "ApplyExpr::classof out of date");
     assert(validateArg(Arg) && "Arg is not a permitted expr kind");
     Bits.ApplyExpr.ThrowsIsSet = false;
+    Bits.ApplyExpr.ImplicitlyAsync = false;
+    Bits.ApplyExpr.NoAsync = false;
   }
 
 public:
@@ -4259,6 +4421,39 @@ public:
     assert(!Bits.ApplyExpr.ThrowsIsSet);
     Bits.ApplyExpr.ThrowsIsSet = true;
     Bits.ApplyExpr.Throws = throws;
+  }
+
+  /// Is this a 'rethrows' function that is known not to throw?
+  bool isNoThrows() const { return !throws(); }
+
+  /// Is this a 'reasync' function that is known not to 'await'?
+  bool isNoAsync() const { return Bits.ApplyExpr.NoAsync; }
+  void setNoAsync(bool noAsync) {
+    Bits.ApplyExpr.NoAsync = noAsync;
+  }
+
+  /// Is this application _implicitly_ required to be an async call?
+  /// That is, does it need to be guarded by hop_to_executor.
+  /// Note that this is _not_ a check for whether the callee is async!
+  /// Only meaningful after complete type-checking.
+  ///
+  /// Generally, this comes up only when we have a non-self call to an actor
+  /// instance's synchronous method. Such calls are conceptually treated as if
+  /// they are wrapped with an async closure. For example,
+  ///
+  ///   act.syncMethod(a, b) 
+  ///
+  /// is equivalent to the eta-expanded version of act.syncMethod,
+  ///
+  ///   { (a1, b1) async in act.syncMethod(a1, b1) }(a, b)
+  ///
+  /// where the new closure is declared to be async.
+  ///
+  bool implicitlyAsync() const {
+    return Bits.ApplyExpr.ImplicitlyAsync;
+  }
+  void setImplicitlyAsync(bool flag) {
+    Bits.ApplyExpr.ImplicitlyAsync = flag;
   }
 
   ValueDecl *getCalledValue() const;
@@ -5455,6 +5650,26 @@ public:
       case Kind::Identity:
       case Kind::TupleElement:
         llvm_unreachable("no unresolved name for this kind");
+      }
+      llvm_unreachable("unhandled kind");
+    }
+
+    bool hasDeclRef() const {
+      switch (getKind()) {
+      case Kind::Property:
+      case Kind::Subscript:
+        return true;
+
+      case Kind::Invalid:
+      case Kind::UnresolvedProperty:
+      case Kind::UnresolvedSubscript:
+      case Kind::OptionalChain:
+      case Kind::OptionalWrap:
+      case Kind::OptionalForce:
+      case Kind::Identity:
+      case Kind::TupleElement:
+      case Kind::DictionaryKey:
+        return false;
       }
       llvm_unreachable("unhandled kind");
     }

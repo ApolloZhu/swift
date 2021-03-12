@@ -75,8 +75,8 @@ SIMPLE_LOCATOR_PATH_ELT(FunctionArgument)
 /// The result type of a function.
 SIMPLE_LOCATOR_PATH_ELT(FunctionResult)
 
-/// The result type of a function builder body.
-SIMPLE_LOCATOR_PATH_ELT(FunctionBuilderBodyResult)
+/// The result type of a result builder body.
+SIMPLE_LOCATOR_PATH_ELT(ResultBuilderBodyResult)
 
 /// A generic argument.
 /// FIXME: Add support for named generic arguments?
@@ -147,8 +147,8 @@ ABSTRACT_LOCATOR_PATH_ELT(AnyRequirement)
   /// A single requirement placed on the type parameters.
   CUSTOM_LOCATOR_PATH_ELT(TypeParameterRequirement)
 
-/// RValue adjustment.
-SIMPLE_LOCATOR_PATH_ELT(RValueAdjustment)
+/// Access to `.dynamicType` element
+SIMPLE_LOCATOR_PATH_ELT(DynamicType)
 
 /// The element type of a sequence in a for ... in ... loop.
 SIMPLE_LOCATOR_PATH_ELT(SequenceElementType)
@@ -194,6 +194,12 @@ CUSTOM_LOCATOR_PATH_ELT(ArgumentAttribute)
 
 /// The result of a chain of member accesses off an UnresolvedMemberExpr
 SIMPLE_LOCATOR_PATH_ELT(UnresolvedMemberChainResult)
+
+/// The conformance requirement associated with a type.
+CUSTOM_LOCATOR_PATH_ELT(ConformanceRequirement)
+
+/// A source-specified placeholder.
+CUSTOM_LOCATOR_PATH_ELT(PlaceholderType)
 
 #undef LOCATOR_PATH_ELT
 #undef CUSTOM_LOCATOR_PATH_ELT

@@ -17,6 +17,7 @@
 #ifndef SWIFT_MODULE_H
 #define SWIFT_MODULE_H
 
+#include "swift/AST/AccessNotes.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/Identifier.h"
@@ -249,6 +250,8 @@ private:
   /// \see EntryPointInfoTy
   EntryPointInfoTy EntryPointInfo;
 
+  AccessNotesFile accessNotes;
+
   ModuleDecl(Identifier name, ASTContext &ctx, ImplicitImportInfo importInfo);
 
 public:
@@ -278,6 +281,9 @@ public:
   /// Retrieve a list of modules that each file of this module implicitly
   /// imports.
   ImplicitImportList getImplicitImports() const;
+
+  AccessNotesFile &getAccessNotes() { return accessNotes; }
+  const AccessNotesFile &getAccessNotes() const { return accessNotes; }
 
   ArrayRef<FileUnit *> getFiles() {
     assert(!Files.empty() || failedToLoad());
@@ -572,6 +578,9 @@ public:
          ObjCSelector selector,
          SmallVectorImpl<AbstractFunctionDecl *> &results) const;
 
+  Optional<Fingerprint>
+  loadFingerprint(const IterableDeclContext *IDC) const;
+
   /// Find all SPI names imported from \p importedModule by this module,
   /// collecting the identifiers in \p spiGroups.
   void lookupImportedSPIGroups(
@@ -593,8 +602,7 @@ public:
     Default = 1 << 1,
     /// Include imports declared with `@_implementationOnly`.
     ImplementationOnly = 1 << 2,
-    /// Include imports of SPIs declared with `@_spi`. Non-SPI imports are
-    /// included whether or not this flag is specified.
+    /// Include imports of SPIs declared with `@_spi`
     SPIAccessControl = 1 << 3,
     /// Include imports shadowed by a cross-import overlay. Unshadowed imports
     /// are included whether or not this flag is specified.
@@ -605,33 +613,8 @@ public:
 
   /// Looks up which modules are imported by this module.
   ///
-  /// \p filter controls which imports are included in the list.
-  ///
-  /// There are three axes for categorizing imports:
-  /// 1. Privacy: Exported/Private/ImplementationOnly (mutually exclusive).
-  /// 2. SPI/non-SPI: An import of any privacy level may be @_spi("SPIName").
-  /// 3. Shadowed/Non-shadowed: An import of any privacy level may be shadowed
-  ///    by a cross-import overlay.
-  ///
-  /// It is also possible for SPI imports to be shadowed by a cross-import
-  /// overlay.
-  ///
-  /// If \p filter contains multiple privacy levels, modules at all the privacy
-  /// levels are included.
-  ///
-  /// If \p filter contains \c ImportFilterKind::SPIAccessControl, then both
-  /// SPI and non-SPI imports are included. Otherwise, only non-SPI imports are
-  /// included.
-  ///
-  /// If \p filter contains \c ImportFilterKind::ShadowedByCrossImportOverlay,
-  /// both shadowed and non-shadowed imports are included. Otherwise, only
-  /// non-shadowed imports are included.
-  ///
-  /// Clang modules have some additional complexities; see the implementation of
-  /// \c ClangModuleUnit::getImportedModules for details.
-  ///
-  /// \pre \p filter must contain at least one privacy level, i.e. one of
-  ///      \c Exported or \c Private or \c ImplementationOnly.
+  /// \p filter controls whether public, private, or any imports are included
+  /// in this list.
   void getImportedModules(SmallVectorImpl<ImportedModule> &imports,
                           ImportFilter filter = ImportFilterKind::Exported) const;
 
@@ -649,11 +632,17 @@ public:
   /// This assumes that \p module was imported.
   bool isImportedImplementationOnly(const ModuleDecl *module) const;
 
+  /// Returns true if a function, which is using \p nominal, can be serialized
+  /// by cross-module-optimization.
+  bool canBeUsedForCrossModuleOptimization(NominalTypeDecl *nominal) const;
+
   /// Finds all top-level decls of this module.
   ///
   /// This does a simple local lookup, not recursively looking through imports.
   /// The order of the results is not guaranteed to be meaningful.
   void getTopLevelDecls(SmallVectorImpl<Decl*> &Results) const;
+
+  void getExportedPrespecializations(SmallVectorImpl<Decl *> &results) const;
 
   /// Finds top-level decls of this module filtered by their attributes.
   ///
@@ -720,6 +709,9 @@ public:
   /// \returns true if this module is the "SwiftOnoneSupport" module;
   bool isOnoneSupportModule() const;
 
+  /// \returns true if this module is the "Foundation" module;
+  bool isFoundationModule() const;
+
   /// \returns true if traversal was aborted, false otherwise.
   bool walk(ASTWalker &Walker);
 
@@ -745,6 +737,23 @@ public:
   ReverseFullNameIterator getReverseFullModuleName() const {
     return ReverseFullNameIterator(this);
   }
+
+  /// Calls \p callback for each source file of the module.
+  void collectBasicSourceFileInfo(
+      llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const;
+
+public:
+  /// Retrieve a fingerprint value that summarizes the contents of this module.
+  ///
+  /// This interface hash a of a module is guaranteed to change if the interface
+  /// hash of any of its (primary) source files changes. For example, when
+  /// building incrementally, the interface hash of this module will change when
+  /// the primaries contributing to its content changes. In contrast, when
+  /// a module is deserialized, the hash of every source file contributes to
+  /// the module's interface hash. It therefore serves as an effective, if
+  /// coarse-grained, way of determining when top-level changes to a module's
+  /// contents have been made.
+  Fingerprint getFingerprint() const;
 
   SourceRange getSourceRange() const { return SourceRange(); }
 

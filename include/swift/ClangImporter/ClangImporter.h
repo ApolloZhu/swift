@@ -23,7 +23,7 @@
 
 namespace llvm {
   class Triple;
-  class FileCollector;
+  class FileCollectorBase;
   template<typename Fn> class function_ref;
 }
 
@@ -172,9 +172,9 @@ public:
 
   /// Create a new clang::DependencyCollector customized to
   /// ClangImporter's specific uses.
-  static std::shared_ptr<clang::DependencyCollector>
-  createDependencyCollector(IntermoduleDepTrackingMode Mode,
-                            std::shared_ptr<llvm::FileCollector> FileCollector);
+  static std::shared_ptr<clang::DependencyCollector> createDependencyCollector(
+      IntermoduleDepTrackingMode Mode,
+      std::shared_ptr<llvm::FileCollectorBase> FileCollector);
 
   /// Append visible module names to \p names. Note that names are possibly
   /// duplicated, and not guaranteed to be ordered in any way.
@@ -239,6 +239,10 @@ public:
   lookupRelatedEntity(StringRef clangName, ClangTypeKind kind,
                       StringRef relatedEntityKind,
                       llvm::function_ref<void(TypeDecl *)> receiver) override;
+
+  StructDecl *
+  instantiateCXXClassTemplate(clang::ClassTemplateDecl *decl,
+                      ArrayRef<clang::TemplateArgument> arguments) override;
 
   /// Just like Decl::getClangNode() except we look through to the 'Code'
   /// enum of an error wrapper struct.
@@ -472,6 +476,11 @@ public:
 
   bool isSerializable(const clang::Type *type,
                       bool checkCanonical) const override;
+
+  clang::FunctionDecl *
+  instantiateCXXFunctionTemplate(ASTContext &ctx,
+                                 clang::FunctionTemplateDecl *func,
+                                 SubstitutionMap subst) override;
 };
 
 ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
@@ -482,6 +491,9 @@ ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
 /// building a ModuleInterfaceLoader.
 std::string
 getModuleCachePathFromClang(const clang::CompilerInstance &Instance);
+
+/// Whether the given parameter name identifies a completion handler.
+bool isCompletionHandlerParamName(StringRef paramName);
 
 } // end namespace swift
 

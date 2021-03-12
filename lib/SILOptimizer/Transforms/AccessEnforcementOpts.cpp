@@ -17,6 +17,8 @@
 /// - Should run immediately before the AccessEnforcementWMO to share
 ///   AccessedStorageAnalysis results.
 ///
+/// - Benefits from running after AccessEnforcementReleaseSinking.
+///
 /// This pass optimizes access enforcement as follows:
 ///
 /// **Access marker folding**
@@ -566,7 +568,7 @@ bool AccessConflictAndMergeAnalysis::identifyBeginAccesses() {
       // now, since this optimization runs at the end of the pipeline, we
       // gracefully ignore unrecognized source address patterns, which show up
       // here as an invalid `storage` value.
-      AccessedStorage storage = findAccessedStorage(beginAccess->getSource());
+      auto storage = AccessedStorage::compute(beginAccess->getSource());
 
       auto iterAndInserted = storageSet.insert(storage);
 
@@ -727,7 +729,7 @@ void AccessConflictAndMergeAnalysis::visitFullApply(FullApplySite fullApply,
   ASA->getCallSiteEffects(callSiteAccesses, fullApply);
 
   LLVM_DEBUG(llvm::dbgs() << "Visiting: " << *fullApply.getInstruction()
-                          << "  call site accesses: ";
+                          << "  call site accesses:\n";
              callSiteAccesses.dump());
   recordConflicts(state, callSiteAccesses.getResult());
 }
@@ -1092,10 +1094,6 @@ struct AccessEnforcementOpts : public SILFunctionTransform {
   void run() override {
     SILFunction *F = getFunction();
     if (F->empty())
-      return;
-
-    // FIXME: Support ownership.
-    if (F->hasOwnership())
       return;
 
     LLVM_DEBUG(llvm::dbgs() << "Running local AccessEnforcementOpts on "

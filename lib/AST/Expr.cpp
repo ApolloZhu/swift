@@ -126,7 +126,7 @@ namespace {
 } // end anonymous namespace
 
 void Expr::setType(Type T) {
-  assert(!T || !T->hasTypeVariable() || !T->hasHole());
+  assert(!T || !T->hasTypeVariable() || !T->hasPlaceholder());
   Ty = T;
 }
 
@@ -320,6 +320,7 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
 
   NO_REFERENCE(OpaqueValue);
   NO_REFERENCE(PropertyWrapperValuePlaceholder);
+  NO_REFERENCE(AppliedPropertyWrapper);
   NO_REFERENCE(DefaultArgument);
 
   PASS_THROUGH_REFERENCE(BindOptional, getSubExpr);
@@ -337,7 +338,6 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
 
   PASS_THROUGH_REFERENCE(Load, getSubExpr);
   NO_REFERENCE(DestructureTuple);
-  NO_REFERENCE(UnresolvedTypeConversion);
   PASS_THROUGH_REFERENCE(FunctionConversion, getSubExpr);
   PASS_THROUGH_REFERENCE(CovariantFunctionConversion, getSubExpr);
   PASS_THROUGH_REFERENCE(CovariantReturnConversion, getSubExpr);
@@ -634,6 +634,7 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::RebindSelfInConstructor:
   case ExprKind::OpaqueValue:
   case ExprKind::PropertyWrapperValuePlaceholder:
+  case ExprKind::AppliedPropertyWrapper:
   case ExprKind::DefaultArgument:
   case ExprKind::BindOptional:
   case ExprKind::OptionalEvaluation:
@@ -661,7 +662,6 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
 
   case ExprKind::Load:
   case ExprKind::DestructureTuple:
-  case ExprKind::UnresolvedTypeConversion:
   case ExprKind::FunctionConversion:
   case ExprKind::CovariantFunctionConversion:
   case ExprKind::CovariantReturnConversion:
@@ -1501,11 +1501,20 @@ PropertyWrapperValuePlaceholderExpr *
 PropertyWrapperValuePlaceholderExpr::create(ASTContext &ctx, SourceRange range,
                                             Type ty, Expr *wrappedValue,
                                             bool isAutoClosure) {
-  auto *placeholder =
-      new (ctx) OpaqueValueExpr(range, ty, /*isPlaceholder=*/true);
+  OpaqueValueExpr *placeholder = nullptr;
+  if (ty)
+    placeholder = new (ctx) OpaqueValueExpr(range, ty, /*isPlaceholder=*/true);
 
   return new (ctx) PropertyWrapperValuePlaceholderExpr(
       range, ty, placeholder, wrappedValue, isAutoClosure);
+}
+
+AppliedPropertyWrapperExpr *
+AppliedPropertyWrapperExpr::create(ASTContext &ctx, ConcreteDeclRef callee,
+                                   const ParamDecl *param,
+                                   SourceLoc loc, Type Ty, Expr *value,
+                                   AppliedPropertyWrapperExpr::ValueKind kind) {
+  return new (ctx) AppliedPropertyWrapperExpr(callee, param, loc, Ty, value, kind);
 }
 
 const ParamDecl *DefaultArgumentExpr::getParamDecl() const {
@@ -1974,10 +1983,10 @@ FORWARD_SOURCE_LOCS_TO(ClosureExpr, Body.getPointer())
 
 Expr *ClosureExpr::getSingleExpressionBody() const {
   assert(hasSingleExpressionBody() && "Not a single-expression body");
-  auto body = getBody()->getFirstElement();
+  auto body = getBody()->getLastElement();
   if (auto stmt = body.dyn_cast<Stmt *>()) {
     if (auto braceStmt = dyn_cast<BraceStmt>(stmt))
-      return braceStmt->getFirstElement().get<Expr *>();
+      return braceStmt->getLastElement().get<Expr *>();
 
     return cast<ReturnStmt>(stmt)->getResult();
   }
@@ -1989,7 +1998,7 @@ bool ClosureExpr::hasEmptyBody() const {
 }
 
 void ClosureExpr::setExplicitResultType(Type ty) {
-  assert(ty && !ty->hasTypeVariable() && !ty->hasHole());
+  assert(ty && !ty->hasTypeVariable() && !ty->hasPlaceholder());
   ExplicitResultTypeAndBodyState.getPointer()
       ->setType(MetatypeType::get(ty));
 }
@@ -2003,7 +2012,7 @@ void AutoClosureExpr::setBody(Expr *E) {
 }
 
 Expr *AutoClosureExpr::getSingleExpressionBody() const {
-  return cast<ReturnStmt>(Body->getFirstElement().get<Stmt *>())->getResult();
+  return cast<ReturnStmt>(Body->getLastElement().get<Stmt *>())->getResult();
 }
 
 Expr *AutoClosureExpr::getUnwrappedCurryThunkExpr() const {
@@ -2031,6 +2040,7 @@ Expr *AutoClosureExpr::getUnwrappedCurryThunkExpr() const {
 
   switch (getThunkKind()) {
   case AutoClosureExpr::Kind::None:
+  case AutoClosureExpr::Kind::AsyncLet:
     break;
 
   case AutoClosureExpr::Kind::SingleCurryThunk: {

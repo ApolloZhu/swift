@@ -173,7 +173,11 @@ private:
   }
 
   void visitDecl(Decl *decl) {
-    llvm_unreachable("Declarations not supported");
+    
+    if (isa<IfConfigDecl>(decl))
+      return;
+    
+    llvm_unreachable("Unimplemented case for closure body");
   }
 
   ASTNode visitBraceStmt(BraceStmt *braceStmt) {
@@ -301,7 +305,7 @@ SolutionApplicationToFunctionResult ConstraintSystem::applySolution(
     // Coerce the parameter types.
     closureFnType = closureType->castTo<FunctionType>();
     auto *params = closure->getParameters();
-    TypeChecker::coerceParameterListToType(params, closure, closureFnType);
+    TypeChecker::coerceParameterListToType(params, closureFnType);
 
     // Coerce the result type, if it was written explicitly.
     if (closure->hasExplicitResultType()) {
@@ -313,11 +317,11 @@ SolutionApplicationToFunctionResult ConstraintSystem::applySolution(
   // transformations.
   llvm::SaveAndRestore<DeclContext *> savedDC(currentDC, fn.getAsDeclContext());
 
-  // Apply the function builder transform, if there is one.
+  // Apply the result builder transform, if there is one.
   if (auto transform = solution.getAppliedBuilderTransform(fn)) {
-    // Apply the function builder to the closure. We want to be in the
+    // Apply the result builder to the closure. We want to be in the
     // context of the closure for subsequent transforms.
-    auto newBody = applyFunctionBuilderTransform(
+    auto newBody = applyResultBuilderTransform(
         solution, *transform, fn.getBody(), fn.getAsDeclContext(),
         [&](SolutionApplicationTarget target) {
           auto resultTarget = rewriteTarget(target);

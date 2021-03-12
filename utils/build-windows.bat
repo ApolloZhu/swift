@@ -55,6 +55,8 @@ set install_directory=%build_root%\Library\Developer\Toolchains\unknown-Asserts-
 
 md %build_root%\tmp
 set TMPDIR=%build_root%\tmp
+set TMP=%build_root%\tmp
+set TEMP=%build_root%\tmp
 
 md %build_root%\tmp\org.llvm.clang.9999
 set CUSTOM_CLANG_MODULE_CACHE=%build_root%\tmp\org.llvm.clang.9999
@@ -201,7 +203,6 @@ cmake^
     -DCMAKE_CXX_FLAGS:STRING="/GS- /Oy"^
     -DCMAKE_EXE_LINKER_FLAGS:STRING=/INCREMENTAL:NO^
     -DCMAKE_SHARED_LINKER_FLAGS:STRING=/INCREMENTAL:NO^
-    -DSWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY=YES^
     -S "%source_root%\llvm-project\llvm" %exitOnError%
 
 cmake --build "%build_root%\llvm" %exitOnError%
@@ -263,6 +264,8 @@ cmake^
     -DLLVM_INSTALL_TOOLCHAIN_ONLY:BOOL=YES^
     -DSWIFT_BUILD_SOURCEKIT:BOOL=YES^
     -DSWIFT_ENABLE_SOURCEKIT_TESTS:BOOL=YES^
+    -DSWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY=YES^
+    -DSWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING=YES^
     -DSWIFT_INSTALL_COMPONENTS="autolink-driver;compiler;clang-resource-dir-symlink;stdlib;sdk-overlay;editor-integration;tools;sourcekit-inproc;swift-remote-mirror;swift-remote-mirror-headers"^
     -DSWIFT_PARALLEL_LINK_JOBS=8^
     -DPYTHON_EXECUTABLE:PATH=%PYTHON_HOME%\python.exe^

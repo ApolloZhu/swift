@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -70,6 +70,8 @@ PASS(AccessSummaryDumper, "access-summary-dump",
      "Dump Address Parameter Access Summary")
 PASS(AccessedStorageAnalysisDumper, "accessed-storage-analysis-dump",
      "Dump Accessed Storage Analysis Summaries")
+PASS(AccessPathVerification, "access-path-verification",
+     "Verify Access Paths (and Accessed Storage)")
 PASS(AccessedStorageDumper, "accessed-storage-dump",
      "Dump Accessed Storage Information")
 PASS(AccessMarkerElimination, "access-marker-elim",
@@ -121,7 +123,9 @@ PASS(ConstantEvaluableSubsetChecker, "test-constant-evaluable-subset",
 PASS(CopyForwarding, "copy-forwarding",
      "Copy Forwarding to Remove Redundant Copies")
 PASS(CopyPropagation, "copy-propagation",
-     "Copy propagation to Remove Redundant SSA Copies")
+     "Copy propagation to Remove Redundant SSA Copies, pruning debug info")
+PASS(MandatoryCopyPropagation, "mandatory-copy-propagation",
+     "Copy propagation to Remove Redundant SSA Copies, preserving debug info")
 PASS(COWOpts, "cow-opts",
      "Optimize COW operations")
 PASS(Differentiation, "differentiation",
@@ -136,8 +140,8 @@ PASS(DCE, "dce",
      "Dead Code Elimination")
 PASS(DeadArgSignatureOpt, "dead-arg-signature-opt",
      "Dead Argument Elimination via Function Specialization")
-PASS(DeadFunctionElimination, "sil-deadfuncelim",
-     "Dead Function Elimination")
+PASS(DeadFunctionAndGlobalElimination, "sil-deadfuncelim",
+     "Dead Function and Global Variable Elimination")
 PASS(DeadObjectElimination, "deadobject-elim",
      "Dead Object Elimination for Classes with Trivial Destruction")
 PASS(DefiniteInitialization, "definite-init",
@@ -150,6 +154,8 @@ PASS(DiagnoseInfiniteRecursion, "diagnose-infinite-recursion",
      "Diagnose Infinitely-Recursive Code")
 PASS(DiagnoseInvalidEscapingCaptures, "diagnose-invalid-escaping-captures",
      "Diagnose Invalid Escaping Captures")
+PASS(DiagnoseLifetimeIssues, "diagnose-lifetime-issues",
+     "Diagnose Lifetime Issues")
 PASS(DiagnoseStaticExclusivity, "diagnose-static-exclusivity",
      "Static Enforcement of Law of Exclusivity")
 PASS(DiagnoseUnreachable, "diagnose-unreachable",
@@ -189,18 +195,23 @@ PASS(GenericSpecializer, "generic-specializer",
      "Generic Function Specialization on Static Types")
 PASS(ExistentialSpecializer, "existential-specializer",
      "Existential Specializer")
+PASS(SILSkippingChecker, "check-sil-skipping",
+     "Utility pass to ensure -experimental-skip-*-function-bodies skip "
+     "SIL generation of not-to-be-serialized functions entirely")
 PASS(GlobalOpt, "global-opt",
      "SIL Global Optimization")
 PASS(GlobalPropertyOpt, "global-property-opt",
      "Global Property Optimization")
-PASS(GuaranteedARCOpts, "guaranteed-arc-opts",
-     "Guaranteed ARC Optimization")
+PASS(MandatoryARCOpts, "mandatory-arc-opts",
+     "Mandatory ARC Optimization")
 PASS(HighLevelCSE, "high-level-cse",
      "Common Subexpression Elimination on High-Level SIL")
 PASS(HighLevelLICM, "high-level-licm",
      "Loop Invariant Code Motion in High-Level SIL")
 PASS(IVInfoPrinter, "iv-info-printer",
      "Print Induction Variable Information for Testing")
+PASS(OptimizeHopToExecutor, "optimize-hop-to-executor",
+     "Optimize hop_to_executor instructions for actor isolated code")
 PASS(InstCount, "inst-count",
      "Record SIL Instruction, Block, and Function Counts as LLVM Statistics")
 PASS(JumpThreadSimplifyCFG, "jumpthread-simplify-cfg",
@@ -211,8 +222,8 @@ PASS(LICM, "licm",
      "Loop Invariant Code Motion")
 PASS(LateCodeMotion, "late-codemotion",
      "Late Code Motion with Release Hoisting")
-PASS(LateDeadFunctionElimination, "late-deadfuncelim",
-     "Late Dead Function Elimination")
+PASS(LateDeadFunctionAndGlobalElimination, "late-deadfuncelim",
+     "Late Dead Function and Global Elimination")
 PASS(LateInliner, "late-inline",
      "Late Function Inlining")
 PASS(LoopCanonicalizer, "loop-canonicalizer",
@@ -249,6 +260,8 @@ PASS(Outliner, "outliner",
      "Function Outlining Optimization")
 PASS(OwnershipModelEliminator, "ownership-model-eliminator",
      "Eliminate Ownership Annotation of SIL")
+PASS(NestedSemanticFunctionCheck, "nested-semantic-function-check",
+     "Diagnose improperly nested '@_semantics' functions")
 PASS(NonTransparentFunctionOwnershipModelEliminator,
      "non-transparent-func-ownership-model-eliminator",
      "Eliminate Ownership Annotations from non-transparent SIL Functions")
@@ -341,9 +354,6 @@ PASS(SerializeSILPass, "serialize-sil",
      "Utility pass. Serializes the current SILModule")
 PASS(CMOSerializeSILPass, "cmo-serialize-sil",
      "Utility pass. Serializes the current SILModule for cross-module-optimization")
-PASS(NonInlinableFunctionSkippingChecker, "check-non-inlinable-function-skipping",
-     "Utility pass to ensure -experimental-skip-non-inlinable-function-bodies "
-     "skips everything it should")
 PASS(YieldOnceCheck, "yield-once-check",
     "Check correct usage of yields in yield-once coroutines")
 PASS(OSLogOptimization, "os-log-optimization", "Optimize os log calls")
@@ -351,6 +361,8 @@ PASS(ForEachLoopUnroll, "for-each-loop-unroll",
      "Unroll forEach loops over array literals")
 PASS(MandatoryCombine, "mandatory-combine",
     "Perform mandatory peephole combines")
+PASS(OptimizedMandatoryCombine, "optimized-mandatory-combine",
+    "Perform -O level mandatory peephole combines")
 PASS(BugReducerTester, "bug-reducer-tester",
      "sil-bug-reducer Tool Testing by Asserting on a Sentinel Function")
 PASS(OptRemarkGenerator, "sil-opt-remark-generator",

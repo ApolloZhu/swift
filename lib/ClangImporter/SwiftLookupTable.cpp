@@ -31,7 +31,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Bitcode/RecordLayout.h"
+#include "llvm/Bitcode/BitcodeConvenience.h"
 #include "llvm/Bitstream/BitstreamReader.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/Support/DJB.h"
@@ -1857,7 +1857,6 @@ SwiftNameLookupExtension::hashExtension(llvm::hash_code code) const {
                             SWIFT_LOOKUP_TABLE_VERSION_MAJOR,
                             SWIFT_LOOKUP_TABLE_VERSION_MINOR,
                             inferImportAsMember,
-                            swiftCtx.LangOpts.EnableExperimentalConcurrency,
                             version::getSwiftFullVersion());
 }
 
@@ -2040,7 +2039,12 @@ void importer::finalizeLookupTable(
       auto decl = entry.get<clang::NamedDecl *>();
       auto swiftName = decl->getAttr<clang::SwiftNameAttr>();
 
-      if (swiftName) {
+      if (swiftName
+          // Clang didn't previously attach SwiftNameAttrs to forward
+          // declarations, but this changed and we started diagnosing spurious
+          // warnings on @class declarations. Suppress them.
+          // FIXME: Can we avoid processing these decls in the first place?
+          && !importer::isForwardDeclOfType(decl)) {
         clang::SourceLocation diagLoc = swiftName->getLocation();
         if (!diagLoc.isValid())
           diagLoc = decl->getLocation();

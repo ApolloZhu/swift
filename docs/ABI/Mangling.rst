@@ -167,6 +167,8 @@ Globals
   global ::= protocol-conformance protocol 'Wb' // base protocol witness table accessor
   global ::= type protocol-conformance 'Wl' // lazy protocol witness table accessor
 
+  global ::= global generic-signature? 'WJ' DIFFERENTIABILITY-KIND INDEX-SUBSET 'p' INDEX-SUBSET 'r' // differentiability witness
+
   global ::= type 'WV'                   // value witness table
   global ::= entity 'Wvd'                // field offset
   global ::= entity 'WC'                 // resilient enum tag index
@@ -175,6 +177,7 @@ Globals
 
   global ::= global 'MJ'                 // noncanonical specialized generic type metadata instantiation cache associated with global
   global ::= global 'MN'                 // noncanonical specialized generic type metadata for global
+  global ::= global 'Mz'                 // canonical specialized generic type metadata caching token
 
   #if SWIFT_RUNTIME_VERSION >= 5.4
     global ::= context (decl-name '_')+ 'WZ' // global variable one-time initialization function
@@ -206,6 +209,7 @@ types where the metadata itself has unknown layout.)
   global ::= global 'TD'                 // dynamic dispatch thunk
   global ::= global 'Td'                 // direct method reference thunk
   global ::= global 'TI'                 // implementation of a dynamic_replaceable function
+  global :== global 'Tu'                 // async function pointer of a function
   global ::= global 'TX'                 // function pointer of a dynamic_replaceable function
   global ::= entity entity 'TV'          // vtable override thunk, derived followed by base
   global ::= type label-list? 'D'        // type mangling for the debugger with label list for function types.
@@ -218,12 +222,22 @@ types where the metadata itself has unknown layout.)
   global ::= global 'Tm'                 // merged function
   global ::= entity                      // some identifiable thing
   global ::= from-type to-type generic-signature? 'TR'  // reabstraction thunk
+  global ::= impl-function-type type 'Tz' index? // objc-to-swift-async completion handler block implementation
+  global ::= impl-function-type type 'TZ' index? // objc-to-swift-async completion handler block implementation (predefined by runtime)
+  global ::= from-type to-type generic-signature? 'TR'  // reabstraction thunk
+  global ::= impl-function-type type generic-signature? 'Tz'     // objc-to-swift-async completion handler block implementation
+  global ::= impl-function-type type generic-signature? 'TZ'     // objc-to-swift-async completion handler block implementation (predefined by runtime)
   global ::= from-type to-type self-type generic-signature? 'Ty'  // reabstraction thunk with dynamic 'Self' capture
   global ::= from-type to-type generic-signature? 'Tr'  // obsolete mangling for reabstraction thunk
   global ::= entity generic-signature? type type* 'TK' // key path getter
   global ::= entity generic-signature? type type* 'Tk' // key path setter
   global ::= type generic-signature 'TH' // key path equality
   global ::= type generic-signature 'Th' // key path hasher
+  global ::= global generic-signature? 'TJ' AUTODIFF-FUNCTION-KIND INDEX-SUBSET 'p' INDEX-SUBSET 'r' // autodiff function
+  global ::= global generic-signature? 'TJV' AUTODIFF-FUNCTION-KIND INDEX-SUBSET 'p' INDEX-SUBSET 'r' // autodiff derivative vtable thunk
+  global ::= from-type to-type 'TJO' AUTODIFF-FUNCTION-KIND // autodiff self-reordering reabstraction thunk
+  global ::= from-type 'TJS' AUTODIFF-FUNCTION-KIND INDEX-SUBSET 'p' INDEX-SUBSET 'r' INDEX-SUBSET 'P' // autodiff linear map subset parameters thunk
+  global ::= global to-type 'TJS' AUTODIFF-FUNCTION-KIND INDEX-SUBSET 'p' INDEX-SUBSET 'r' INDEX-SUBSET 'P' // autodiff derivative function subset parameters thunk
 
   global ::= protocol 'TL'               // protocol requirements base descriptor
   global ::= assoc-type-name 'Tl'        // associated type descriptor
@@ -268,6 +282,16 @@ witness functions for a type.
 
 ::
 
+  AUTODIFF-FUNCTION-KIND ::= 'f'        // JVP (forward-mode derivative)
+  AUTODIFF-FUNCTION-KIND ::= 'r'        // VJP (reverse-mode derivative)
+  AUTODIFF-FUNCTION-KIND ::= 'd'        // differential
+  AUTODIFF-FUNCTION-KIND ::= 'p'        // pullback
+
+``<AUTODIFF-FUNCTION-KIND>`` differentiates the kinds of functions assocaited
+with a differentiable function used for differentiable programming.
+
+::
+
   global ::= generic-signature? type 'WOy' // Outlined copy
   global ::= generic-signature? type 'WOe' // Outlined consume
   global ::= generic-signature? type 'WOr' // Outlined retain
@@ -301,6 +325,7 @@ Entities
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
   entity-spec ::= 'fi'                       // non-local variable initializer
   entity-spec ::= 'fP'                       // property wrapper backing initializer
+  entity-spec ::= 'fW'                       // property wrapper init from projected value
   entity-spec ::= 'fD'                       // deallocating destructor; untyped
   entity-spec ::= 'fd'                       // non-deallocating destructor; untyped
   entity-spec ::= 'fE'                       // ivar destroyer; untyped
@@ -437,7 +462,6 @@ Types
   KNOWN-TYPE-KIND ::= 'a'                    // Swift.Array
   KNOWN-TYPE-KIND ::= 'B'                    // Swift.BinaryFloatingPoint
   KNOWN-TYPE-KIND ::= 'b'                    // Swift.Bool
-  KNOWN-TYPE-KIND ::= 'c'                    // Swift.UnicodeScalar
   KNOWN-TYPE-KIND ::= 'D'                    // Swift.Dictionary
   KNOWN-TYPE-KIND ::= 'd'                    // Swift.Float64
   KNOWN-TYPE-KIND ::= 'E'                    // Swift.Encodable
@@ -488,9 +512,12 @@ Types
 
   type ::= 'Bb'                              // Builtin.BridgeObject
   type ::= 'BB'                              // Builtin.UnsafeValueBuffer
+  type ::= 'Bc'                              // Builtin.RawUnsafeContinuation
+  type ::= 'BD'                              // Builtin.DefaultActorStorage
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
+  type ::= 'Bj'                              // Builtin.Job
   type ::= 'BO'                              // Builtin.UnknownObject (no longer a distinct type, but still used for AnyObject)
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
@@ -523,22 +550,28 @@ Types
   FUNCTION-KIND ::= 'U'                      // uncurried function type (currently not used)
   FUNCTION-KIND ::= 'K'                      // @auto_closure function type (noescape)
   FUNCTION-KIND ::= 'B'                      // objc block function type
-  FUNCTION-KIND ::= 'L'                      // objc block function type (escaping) (DWARF only; otherwise use 'B')
+  FUNCTION-KIND ::= 'zB' C-TYPE              // objc block type with non-canonical C type
+  FUNCTION-KIND ::= 'L'                      // objc block function type with canonical C type (escaping) (DWARF only; otherwise use 'B' or 'zB' C-TYPE)
   FUNCTION-KIND ::= 'C'                      // C function pointer type
+  FUNCTION-KIND ::= 'zC' C-TYPE              // C function pointer type with with non-canonical C type
   FUNCTION-KIND ::= 'A'                      // @auto_closure function type (escaping)
   FUNCTION-KIND ::= 'E'                      // function type (noescape)
   FUNCTION-KIND ::= 'F'                      // @differentiable function type
   FUNCTION-KIND ::= 'G'                      // @differentiable function type (escaping)
-  FUNCTION-KIND ::= 'H'                      // @differentiable(linear) function type
-  FUNCTION-KIND ::= 'I'                      // @differentiable(linear) function type (escaping)
+  FUNCTION-KIND ::= 'H'                      // @differentiable(_linear) function type
+  FUNCTION-KIND ::= 'I'                      // @differentiable(_linear) function type (escaping)
 
-  function-signature ::= params-type params-type async? throws? // results and parameters
+  C-TYPE is mangled according to the Itanium ABI, and prefixed with the length.
+  Non-ASCII identifiers are preserved as-is; we do not use Punycode.
+
+  function-signature ::= params-type params-type async? concurrent? throws? // results and parameters
 
   params-type ::= type 'z'? 'h'?              // tuple in case of multiple parameters or a single parameter with a single tuple type
                                              // with optional inout convention, shared convention. parameters don't have labels,
                                              // they are mangled separately as part of the entity.
   params-type ::= empty-list                  // shortcut for no parameters
 
+  concurrent ::= 'J'                         // @concurrent on function types
   async ::= 'Y'                              // 'async' annotation on function types
   throws ::= 'K'                             // 'throws' annotation on function types
 
@@ -600,7 +633,7 @@ mangled in to disambiguate.
   impl-function-type ::= type* 'I' FUNC-ATTRIBUTES '_'
   impl-function-type ::= type* generic-signature 'I' FUNC-ATTRIBUTES '_'
 
-  FUNC-ATTRIBUTES ::= PATTERN-SUBS? INVOCATION-SUBS? PSEUDO-GENERIC? CALLEE-ESCAPE? DIFFERENTIABILITY-KIND? CALLEE-CONVENTION FUNC-REPRESENTATION? COROUTINE-KIND? ASYNC? (PARAM-CONVENTION PARAM-DIFFERENTIABILITY?)* RESULT-CONVENTION* ('Y' PARAM-CONVENTION)* ('z' RESULT-CONVENTION RESULT-DIFFERENTIABILITY?)?
+  FUNC-ATTRIBUTES ::= PATTERN-SUBS? INVOCATION-SUBS? PSEUDO-GENERIC? CALLEE-ESCAPE? DIFFERENTIABILITY-KIND? CALLEE-CONVENTION FUNC-REPRESENTATION? COROUTINE-KIND? CONCURRENT? ASYNC? (PARAM-CONVENTION PARAM-DIFFERENTIABILITY?)* RESULT-CONVENTION* ('Y' PARAM-CONVENTION)* ('z' RESULT-CONVENTION RESULT-DIFFERENTIABILITY?)?
 
   PATTERN-SUBS ::= 's'                       // has pattern substitutions
   INVOCATION-SUB ::= 'I'                     // has invocation substitutions
@@ -608,9 +641,10 @@ mangled in to disambiguate.
 
   CALLEE-ESCAPE ::= 'e'                      // @escaping (inverse of SIL @noescape)
 
-  DIFFERENTIABILITY-KIND ::= DIFFERENTIABLE | LINEAR
-  DIFFERENTIABLE ::= 'd'                     // @differentiable
-  LINEAR ::= 'l'                             // @differentiable(linear)
+  DIFFERENTIABILITY-KIND ::= 'd'             // @differentiable
+  DIFFERENTIABILITY-KIND ::= 'l'             // @differentiable(_linear)
+  DIFFERENTIABILITY-KIND ::= 'f'             // @differentiable(_forward)
+  DIFFERENTIABILITY-KIND ::= 'r'             // @differentiable(reverse)
 
   CALLEE-CONVENTION ::= 'y'                  // @callee_unowned
   CALLEE-CONVENTION ::= 'g'                  // @callee_guaranteed
@@ -618,7 +652,9 @@ mangled in to disambiguate.
   CALLEE-CONVENTION ::= 't'                  // thin
 
   FUNC-REPRESENTATION ::= 'B'                // C block invocation function
+  FUNC-REPRESENTATION ::= 'zB' C-TYPE        // C block invocation function with non-canonical C type
   FUNC-REPRESENTATION ::= 'C'                // C global function
+  FUNC-REPRESENTATION ::= 'zC' C-TYPE        // C global function with non-canonical C type
   FUNC-REPRESENTATION ::= 'M'                // Swift method
   FUNC-REPRESENTATION ::= 'J'                // ObjC method
   FUNC-REPRESENTATION ::= 'K'                // closure
@@ -627,6 +663,7 @@ mangled in to disambiguate.
   COROUTINE-KIND ::= 'A'                     // yield-once coroutine
   COROUTINE-KIND ::= 'G'                     // yield-many coroutine
 
+  CONCURRENT ::= 'h'                         // @concurrent
   ASYNC ::= 'H'                              // @async
 
   PARAM-CONVENTION ::= 'i'                   // indirect in
@@ -989,12 +1026,21 @@ Numbers and Indexes
 ``<INDEX>`` is a production for encoding numbers in contexts that can't
 end in a digit; it's optimized for encoding smaller numbers.
 
+::
+
+  INDEX-SUBSET ::= ('S' | 'U')+
+
+``<INDEX-SUBSET>`` is encoded like a bit vector and is optimized for encoding
+indices with a small upper bound.
+
 Function Specializations
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
   specialization ::= type '_' type* 'Tg' SPEC-INFO     // Generic re-abstracted specialization
+  specialization ::= type '_' type* 'TB' SPEC-INFO     // Alternative mangling for generic re-abstracted specializations,
+                                                       // used for functions with re-abstracted resilient parameter types.
   specialization ::= type '_' type* 'Ts' SPEC-INFO     // Generic re-abstracted prespecialization
   specialization ::= type '_' type* 'TG' SPEC-INFO     // Generic not re-abstracted specialization
   specialization ::= type '_' type* 'Ti' SPEC-INFO     // Inlined function with generic substitutions.

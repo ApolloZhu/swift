@@ -18,13 +18,13 @@
 #include "ClangTypeConverter.h"
 #include "ForeignRepresentationInfo.h"
 #include "SubstitutionMapStorage.h"
-#include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/FileUnit.h"
+#include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
@@ -41,19 +41,20 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/RawComment.h"
+#include "swift/AST/SILLayout.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/SubstitutionMap.h"
-#include "swift/AST/SILLayout.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/StringExtras.h"
-#include "swift/Syntax/References.h"
-#include "swift/Syntax/SyntaxArena.h"
 #include "swift/Strings.h"
 #include "swift/Subsystems.h"
+#include "swift/Syntax/References.h"
+#include "swift/Syntax/SyntaxArena.h"
+#include "clang/AST/Type.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringMap.h"
@@ -205,6 +206,9 @@ struct ASTContext::Implementation {
   /// The declaration of 'Sequence.makeIterator()'.
   FuncDecl *MakeIterator = nullptr;
 
+  /// The declaration of 'AsyncSequence.makeAsyncIterator()'.
+  FuncDecl *MakeAsyncIterator = nullptr;
+
   /// The declaration of Swift.Optional<T>.Some.
   EnumElementDecl *OptionalSomeDecl = nullptr;
 
@@ -225,6 +229,12 @@ struct ASTContext::Implementation {
   
   /// The declaration of Swift.AutoreleasingUnsafeMutablePointer<T>.memory.
   VarDecl *AutoreleasingUnsafeMutablePointerMemoryDecl = nullptr;
+
+  /// The declaration of _Concurrency.DefaultActor.
+  ClassDecl *DefaultActorDecl = nullptr;
+
+  /// The declaration of _Concurrency.NSObjectDefaultActor.
+  ClassDecl *NSObjectDefaultActorDecl = nullptr;
 
   // Declare cached declarations for each of the known declarations.
 #define FUNC_DECL(Name, Id) FuncDecl *Get##Name = nullptr;
@@ -588,18 +598,10 @@ ASTContext::ASTContext(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
     TheEmptyTupleType(TupleType::get(ArrayRef<TupleTypeElt>(), *this)),
     TheAnyType(ProtocolCompositionType::get(*this, ArrayRef<Type>(),
                                             /*HasExplicitAnyObject=*/false)),
-    TheNativeObjectType(new (*this, AllocationArena::Permanent)
-                           BuiltinNativeObjectType(*this)),
-    TheBridgeObjectType(new (*this, AllocationArena::Permanent)
-                           BuiltinBridgeObjectType(*this)),
-    TheRawPointerType(new (*this, AllocationArena::Permanent)
-                        BuiltinRawPointerType(*this)),
-    TheUnsafeValueBufferType(new (*this, AllocationArena::Permanent)
-                               BuiltinUnsafeValueBufferType(*this)),
-    TheSILTokenType(new (*this, AllocationArena::Permanent)
-                      SILTokenType(*this)),
-    TheIntegerLiteralType(new (*this, AllocationArena::Permanent)
-                               BuiltinIntegerLiteralType(*this)),
+#define SINGLETON_TYPE(SHORT_ID, ID) \
+    The##SHORT_ID##Type(new (*this, AllocationArena::Permanent) \
+                          ID##Type(*this)),
+#include "swift/AST/TypeNodes.def"
     TheIEEE32Type(new (*this, AllocationArena::Permanent)
                     BuiltinFloatType(BuiltinFloatType::IEEE32,*this)),
     TheIEEE64Type(new (*this, AllocationArena::Permanent)
@@ -629,11 +631,6 @@ ASTContext::ASTContext(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
 }
 
 ASTContext::~ASTContext() {
-  // Emit evaluator dependency graph if requested.
-  auto graphPath = LangOpts.RequestEvaluatorGraphVizPath;
-  if (!graphPath.empty()) {
-    evaluator.emitRequestEvaluatorGraphViz(graphPath);
-  }
   getImpl().~Implementation();
 }
 
@@ -712,8 +709,7 @@ FuncDecl *ASTContext::getPlusFunctionOnRangeReplaceableCollection() const {
         continue;
       for (auto Req: FD->getGenericRequirements()) {
         if (Req.getKind() == RequirementKind::Conformance &&
-              Req.getSecondType()->getNominalOrBoundGenericNominal() ==
-            getRangeReplaceableCollectionDecl()) {
+              Req.getProtocolDecl() == getRangeReplaceableCollectionDecl()) {
           getImpl().PlusFunctionOnRangeReplaceableCollection = FD;
         }
       }
@@ -771,6 +767,31 @@ FuncDecl *ASTContext::getSequenceMakeIterator() const {
         continue;
 
       getImpl().MakeIterator = func;
+      return func;
+    }
+  }
+
+  return nullptr;
+}
+
+FuncDecl *ASTContext::getAsyncSequenceMakeAsyncIterator() const {
+  if (getImpl().MakeAsyncIterator) {
+    return getImpl().MakeAsyncIterator;
+  }
+
+  auto proto = getProtocol(KnownProtocolKind::AsyncSequence);
+  if (!proto)
+    return nullptr;
+
+  for (auto result : proto->lookupDirect(Id_makeAsyncIterator)) {
+    if (result->getDeclContext() != proto)
+      continue;
+
+    if (auto func = dyn_cast<FuncDecl>(result)) {
+      if (func->getParameters()->size() != 0)
+        continue;
+
+      getImpl().MakeAsyncIterator = func;
       return func;
     }
   }
@@ -949,6 +970,8 @@ ProtocolDecl *ASTContext::getProtocol(KnownProtocolKind kind) const {
     M = getLoadedModule(Id_Differentiation);
     break;
   case KnownProtocolKind::Actor:
+  case KnownProtocolKind::AsyncSequence:
+  case KnownProtocolKind::AsyncIteratorProtocol:
     M = getLoadedModule(Id_Concurrency);
     break;
   default:
@@ -1493,9 +1516,8 @@ bool ASTContext::hadError() const {
 /// Retrieve the arena from which we should allocate storage for a type.
 static AllocationArena getArena(RecursiveTypeProperties properties) {
   bool hasTypeVariable = properties.hasTypeVariable();
-  bool hasHole = properties.hasTypeHole();
-  return hasTypeVariable || hasHole ? AllocationArena::ConstraintSolver
-                                    : AllocationArena::Permanent;
+  return hasTypeVariable ? AllocationArena::ConstraintSolver
+                         : AllocationArena::Permanent;
 }
 
 void ASTContext::addSearchPath(StringRef searchPath, bool isFramework,
@@ -1534,15 +1556,35 @@ void ASTContext::addModuleInterfaceChecker(
 
 Optional<ModuleDependencies> ASTContext::getModuleDependencies(
     StringRef moduleName, bool isUnderlyingClangModule,
-    ModuleDependenciesCache &cache, InterfaceSubContextDelegate &delegate) {
-  for (auto &loader : getImpl().ModuleLoaders) {
-    if (isUnderlyingClangModule &&
-        loader.get() != getImpl().TheClangModuleLoader)
-      continue;
+    ModuleDependenciesCache &cache, InterfaceSubContextDelegate &delegate,
+    bool cacheOnly) {
+  // Retrieve the dependencies for this module.
+  if (cacheOnly) {
+    // Check whether we've cached this result.
+    if (!isUnderlyingClangModule) {
+      if (auto found = cache.findDependencies(moduleName,
+                                              ModuleDependenciesKind::SwiftTextual))
+        return found;
+      if (auto found = cache.findDependencies(moduleName,
+                                              ModuleDependenciesKind::SwiftTextual))
+        return found;
+      if (auto found = cache.findDependencies(moduleName,
+                                              ModuleDependenciesKind::SwiftPlaceholder))
+        return found;
+    }
+    if (auto found = cache.findDependencies(moduleName,
+                                            ModuleDependenciesKind::Clang))
+      return found;
+  } else {
+    for (auto &loader : getImpl().ModuleLoaders) {
+      if (isUnderlyingClangModule &&
+          loader.get() != getImpl().TheClangModuleLoader)
+        continue;
 
-    if (auto dependencies = loader->getModuleDependencies(moduleName, cache,
-                                                          delegate))
-      return dependencies;
+      if (auto dependencies = loader->getModuleDependencies(moduleName, cache,
+                                                            delegate))
+        return dependencies;
+    }
   }
 
   return None;
@@ -1699,8 +1741,7 @@ GenericSignatureBuilder *ASTContext::getOrCreateGenericSignatureBuilder(
 
 #if SWIFT_GSB_EXPENSIVE_ASSERTIONS
   auto builderSig =
-    builder->computeGenericSignature(SourceLoc(),
-                                     /*allowConcreteGenericParams=*/true);
+    builder->computeGenericSignature(/*allowConcreteGenericParams=*/true);
   if (builderSig.getCanonicalSignature() != sig) {
     llvm::errs() << "ERROR: generic signature builder is not idempotent.\n";
     llvm::errs() << "Original generic signature   : ";
@@ -1923,6 +1964,32 @@ ASTContext::getModule(ImportPath::Module ModulePath) {
   auto moduleID = ModulePath[0];
   for (auto &importer : getImpl().ModuleLoaders) {
     if (ModuleDecl *M = importer->loadModule(moduleID.Loc, ModulePath)) {
+      if (LangOpts.EnableModuleLoadingRemarks) {
+        Diags.diagnose(ModulePath.getSourceRange().Start,
+                       diag::module_loaded,
+                       M->getModuleFilename());
+      }
+      return M;
+    }
+  }
+
+  return nullptr;
+}
+
+ModuleDecl *ASTContext::getOverlayModule(const FileUnit *FU) {
+  assert(FU && FU->getKind() == FileUnitKind::ClangModule &&
+         "Overlays can only be retrieved for clang modules!");
+  ImportPath::Module::Builder builder(FU->getParentModule()->getName());
+  auto ModPath = builder.get();
+  if (auto *Existing = getLoadedModule(ModPath)) {
+    if (!Existing->isNonSwiftModule())
+      return Existing;
+  }
+
+  for (auto &importer : getImpl().ModuleLoaders) {
+    if (importer.get() == getClangModuleLoader())
+      continue;
+    if (ModuleDecl *M = importer->loadModule(SourceLoc(), ModPath)) {
       return M;
     }
   }
@@ -2140,13 +2207,28 @@ LazyIterableDeclContextData *ASTContext::getOrCreateLazyIterableContextData(
                                                                    lazyLoader);
 }
 
-bool ASTContext::hasDelayedConformanceErrors() const {
-  for (const auto &entry : getImpl().DelayedConformanceDiags) {
-    auto &diagnostics = entry.getSecond();
-    if (std::any_of(diagnostics.begin(), diagnostics.end(),
-                    [](const ASTContext::DelayedConformanceDiag &diag) {
+bool ASTContext::hasDelayedConformanceErrors(
+                          NormalProtocolConformance const* conformance) const {
+
+  auto hasDelayedErrors = [](std::vector<DelayedConformanceDiag> const& diags) {
+    return std::any_of(diags.begin(), diags.end(),
+                    [](ASTContext::DelayedConformanceDiag const& diag) {
                       return diag.IsError;
-                    }))
+                    });
+  };
+
+  if (conformance) {
+    auto entry = getImpl().DelayedConformanceDiags.find(conformance);
+    if (entry != getImpl().DelayedConformanceDiags.end())
+      return hasDelayedErrors(entry->second);
+
+    return false; // unknown conformance, so no delayed delayed diags either.
+  }
+  
+  // check all conformances for any delayed errors
+  for (const auto &entry : getImpl().DelayedConformanceDiags) {
+    auto const& diagnostics = entry.getSecond();
+    if (hasDelayedErrors(diagnostics))
       return true;
   }
 
@@ -2180,9 +2262,9 @@ ASTContext::takeDelayedMissingWitnesses(
 }
 
 std::vector<ASTContext::DelayedConformanceDiag>
-ASTContext::takeDelayedConformanceDiags(NormalProtocolConformance *conformance){
+ASTContext::takeDelayedConformanceDiags(NormalProtocolConformance const* cnfrm){
   std::vector<ASTContext::DelayedConformanceDiag> result;
-  auto known = getImpl().DelayedConformanceDiags.find(conformance);
+  auto known = getImpl().DelayedConformanceDiags.find(cnfrm);
   if (known != getImpl().DelayedConformanceDiags.end()) {
     result = std::move(known->second);
     getImpl().DelayedConformanceDiags.erase(known);
@@ -2413,11 +2495,10 @@ Type ErrorType::get(Type originalType) {
   return entry = new (mem) ErrorType(ctx, originalType, properties);
 }
 
-Type HoleType::get(ASTContext &ctx, Originator originator) {
+Type PlaceholderType::get(ASTContext &ctx, Originator originator) {
   assert(originator);
-  auto arena = getArena(RecursiveTypeProperties::HasTypeHole);
-  return new (ctx, arena)
-      HoleType(ctx, originator, RecursiveTypeProperties::HasTypeHole);
+  return new (ctx, AllocationArena::Permanent)
+      PlaceholderType(ctx, originator, RecursiveTypeProperties::HasPlaceholder);
 }
 
 BuiltinIntegerType *BuiltinIntegerType::get(BuiltinIntegerWidth BitWidth,
@@ -2861,7 +2942,7 @@ ReferenceStorageType *ReferenceStorageType::get(Type T,
                                                 ReferenceOwnership ownership,
                                                 const ASTContext &C) {
   assert(!T->hasTypeVariable()); // not meaningful in type-checker
-  assert(!T->hasHole());
+  assert(!T->hasPlaceholder());
   switch (optionalityOf(ownership)) {
   case ReferenceOwnershipOptionality::Disallowed:
     assert(!T->getOptionalObjectType() && "optional type is disallowed");
@@ -3248,7 +3329,7 @@ GenericFunctionType *GenericFunctionType::get(GenericSignature sig,
                                               ExtInfo info) {
   assert(sig && "no generic signature for generic function type?!");
   assert(!result->hasTypeVariable());
-  assert(!result->hasHole());
+  assert(!result->hasPlaceholder());
 
   llvm::FoldingSetNodeID id;
   GenericFunctionType::Profile(id, sig, params, result, info);
@@ -4566,6 +4647,21 @@ ASTContext::getCanonicalClangFunctionType(
   return ty ? ty->getCanonicalTypeInternal().getTypePtr() : nullptr;
 }
 
+std::unique_ptr<TemplateInstantiationError>
+ASTContext::getClangTemplateArguments(
+    const clang::TemplateParameterList *templateParams,
+    ArrayRef<Type> genericArgs,
+    SmallVectorImpl<clang::TemplateArgument> &templateArgs) {
+  auto &impl = getImpl();
+  if (!impl.Converter) {
+    auto *cml = getClangModuleLoader();
+    impl.Converter.emplace(*this, cml->getClangASTContext(), LangOpts.Target);
+  }
+
+  return impl.Converter->getClangTemplateArguments(templateParams, genericArgs,
+                                                   templateArgs);
+}
+
 const Decl *
 ASTContext::getSwiftDeclForExportedClangDecl(const clang::Decl *decl) {
   auto &impl = getImpl();
@@ -4577,6 +4673,10 @@ ASTContext::getSwiftDeclForExportedClangDecl(const clang::Decl *decl) {
   return impl.Converter->getSwiftDeclForExportedClangDecl(decl);
 }
 
+const clang::Type *
+ASTContext::getClangTypeForIRGen(Type ty) {
+  return getClangTypeConverter().convert(ty).getTypePtrOrNull();
+}
 
 CanGenericSignature ASTContext::getSingleGenericParameterSignature() const {
   if (auto theSig = getImpl().SingleGenericParameterSignature)
@@ -4753,6 +4853,10 @@ ASTContext::SILTransformCtors ASTContext::getIRGenSILTransforms() const {
   auto passes = getImpl().IRGenSILPasses;
   assert(!passes.empty() && "Didn't register the necessary passes");
   return passes;
+}
+
+std::string ASTContext::getEntryPointFunctionName() const {
+  return LangOpts.entryPointFunctionName;
 }
 
 SILLayout *SILLayout::get(ASTContext &C,

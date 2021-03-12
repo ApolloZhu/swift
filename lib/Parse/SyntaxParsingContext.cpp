@@ -18,8 +18,8 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/Basic/Defer.h"
-#include "swift/Parse/ParsedSyntax.h"
 #include "swift/Parse/ParsedRawSyntaxRecorder.h"
+#include "swift/Parse/ParsedSyntax.h"
 #include "swift/Parse/ParsedSyntaxRecorder.h"
 #include "swift/Parse/SyntaxParseActions.h"
 #include "swift/Parse/SyntaxParsingCache.h"
@@ -88,7 +88,7 @@ size_t SyntaxParsingContext::lookupNode(size_t LexerOffset, SourceLoc Loc) {
     return 0;
   }
   Mode = AccumulationMode::SkippedForIncrementalUpdate;
-  auto length = foundNode.getRecordedRange().getByteLength();
+  auto length = foundNode.getRange().getByteLength();
   getStorage().push_back(std::move(foundNode));
   return length;
 }
@@ -98,7 +98,7 @@ SyntaxParsingContext::makeUnknownSyntax(SyntaxKind Kind,
                                         MutableArrayRef<ParsedRawSyntaxNode> Parts) {
   assert(isUnknownKind(Kind));
   if (shouldDefer())
-    return ParsedRawSyntaxNode::makeDeferred(Kind, Parts, *this);
+    return getRecorder().makeDeferred(Kind, Parts, *this);
   else
     return getRecorder().recordRawSyntax(Kind, Parts);
 }
@@ -112,7 +112,7 @@ SyntaxParsingContext::createSyntaxAs(SyntaxKind Kind,
   auto &rec = getRecorder();
   auto formNode = [&](SyntaxKind kind, MutableArrayRef<ParsedRawSyntaxNode> layout) {
     if (nodeCreateK == SyntaxNodeCreationKind::Deferred || shouldDefer()) {
-      rawNode = ParsedRawSyntaxNode::makeDeferred(kind, layout, *this);
+      rawNode = getRecorder().makeDeferred(kind, layout, *this);
     } else {
       rawNode = rec.recordRawSyntax(kind, layout);
     }
@@ -186,7 +186,7 @@ SyntaxParsingContext::bridgeAs(SyntaxContextKind Kind,
 }
 
 /// Add RawSyntax to the parts.
-void SyntaxParsingContext::addRawSyntax(ParsedRawSyntaxNode Raw) {
+void SyntaxParsingContext::addRawSyntax(ParsedRawSyntaxNode &&Raw) {
   getStorage().emplace_back(std::move(Raw));
 }
 
@@ -203,23 +203,22 @@ ParsedTokenSyntax SyntaxParsingContext::popToken() {
 }
 
 /// Add Token with Trivia to the parts.
-void SyntaxParsingContext::addToken(Token &Tok,
-                                    const ParsedTrivia &LeadingTrivia,
-                                    const ParsedTrivia &TrailingTrivia) {
+void SyntaxParsingContext::addToken(Token &Tok, StringRef LeadingTrivia,
+                                    StringRef TrailingTrivia) {
   if (!Enabled)
     return;
 
   ParsedRawSyntaxNode raw;
-  if (shouldDefer())
-    raw = ParsedRawSyntaxNode::makeDeferred(Tok, LeadingTrivia, TrailingTrivia,
-                                            *this);
-  else
+  if (shouldDefer()) {
+    raw = getRecorder().makeDeferred(Tok, LeadingTrivia, TrailingTrivia);
+  } else {
     raw = getRecorder().recordToken(Tok, LeadingTrivia, TrailingTrivia);
+  }
   addRawSyntax(std::move(raw));
 }
 
 /// Add Syntax to the parts.
-void SyntaxParsingContext::addSyntax(ParsedSyntax Node) {
+void SyntaxParsingContext::addSyntax(ParsedSyntax &&Node) {
   if (!Enabled)
     return;
   addRawSyntax(Node.takeRaw());
@@ -251,7 +250,10 @@ void SyntaxParsingContext::createNodeInPlace(SyntaxKind Kind,
   case SyntaxKind::ForcedValueExpr:
   case SyntaxKind::PostfixUnaryExpr:
   case SyntaxKind::TernaryExpr:
-  case SyntaxKind::AvailabilityLabeledArgument: {
+  case SyntaxKind::AvailabilityLabeledArgument:
+  case SyntaxKind::MetatypeType:
+  case SyntaxKind::OptionalType:
+  case SyntaxKind::ImplicitlyUnwrappedOptionalType: {
     auto Pair = SyntaxFactory::countChildren(Kind);
     assert(Pair.first == Pair.second);
     createNodeInPlace(Kind, Pair.first, nodeCreateK);
@@ -327,7 +329,8 @@ OpaqueSyntaxNode SyntaxParsingContext::finalizeRoot() {
   // the root context.
   getStorage().clear();
 
-  return root.takeOpaqueNode();
+  assert(root.isRecorded() && "Root of syntax tree should be recorded");
+  return root.takeData();
 }
 
 void SyntaxParsingContext::synthesize(tok Kind, SourceLoc Loc) {
@@ -336,7 +339,7 @@ void SyntaxParsingContext::synthesize(tok Kind, SourceLoc Loc) {
 
   ParsedRawSyntaxNode raw;
   if (shouldDefer())
-    raw = ParsedRawSyntaxNode::makeDeferredMissing(Kind, Loc);
+    raw = getRecorder().makeDeferredMissing(Kind, Loc);
   else
     raw = getRecorder().recordMissingToken(Kind, Loc);
   getStorage().push_back(std::move(raw));
@@ -402,12 +405,6 @@ SyntaxParsingContext::~SyntaxParsingContext() {
   // Remove all parts in this context.
   case AccumulationMode::Discard: {
     auto &nodes = getStorage();
-    for (auto i = nodes.begin()+Offset, e = nodes.end(); i != e; ++i) {
-      // FIXME: This should not be needed. This breaks invariant that any
-      // recorded node must be a part of result souce syntax tree.
-      if (i->isRecorded())
-        getRecorder().discardRecordedNode(*i);
-    }
     nodes.erase(nodes.begin()+Offset, nodes.end());
     break;
   }

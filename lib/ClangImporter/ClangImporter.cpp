@@ -21,8 +21,9 @@
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
-#include "swift/AST/ImportCache.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/AST/ImportCache.h"
 #include "swift/AST/LinkLibrary.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
@@ -35,8 +36,6 @@
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Config.h"
 #include "swift/Demangling/Demangle.h"
-#include "swift/ClangImporter/ClangModule.h"
-#include "swift/Config.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Strings.h"
@@ -327,13 +326,13 @@ class ClangImporterDependencyCollector : public clang::DependencyCollector
   llvm::StringSet<> ExcludedPaths;
   /// The FileCollector is used by LLDB to generate reproducers. It's not used
   /// by Swift to track dependencies.
-  std::shared_ptr<llvm::FileCollector> FileCollector;
+  std::shared_ptr<llvm::FileCollectorBase> FileCollector;
   const IntermoduleDepTrackingMode Mode;
 
 public:
   ClangImporterDependencyCollector(
       IntermoduleDepTrackingMode Mode,
-      std::shared_ptr<llvm::FileCollector> FileCollector)
+      std::shared_ptr<llvm::FileCollectorBase> FileCollector)
       : FileCollector(FileCollector), Mode(Mode) {}
 
   void excludePath(StringRef filename) {
@@ -379,7 +378,7 @@ public:
 std::shared_ptr<clang::DependencyCollector>
 ClangImporter::createDependencyCollector(
     IntermoduleDepTrackingMode Mode,
-    std::shared_ptr<llvm::FileCollector> FileCollector) {
+    std::shared_ptr<llvm::FileCollectorBase> FileCollector) {
   return std::make_shared<ClangImporterDependencyCollector>(Mode,
                                                             FileCollector);
 }
@@ -392,9 +391,7 @@ void ClangImporter::Implementation::addBridgeHeaderTopLevelDecls(
   BridgeHeaderTopLevelDecls.push_back(D);
 }
 
-bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
-    clang::Decl *D) {
-  // Ignore forward references;
+bool importer::isForwardDeclOfType(const clang::Decl *D) {
   if (auto *ID = dyn_cast<clang::ObjCInterfaceDecl>(D)) {
     if (!ID->isThisDeclarationADefinition())
       return true;
@@ -406,6 +403,11 @@ bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
       return true;
   }
   return false;
+}
+
+bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
+    clang::Decl *D) {
+  return importer::isForwardDeclOfType(D);
 }
 
 ClangImporter::ClangImporter(ASTContext &ctx,
@@ -521,21 +523,45 @@ importer::getNormalInvocationArguments(
     invocationArgStrs.push_back(
         "-Werror=non-modular-include-in-framework-module");
 
+  bool EnableCXXInterop = LangOpts.EnableCXXInterop;
+
   if (LangOpts.EnableObjCInterop) {
-    bool EnableCXXInterop = LangOpts.EnableCXXInterop;
-    invocationArgStrs.insert(
-        invocationArgStrs.end(),
-        {"-x", EnableCXXInterop ? "objective-c++" : "objective-c",
-         EnableCXXInterop ? "-std=gnu++17" : "-std=gnu11", "-fobjc-arc"});
+    invocationArgStrs.insert(invocationArgStrs.end(), {"-fobjc-arc"});
     // TODO: Investigate whether 7.0 is a suitable default version.
     if (!triple.isOSDarwin())
       invocationArgStrs.insert(invocationArgStrs.end(),
                                {"-fobjc-runtime=ios-7.0"});
+
+    invocationArgStrs.insert(invocationArgStrs.end(), {
+      "-x", EnableCXXInterop ? "objective-c++" : "objective-c",
+    });
   } else {
-    bool EnableCXXInterop = LangOpts.EnableCXXInterop;
-    invocationArgStrs.insert(invocationArgStrs.end(),
-                             {"-x", EnableCXXInterop ? "c++" : "c",
-                              EnableCXXInterop ? "-std=gnu++17" : "-std=gnu11"});
+    invocationArgStrs.insert(invocationArgStrs.end(), {
+      "-x", EnableCXXInterop ? "c++" : "c",
+    });
+  }
+
+  {
+    const clang::LangStandard &stdcxx =
+#if defined(CLANG_DEFAULT_STD_CXX)
+        *clang::LangStandard::getLangStandardForName(CLANG_DEFAULT_STD_CXX);
+#else
+        clang::LangStandard::getLangStandardForKind(
+            clang::LangStandard::lang_gnucxx14);
+#endif
+
+    const clang::LangStandard &stdc =
+#if defined(CLANG_DEFAULT_STD_C)
+        *clang::LangStandard::getLangStandardForName(CLANG_DEFAULT_STD_C);
+#else
+        clang::LangStandard::getLangStandardForKind(
+            clang::LangStandard::lang_gnu11);
+#endif
+
+    invocationArgStrs.insert(invocationArgStrs.end(), {
+      (Twine("-std=") + StringRef(EnableCXXInterop ? stdcxx.getName()
+                                                   : stdc.getName())).str()
+    });
   }
 
   // Set C language options.
@@ -798,7 +824,8 @@ bool ClangImporter::canReadPCH(StringRef PCHFilename) {
                              &Impl.Instance->getModuleCache());
   auto invocation =
       std::make_shared<clang::CompilerInvocation>(*Impl.Invocation);
-  invocation->getPreprocessorOpts().DisablePCHValidation = false;
+  invocation->getPreprocessorOpts().DisablePCHOrModuleValidation =
+      clang::DisableValidationForModuleKind::None;
   invocation->getPreprocessorOpts().AllowPCHWithCompilerErrors = false;
   invocation->getHeaderSearchOpts().ModulesValidateSystemHeaders = true;
   invocation->getLangOpts()->NeededByPCHOrCompilationUsesPCH = true;
@@ -1624,11 +1651,12 @@ bool ClangImporter::emitPrecompiledModule(StringRef moduleMapPath,
   LangOpts->CurrentModule = LangOpts->ModuleName;
 
   auto language = getLanguageFromOptions(LangOpts);
-  auto inputFile = clang::FrontendInputFile(
-      moduleMapPath, clang::InputKind(
-          language, clang::InputKind::ModuleMap, false));
 
   auto &FrontendOpts = invocation.getFrontendOpts();
+  auto inputFile = clang::FrontendInputFile(
+      moduleMapPath, clang::InputKind(
+          language, clang::InputKind::ModuleMap, false),
+      FrontendOpts.IsSystemModule);
   FrontendOpts.Inputs = {inputFile};
   FrontendOpts.OriginalModuleMap = moduleMapPath.str();
   FrontendOpts.OutputFile = outputPath.str();
@@ -1942,20 +1970,32 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
   case PlatformKind::tvOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of iOS 7 and earlier are unavailable in Swift";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of iOS 12 and earlier are not imported as 'async'";
     break;
 
   case PlatformKind::watchOS:
   case PlatformKind::watchOSApplicationExtension:
     deprecatedAsUnavailableMessage = "";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of watchOS 5 and earlier are not imported as "
+      "'async'";
     break;
 
   case PlatformKind::macOS:
   case PlatformKind::macOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of macOS 10.9 and earlier are unavailable in Swift";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of macOS 10.14 and earlier are not imported as "
+      "'async'";
     break;
 
   case PlatformKind::OpenBSD:
+    deprecatedAsUnavailableMessage = "";
+    break;
+
+  case PlatformKind::Windows:
     deprecatedAsUnavailableMessage = "";
     break;
 
@@ -1994,6 +2034,9 @@ bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
   case PlatformKind::OpenBSD:
     return name == "openbsd";
 
+  case PlatformKind::Windows:
+    return name == "windows";
+
   case PlatformKind::none:
     return false;
   }
@@ -2002,7 +2045,8 @@ bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
 }
 
 bool PlatformAvailability::treatDeprecatedAsUnavailable(
-    const clang::Decl *clangDecl, const llvm::VersionTuple &version) const {
+    const clang::Decl *clangDecl, const llvm::VersionTuple &version,
+    bool isAsync) const {
   assert(!version.empty() && "Must provide version when deprecated");
   unsigned major = version.getMajor();
   Optional<unsigned> minor = version.getMinor();
@@ -2013,6 +2057,13 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
 
   case PlatformKind::macOS:
   case PlatformKind::macOSApplicationExtension:
+    // Anything deprecated by macOS 10.14 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major < 10 ||
+          (major == 10 && (!minor.hasValue() || minor.getValue() <= 14));
+    }
+
     // Anything deprecated in OSX 10.9.x and earlier is unavailable in Swift.
     return major < 10 ||
            (major == 10 && (!minor.hasValue() || minor.getValue() <= 9));
@@ -2021,6 +2072,12 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
   case PlatformKind::iOSApplicationExtension:
   case PlatformKind::tvOS:
   case PlatformKind::tvOSApplicationExtension:
+    // Anything deprecated by iOS 12 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major <= 12;
+    }
+
     // Anything deprecated in iOS 7.x and earlier is unavailable in Swift.
     return major <= 7;
 
@@ -2031,11 +2088,21 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
 
   case PlatformKind::watchOS:
   case PlatformKind::watchOSApplicationExtension:
+    // Anything deprecated by watchOS 5.0 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major <= 5;
+    }
+
     // No deprecation filter on watchOS
     return false;
 
   case PlatformKind::OpenBSD:
     // No deprecation filter on OpenBSD
+    return false;
+
+  case PlatformKind::Windows:
+    // No deprecation filter on Windows
     return false;
   }
 
@@ -3439,18 +3506,23 @@ ModuleDecl *ClangModuleUnit::getOverlayModule() const {
     // FIXME: Include proper source location.
     ModuleDecl *M = getParentModule();
     ASTContext &Ctx = M->getASTContext();
-    auto overlay = Ctx.getModuleByIdentifier(M->getName());
-    if (overlay == M) {
-      overlay = nullptr;
-    } else {
-      // FIXME: This bizarre and twisty invariant is due to nested
-      // re-entrancy in both clang module loading and overlay module loading.
-      auto *sharedModuleRef = Ctx.getLoadedModule(M->getName());
-      assert(!sharedModuleRef || sharedModuleRef == overlay ||
-             sharedModuleRef == M);
+    auto overlay = Ctx.getOverlayModule(this);
+    if (overlay) {
       Ctx.addLoadedModule(overlay);
+    } else {
+      // FIXME: This is the awful legacy of the old implementation of overlay
+      // loading laid bare. Because the previous implementation used
+      // ASTContext::getModuleByIdentifier, it consulted the clang importer
+      // recursively which forced the current module, its dependencies, and
+      // the overlays of those dependencies to load and
+      // become visible in the current context. All of the callers of
+      // ClangModuleUnit::getOverlayModule are relying on this behavior, and
+      // untangling them is going to take a heroic amount of effort.
+      // Clang module loading should *never* *ever* be allowed to load unrelated
+      // Swift modules.
+      ImportPath::Module::Builder builder(M->getName());
+      (void) owner.loadModule(SourceLoc(), std::move(builder).get());
     }
-
     auto mutableThis = const_cast<ClangModuleUnit *>(this);
     mutableThis->overlayModule.setPointerAndInt(overlay, true);
   }
@@ -3614,7 +3686,13 @@ void ClangImporter::getMangledName(raw_ostream &os,
   if (!Impl.Mangler)
     Impl.Mangler.reset(Impl.getClangASTContext().createMangleContext());
 
-  Impl.Mangler->mangleName(clangDecl, os);
+  if (auto ctor = dyn_cast<clang::CXXConstructorDecl>(clangDecl)) {
+    auto ctorGlobalDecl =
+        clang::GlobalDecl(ctor, clang::CXXCtorType::Ctor_Complete);
+    Impl.Mangler->mangleCXXName(ctorGlobalDecl, os);
+  } else {
+    Impl.Mangler->mangleName(clangDecl, os);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3669,7 +3747,7 @@ void ClangImporter::Implementation::lookupValue(
   if (name.isOperator()) {
     for (auto entry : table.lookupMemberOperators(name.getBaseName())) {
       if (isVisibleClangEntry(entry)) {
-        if (auto decl = dyn_cast<ValueDecl>(
+        if (auto decl = dyn_cast_or_null<ValueDecl>(
                 importDeclReal(entry->getMostRecentDecl(), CurrentVersion)))
           consumer.foundDecl(decl, DeclVisibilityKind::VisibleAtTopLevel);
       }
@@ -3731,7 +3809,6 @@ void ClangImporter::Implementation::lookupValue(
           clangDecl->getMostRecentDecl();
 
       CurrentVersion.forEachOtherImportNameVersion(
-          SwiftContext.LangOpts.EnableExperimentalConcurrency,
           [&](ImportNameVersion nameVersion) {
         if (anyMatching)
           return;
@@ -4100,3 +4177,54 @@ swift::getModuleCachePathFromClang(const clang::CompilerInstance &Clang) {
   return llvm::sys::path::parent_path(SpecificModuleCachePath).str();
 }
 
+clang::FunctionDecl *ClangImporter::instantiateCXXFunctionTemplate(
+    ASTContext &ctx, clang::FunctionTemplateDecl *func, SubstitutionMap subst) {
+  SmallVector<clang::TemplateArgument, 4> templateSubst;
+  std::unique_ptr<TemplateInstantiationError> error =
+      ctx.getClangTemplateArguments(func->getTemplateParameters(),
+                                    subst.getReplacementTypes(), templateSubst);
+  if (error) {
+    std::string failedTypesStr;
+    llvm::raw_string_ostream failedTypesStrStream(failedTypesStr);
+    llvm::interleaveComma(error->failedTypes, failedTypesStrStream);
+    // TODO: Use the location of the apply here.
+    // TODO: This error message should not reference implementation details.
+    // See: https://github.com/apple/swift/pull/33053#discussion_r477003350
+    ctx.Diags.diagnose(SourceLoc(),
+                       diag::unable_to_convert_generic_swift_types.ID,
+                       {func->getName(), StringRef(failedTypesStr)});
+    // Return a valid FunctionDecl but, we'll never use it.
+    return func->getAsFunction();
+  }
+
+  // Instanciate a specialization of this template using the substitution map.
+  auto *templateArgList = clang::TemplateArgumentList::CreateCopy(
+      func->getASTContext(), templateSubst);
+  auto &sema = getClangInstance().getSema();
+  auto *spec = sema.InstantiateFunctionDeclaration(func, templateArgList,
+                                                   clang::SourceLocation());
+  sema.InstantiateFunctionDefinition(clang::SourceLocation(), spec);
+  return spec;
+}
+
+StructDecl *
+ClangImporter::instantiateCXXClassTemplate(
+    clang::ClassTemplateDecl *decl,
+    ArrayRef<clang::TemplateArgument> arguments) {
+  void *InsertPos = nullptr;
+  auto *ctsd = decl->findSpecialization(arguments, InsertPos);
+  if (!ctsd) {
+    ctsd = clang::ClassTemplateSpecializationDecl::Create(
+        decl->getASTContext(), decl->getTemplatedDecl()->getTagKind(),
+        decl->getDeclContext(), decl->getTemplatedDecl()->getBeginLoc(),
+        decl->getLocation(), decl, arguments, nullptr);
+    decl->AddSpecialization(ctsd, InsertPos);
+  }
+
+  auto CanonType = decl->getASTContext().getTypeDeclType(ctsd);
+  assert(isa<clang::RecordType>(CanonType) &&
+          "type of non-dependent specialization is not a RecordType");
+
+  return dyn_cast_or_null<StructDecl>(
+      Impl.importDecl(ctsd, Impl.CurrentVersion));
+}

@@ -44,6 +44,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Target/TargetMachine.h"
 
@@ -723,11 +724,22 @@ public:
       *DynamicReplacementLinkEntryPtrTy; // %link_entry*
   llvm::StructType *DynamicReplacementKeyTy; // { i32, i32}
 
+  llvm::StructType *AsyncFunctionPointerTy; // { i32, i32 }
   llvm::StructType *SwiftContextTy;
   llvm::StructType *SwiftTaskTy;
+  llvm::StructType *SwiftJobTy;
+  llvm::StructType *SwiftExecutorTy;
+  llvm::PointerType *AsyncFunctionPointerPtrTy;
   llvm::PointerType *SwiftContextPtrTy;
   llvm::PointerType *SwiftTaskPtrTy;
-
+  llvm::PointerType *SwiftTaskGroupPtrTy;
+  llvm::PointerType *SwiftJobPtrTy;
+  llvm::PointerType *SwiftExecutorPtrTy;
+  llvm::FunctionType *TaskContinuationFunctionTy;
+  llvm::PointerType *TaskContinuationFunctionPtrTy;
+  llvm::StructType *AsyncTaskAndContextTy;
+  llvm::StructType *AsyncContinuationContextTy;
+  llvm::PointerType *AsyncContinuationContextPtrTy;
   llvm::StructType *DifferentiabilityWitnessTy; // { i8*, i8* }
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
@@ -743,6 +755,10 @@ public:
   llvm::CallingConv::ID C_CC;          /// standard C calling convention
   llvm::CallingConv::ID DefaultCC;     /// default calling convention
   llvm::CallingConv::ID SwiftCC;       /// swift calling convention
+  llvm::CallingConv::ID SwiftAsyncCC;  /// swift calling convention for async
+
+  /// What kind of tail call should be used for async->async calls.
+  llvm::CallInst::TailCallKind AsyncTailCallKind;
 
   Signature getAssociatedTypeWitnessTableAccessFunctionSignature();
 
@@ -889,6 +905,9 @@ public:
   const TypeInfo &getTypeInfo(SILType T);
   const TypeInfo &getWitnessTablePtrTypeInfo();
   const TypeInfo &getTypeMetadataPtrTypeInfo();
+  const TypeInfo &getSwiftContextPtrTypeInfo();
+  const TypeInfo &getTaskContinuationFunctionPtrTypeInfo();
+  const TypeInfo &getSwiftExecutorPtrTypeInfo();
   const TypeInfo &getObjCClassPtrTypeInfo();
   const LoadableTypeInfo &getOpaqueStorageTypeInfo(Size size, Alignment align);
   const LoadableTypeInfo &
@@ -897,6 +916,7 @@ public:
   const LoadableTypeInfo &getUnknownObjectTypeInfo();
   const LoadableTypeInfo &getBridgeObjectTypeInfo();
   const LoadableTypeInfo &getRawPointerTypeInfo();
+  const LoadableTypeInfo &getRawUnsafeContinuationTypeInfo();
   llvm::Type *getStorageTypeForUnlowered(Type T);
   llvm::Type *getStorageTypeForLowered(CanType T);
   llvm::Type *getStorageType(SILType T);
@@ -957,9 +977,6 @@ private:
   friend TypeConverter;
 
   const clang::ASTContext *ClangASTContext;
-  ClangTypeConverter *ClangTypes;
-  void initClangTypeConverter();
-  void destroyClangTypeConverter();
 
   llvm::DenseMap<Decl*, MetadataLayout*> MetadataLayouts;
   void destroyMetadataLayoutMap();
@@ -997,6 +1014,7 @@ public:
   void addUsedGlobal(llvm::GlobalValue *global);
   void addCompilerUsedGlobal(llvm::GlobalValue *global);
   void addObjCClass(llvm::Constant *addr, bool nonlazy);
+  void addObjCClassStub(llvm::Constant *addr);
   void addProtocolConformance(ConformanceDescription &&conformance);
 
   llvm::Constant *emitSwiftProtocols();
@@ -1050,10 +1068,10 @@ public:
                               SILType objectType, const TypeInfo &objectTI,
                               const OutliningMetadataCollector &collector);
 
-private:
   llvm::Constant *getAddrOfClangGlobalDecl(clang::GlobalDecl global,
                                            ForDefinition_t forDefinition);
 
+private:
   using CopyAddrHelperGenerator =
     llvm::function_ref<void(IRGenFunction &IGF, Address dest, Address src,
                             SILType objectType, const TypeInfo &objectTI)>;
@@ -1114,6 +1132,8 @@ private:
   /// List of Objective-C classes that require nonlazy realization, bitcast to
   /// i8*.
   SmallVector<llvm::WeakTrackingVH, 4> ObjCNonLazyClasses;
+  /// List of Objective-C resilient class stubs, bitcast to i8*.
+  SmallVector<llvm::WeakTrackingVH, 4> ObjCClassStubs;
   /// List of Objective-C categories, bitcast to i8*.
   SmallVector<llvm::WeakTrackingVH, 4> ObjCCategories;
   /// List of Objective-C categories on class stubs, bitcast to i8*.
@@ -1271,6 +1291,7 @@ public:
   llvm::InlineAsm *getObjCRetainAutoreleasedReturnValueMarker();
   ClassDecl *getObjCRuntimeBaseForSwiftRootClass(ClassDecl *theClass);
   ClassDecl *getObjCRuntimeBaseClass(Identifier name, Identifier objcName);
+  ClassDecl *getSwiftNativeNSObjectDecl();
   llvm::Module *getModule() const;
   llvm::AttributeList getAllocAttrs();
 
@@ -1367,7 +1388,8 @@ public:
   void finalizeClangCodeGen();
   void finishEmitAfterTopLevel();
 
-  Signature getSignature(CanSILFunctionType fnType);
+  Signature getSignature(CanSILFunctionType fnType,
+                         bool suppressGenerics = false);
   llvm::FunctionType *getFunctionType(CanSILFunctionType type,
                                       llvm::AttributeList &attrs,
                                       ForeignFunctionInfo *foreignInfo=nullptr);
@@ -1380,6 +1402,12 @@ public:
 
   /// Cast the given constant to i8*.
   llvm::Constant *getOpaquePtr(llvm::Constant *pointer);
+
+  llvm::Constant *getAddrOfAsyncFunctionPointer(LinkEntity entity);
+  llvm::Constant *getAddrOfAsyncFunctionPointer(SILFunction *function);
+  llvm::Constant *defineAsyncFunctionPointer(LinkEntity entity,
+                                             ConstantInit init);
+  SILFunction *getSILFunctionForAsyncFunctionPointer(llvm::Constant *afp);
 
   llvm::Function *getAddrOfDispatchThunk(SILDeclRef declRef,
                                          ForDefinition_t forDefinition);
@@ -1456,6 +1484,8 @@ public:
   llvm::Constant *getAddrOfTypeMetadataLazyCacheVariable(CanType type);
   llvm::Constant *getAddrOfTypeMetadataDemanglingCacheVariable(CanType type,
                                                        ConstantInit definition);
+  llvm::Constant *getAddrOfCanonicalPrespecializedGenericTypeCachingOnceToken(
+      NominalTypeDecl *decl);
   llvm::Constant *getAddrOfNoncanonicalSpecializedGenericTypeMetadataCacheVariable(CanType type);
 
   llvm::Constant *getAddrOfClassMetadataBounds(ClassDecl *D,
@@ -1598,6 +1628,9 @@ public:
   /// Add the swiftself attribute.
   void addSwiftSelfAttributes(llvm::AttributeList &attrs, unsigned argIndex);
 
+  void addSwiftAsyncContextAttributes(llvm::AttributeList &attrs,
+                                      unsigned argIndex);
+
   /// Add the swifterror attribute.
   void addSwiftErrorAttributes(llvm::AttributeList &attrs, unsigned argIndex);
 
@@ -1620,7 +1653,7 @@ public:
   bool hasObjCResilientClassStub(ClassDecl *D);
 
   /// Emit a resilient class stub.
-  void emitObjCResilientClassStub(ClassDecl *D);
+  llvm::Constant *emitObjCResilientClassStub(ClassDecl *D, bool isPublic);
 
 private:
   llvm::Constant *

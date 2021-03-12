@@ -5,14 +5,14 @@
 // REQUIRES: CPU=arm64e
 // REQUIRES: OS=macosx
 
-import _Concurrency
 import Swift
+import _Concurrency
 
-public actor class A1 {
+public actor A1 {
   var x: Int = 17
 }
 
-open actor class A3<T>: Actor {
+open actor A3<T>: Actor {
   open func f() { }
 }
 

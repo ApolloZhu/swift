@@ -24,6 +24,7 @@
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ParameterList.h"
@@ -194,13 +195,18 @@ namespace {
     ClangImporter::Implementation &Impl;
     bool AllowNSUIntegerAsInt;
     Bridgeability Bridging;
+    const clang::FunctionType *CompletionHandlerType;
+    Optional<unsigned> CompletionHandlerErrorParamIndex;
 
   public:
     SwiftTypeConverter(ClangImporter::Implementation &impl,
                        bool allowNSUIntegerAsInt,
-                       Bridgeability bridging)
+                       Bridgeability bridging,
+                       const clang::FunctionType *completionHandlerType,
+                       Optional<unsigned> completionHandlerErrorParamIndex)
       : Impl(impl), AllowNSUIntegerAsInt(allowNSUIntegerAsInt),
-        Bridging(bridging) {}
+        Bridging(bridging), CompletionHandlerType(completionHandlerType),
+        CompletionHandlerErrorParamIndex(completionHandlerErrorParamIndex) {}
 
     using TypeVisitor::Visit;
     ImportResult Visit(clang::QualType type) {
@@ -210,10 +216,9 @@ namespace {
 
     ImportResult VisitType(const Type*) = delete;
 
-#define DEPENDENT_TYPE(Class, Base)                               \
-    ImportResult Visit##Class##Type(const clang::Class##Type *) { \
-      llvm_unreachable("Dependent types cannot be converted");    \
-    }
+    // TODO: Add support for dependent types (SR-13809).
+#define DEPENDENT_TYPE(Class, Base)                                            \
+  ImportResult Visit##Class##Type(const clang::Class##Type *) { return Type(); }
 #define TYPE(Class, Base)
 #include "clang/AST/TypeNodes.inc"
 
@@ -229,7 +234,7 @@ namespace {
         return NAT->getSinglyDesugaredType();
       return T;
     }
-    
+
     ImportResult VisitBuiltinType(const clang::BuiltinType *type) {
       switch (type->getKind()) {
       case clang::BuiltinType::Void:
@@ -355,10 +360,16 @@ namespace {
       case clang::BuiltinType::OMPIterator:
         return Type();
 
-      // SVE builtin types that don't have Swift equivalents.
+      // ARM SVE builtin types that don't have Swift equivalents.
 #define SVE_TYPE(Name, Id, ...) \
       case clang::BuiltinType::Id:
 #include "clang/Basic/AArch64SVEACLETypes.def"
+        return Type();
+
+      // PPC SVE builtin types that don't have Swift equivalents.
+#define PPC_VECTOR_TYPE(Name, Id, Size) \
+      case clang::BuiltinType::Id:
+#include "clang/Basic/PPCTypes.def"
         return Type();
       }
 
@@ -393,8 +404,8 @@ namespace {
     ImportResult VisitMemberPointerType(const clang::MemberPointerType *type) {
       return Type();
     }
-    
-    ImportResult VisitPointerType(const clang::PointerType *type) {      
+
+    ImportResult VisitPointerType(const clang::PointerType *type) {
       auto pointeeQualType = type->getPointeeType();
       auto quals = pointeeQualType.getQualifiers();
 
@@ -505,6 +516,8 @@ namespace {
       Type pointeeType =
           Impl.importTypeIgnoreIUO(pointeeQualType, ImportTypeKind::Value,
                                    AllowNSUIntegerAsInt, Bridgeability::None);
+      if (!pointeeType)
+        return Type();
 
       if (pointeeQualType->isFunctionType()) {
         return importFunctionPointerLikeType(*type, pointeeType);
@@ -537,7 +550,7 @@ namespace {
       // context.
       return Type();
     }
-    
+
     ImportResult VisitConstantArrayType(const clang::ConstantArrayType *type) {
       // FIXME: Map to a real fixed-size Swift array type when we have those.
       // Importing as a tuple at least fills the right amount of space, and
@@ -552,7 +565,7 @@ namespace {
       auto size = type->getSize().getZExtValue();
       // An array of size N is imported as an N-element tuple which
       // takes very long to compile. We chose 4096 as the upper limit because
-      // we don't want to break arrays of size PATH_MAX. 
+      // we don't want to break arrays of size PATH_MAX.
       if (size > 4096)
         return Type();
       
@@ -610,8 +623,19 @@ namespace {
       for (auto param = type->param_type_begin(),
              paramEnd = type->param_type_end();
            param != paramEnd; ++param) {
+        // Determine whether we have a result parameter of a completion
+        // handler that can also express a thrown error.
+        ImportTypeKind paramImportKind = ImportTypeKind::Parameter;
+        unsigned paramIdx = param - type->param_type_begin();
+        if (CompletionHandlerType &&
+            Impl.getClangASTContext().hasSameType(
+                CompletionHandlerType, type) &&
+            paramIdx != CompletionHandlerErrorParamIndex) {
+          paramImportKind = ImportTypeKind::CompletionHandlerResultParameter;
+        }
+
         auto swiftParamTy = Impl.importTypeIgnoreIUO(
-            *param, ImportTypeKind::Parameter, AllowNSUIntegerAsInt, Bridging,
+            *param, paramImportKind, AllowNSUIntegerAsInt, Bridging,
             OTK_Optional);
         if (!swiftParamTy)
           return Type();
@@ -829,23 +853,31 @@ namespace {
       return { mappedType, underlyingResult.Hint };
     }
 
-#define SUGAR_TYPE(KIND)                                            \
-    ImportResult Visit##KIND##Type(const clang::KIND##Type *type) { \
-      return Visit(type->desugar());                                \
+    // TODO: add custom visitors for these types.
+#define MAYBE_SUGAR_TYPE(KIND)                                                 \
+    ImportResult Visit##KIND##Type(const clang::KIND##Type *type) {            \
+      if (type->isSugared())                                                   \
+        return Visit(type->desugar());                                         \
+      return Type();                                                           \
     }
-    SUGAR_TYPE(TypeOfExpr)
-    SUGAR_TYPE(TypeOf)
-    SUGAR_TYPE(Decltype)
-    SUGAR_TYPE(UnaryTransform)
-    SUGAR_TYPE(Elaborated)
-    SUGAR_TYPE(SubstTemplateTypeParm)
-    SUGAR_TYPE(TemplateSpecialization)
-    SUGAR_TYPE(Auto)
-    SUGAR_TYPE(DeducedTemplateSpecialization)
-    SUGAR_TYPE(Adjusted)
-    SUGAR_TYPE(PackExpansion)
-    SUGAR_TYPE(Attributed)
+    MAYBE_SUGAR_TYPE(TypeOfExpr)
+    MAYBE_SUGAR_TYPE(TypeOf)
+    MAYBE_SUGAR_TYPE(Decltype)
+    MAYBE_SUGAR_TYPE(UnaryTransform)
+    MAYBE_SUGAR_TYPE(TemplateSpecialization)
+    MAYBE_SUGAR_TYPE(Auto)
+    MAYBE_SUGAR_TYPE(DeducedTemplateSpecialization)
+
+    // These types are ALWAYS sugared.
+#define SUGAR_TYPE(KIND)                                                       \
+    ImportResult Visit##KIND##Type(const clang::KIND##Type *type) {            \
+      return Visit(type->desugar());                                           \
+    }
     SUGAR_TYPE(MacroQualified)
+    SUGAR_TYPE(Attributed)
+    SUGAR_TYPE(Adjusted)
+    SUGAR_TYPE(SubstTemplateTypeParm)
+    SUGAR_TYPE(Elaborated)
 
     ImportResult VisitDecayedType(const clang::DecayedType *type) {
       clang::ASTContext &clangCtx = Impl.getClangASTContext();
@@ -994,7 +1026,7 @@ namespace {
         } else {
           importedType = imported->getDeclaredInterfaceType();
         }
- 
+
         if (!type->qual_empty()) {
           // As a special case, turn 'NSObject <NSCopying>' into
           // 'id <NSObject, NSCopying>', which can be imported more usefully.
@@ -1180,6 +1212,7 @@ static bool canBridgeTypes(ImportTypeKind importKind) {
   case ImportTypeKind::Result:
   case ImportTypeKind::AuditedResult:
   case ImportTypeKind::Parameter:
+  case ImportTypeKind::CompletionHandlerResultParameter:
   case ImportTypeKind::CFRetainedOutParameter:
   case ImportTypeKind::CFUnretainedOutParameter:
   case ImportTypeKind::Property:
@@ -1207,6 +1240,7 @@ static bool isCFAudited(ImportTypeKind importKind) {
   case ImportTypeKind::AuditedVariable:
   case ImportTypeKind::AuditedResult:
   case ImportTypeKind::Parameter:
+  case ImportTypeKind::CompletionHandlerResultParameter:
   case ImportTypeKind::CFRetainedOutParameter:
   case ImportTypeKind::CFUnretainedOutParameter:
   case ImportTypeKind::Property:
@@ -1264,13 +1298,11 @@ static Type maybeImportNSErrorOutParameter(ClangImporter::Implementation &impl,
         impl.SwiftContext.getSwiftName(KnownFoundationEntity::NSError))
     return Type();
 
-  ModuleDecl *foundationModule = impl.tryLoadFoundationModule();
-  if (!foundationModule ||
-      foundationModule->getName()
-        != elementClass->getModuleContext()->getName())
+  if (!impl.canImportFoundationModule() ||
+      !elementClass->getModuleContext()->isFoundationModule())
     return Type();
 
-
+  ModuleDecl *foundationModule = impl.tryLoadFoundationModule();
   if (resugarNSErrorPointer)
     return impl.getNamedSwiftType(
       foundationModule,
@@ -1376,7 +1408,7 @@ static ImportedType adjustTypeForConcreteImport(
       // id and Any can be bridged without Foundation. There would be
       // bootstrapping issues with the ObjectiveC module otherwise.
       if (hint.BridgedType->isAny()
-          || impl.tryLoadFoundationModule()
+          || impl.canImportFoundationModule()
           || impl.ImportForwardDeclarations) {
 
         // Set the bridged type if it wasn't done already.
@@ -1511,7 +1543,8 @@ static ImportedType adjustTypeForConcreteImport(
 ImportedType ClangImporter::Implementation::importType(
     clang::QualType type, ImportTypeKind importKind, bool allowNSUIntegerAsInt,
     Bridgeability bridging, OptionalTypeKind optionality,
-    bool resugarNSErrorPointer) {
+    bool resugarNSErrorPointer,
+    Optional<unsigned> completionHandlerErrorParamIndex) {
   if (type.isNull())
     return {Type(), false};
 
@@ -1542,15 +1575,32 @@ ImportedType ClangImporter::Implementation::importType(
                 clangContext.getObjCSelRedefinitionType()))
       type = clangContext.getObjCSelType();
   }
-  
+
   // If nullability is provided as part of the type, that overrides
   // optionality provided externally.
   if (auto nullability = type->getNullability(clangContext)) {
-    optionality = translateNullability(*nullability);
+    bool stripNonResultOptionality =
+        importKind == ImportTypeKind::CompletionHandlerResultParameter;
+    
+    optionality = translateNullability(*nullability, stripNonResultOptionality);
+  }
+
+  // If this is a completion handler parameter, record the function type whose
+  // parameters will act as the results of the completion handler.
+  const clang::FunctionType *completionHandlerType = nullptr;
+  if (completionHandlerErrorParamIndex) {
+    if (auto blockPtrType = type->getAs<clang::BlockPointerType>()) {
+      completionHandlerType =
+          blockPtrType->getPointeeType()->castAs<clang::FunctionType>();
+
+      type = clang::QualType(blockPtrType, 0);
+    }
   }
 
   // Perform abstract conversion, ignoring how the type is actually used.
-  SwiftTypeConverter converter(*this, allowNSUIntegerAsInt, bridging);
+  SwiftTypeConverter converter(
+      *this, allowNSUIntegerAsInt, bridging,
+      completionHandlerType, completionHandlerErrorParamIndex);
   auto importResult = converter.Visit(type);
 
   // Now fix up the type based on how we're concretely using it.
@@ -1696,22 +1746,51 @@ ImportedType ClangImporter::Implementation::importFunctionReturnType(
                     OptionalityOfReturn);
 }
 
+static Type
+findGenericTypeInGenericDecls(const clang::TemplateTypeParmType *templateParam,
+                              ArrayRef<GenericTypeParamDecl *> genericParams) {
+  StringRef name = templateParam->getIdentifier()->getName();
+  auto genericParamIter =
+      llvm::find_if(genericParams, [name](GenericTypeParamDecl *generic) {
+        return generic->getName().str() == name;
+      });
+  // TODO: once we support generics in class types, replace this with
+  // "return nullptr". Once support for template classes, this will need to
+  // be updated, though. I'm leaving the assert here to make it easier to
+  // find.
+  assert(genericParamIter != genericParams.end() &&
+         "Could not find generic param type in generic params.");
+  auto *genericParamDecl = *genericParamIter;
+  auto metatype =
+      cast<MetatypeType>(genericParamDecl->getInterfaceType().getPointer());
+  return metatype->getMetatypeInstanceType();
+}
+
 ImportedType ClangImporter::Implementation::importFunctionParamsAndReturnType(
     DeclContext *dc, const clang::FunctionDecl *clangDecl,
     ArrayRef<const clang::ParmVarDecl *> params, bool isVariadic,
-    bool isFromSystemModule, DeclName name, ParameterList *&parameterList) {
+    bool isFromSystemModule, DeclName name, ParameterList *&parameterList,
+    ArrayRef<GenericTypeParamDecl *> genericParams) {
 
   bool allowNSUIntegerAsInt =
       shouldAllowNSUIntegerAsInt(isFromSystemModule, clangDecl);
 
-  auto importedType =
-      importFunctionReturnType(dc, clangDecl, allowNSUIntegerAsInt);
-  if (!importedType)
-    return {Type(), false};
+  ImportedType importedType;
+  if (auto templateType =
+          dyn_cast<clang::TemplateTypeParmType>(clangDecl->getReturnType())) {
+    importedType = {findGenericTypeInGenericDecls(templateType, genericParams),
+                    false};
+  } else {
+    importedType =
+        importFunctionReturnType(dc, clangDecl, allowNSUIntegerAsInt);
+    if (!importedType)
+      return {Type(), false};
+  }
 
   ArrayRef<Identifier> argNames = name.getArgumentNames();
   parameterList = importFunctionParameterList(dc, clangDecl, params, isVariadic,
-                                              allowNSUIntegerAsInt, argNames);
+                                              allowNSUIntegerAsInt, argNames,
+                                              genericParams);
   if (!parameterList)
     return {Type(), false};
 
@@ -1725,7 +1804,8 @@ ImportedType ClangImporter::Implementation::importFunctionParamsAndReturnType(
 ParameterList *ClangImporter::Implementation::importFunctionParameterList(
     DeclContext *dc, const clang::FunctionDecl *clangDecl,
     ArrayRef<const clang::ParmVarDecl *> params, bool isVariadic,
-    bool allowNSUIntegerAsInt, ArrayRef<Identifier> argNames) {
+    bool allowNSUIntegerAsInt, ArrayRef<Identifier> argNames,
+    ArrayRef<GenericTypeParamDecl *> genericParams) {
   // Import the parameters.
   SmallVector<ParamDecl *, 4> parameters;
   unsigned index = 0;
@@ -1735,7 +1815,7 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
   // imported into Swift as static methods that have an additional
   // parameter for the left-hand side operand instead of the receiver object.
   if (auto CMD = dyn_cast<clang::CXXMethodDecl>(clangDecl)) {
-    if (clangDecl->isOverloadedOperator()) {
+    if (clangDecl->isOverloadedOperator() && isImportedAsStatic(clangDecl->getOverloadedOperator())) {
       auto param = new (SwiftContext)
           ParamDecl(SourceLoc(), SourceLoc(), Identifier(), SourceLoc(),
                     SwiftContext.getIdentifier("lhs"), dc);
@@ -1773,12 +1853,33 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
       importKind = ImportTypeKind::CFUnretainedOutParameter;
 
     // Import the parameter type into Swift.
-    auto importedType = importType(paramTy, importKind, allowNSUIntegerAsInt,
-                                   Bridgeability::Full, OptionalityOfParam);
-    if (!importedType)
-      return nullptr;
+    Type swiftParamTy;
+    bool isParamTypeImplicitlyUnwrapped = false;
 
-    auto swiftParamTy = importedType.getType();
+    auto referenceType = dyn_cast<clang::ReferenceType>(paramTy);
+    if (referenceType &&
+        isa<clang::TemplateTypeParmType>(referenceType->getPointeeType())) {
+      auto pointeeType = referenceType->getPointeeType();
+      auto templateParamType = cast<clang::TemplateTypeParmType>(pointeeType);
+      PointerTypeKind pointerKind = pointeeType.getQualifiers().hasConst()
+                                        ? PTK_UnsafePointer
+                                        : PTK_UnsafeMutablePointer;
+      auto genericType =
+          findGenericTypeInGenericDecls(templateParamType, genericParams);
+      swiftParamTy = genericType->wrapInPointer(pointerKind);
+    } else if (auto *templateParamType =
+                   dyn_cast<clang::TemplateTypeParmType>(paramTy)) {
+      swiftParamTy =
+          findGenericTypeInGenericDecls(templateParamType, genericParams);
+    } else {
+      auto importedType = importType(paramTy, importKind, allowNSUIntegerAsInt,
+                                     Bridgeability::Full, OptionalityOfParam);
+      if (!importedType)
+        return nullptr;
+
+      isParamTypeImplicitlyUnwrapped = importedType.isImplicitlyUnwrapped();
+      swiftParamTy = importedType.getType();
+    }
 
     // Map __attribute__((noescape)) to @noescape.
     if (param->hasAttr<clang::NoEscapeAttr>()) {
@@ -1787,7 +1888,7 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
         swiftParamTy = newParamTy;
       }
     }
-    
+
     // Figure out the name for this parameter.
     Identifier bodyName = importFullName(param, CurrentVersion)
                               .getDeclName()
@@ -1806,8 +1907,7 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
         ImportedHeaderUnit);
     paramInfo->setSpecifier(ParamSpecifier::Default);
     paramInfo->setInterfaceType(swiftParamTy);
-    recordImplicitUnwrapForDecl(paramInfo,
-                                importedType.isImplicitlyUnwrapped());
+    recordImplicitUnwrapForDecl(paramInfo, isParamTypeImplicitlyUnwrapped);
     parameters.push_back(paramInfo);
     ++index;
   }
@@ -1960,7 +2060,7 @@ adjustResultTypeForThrowingFunction(ForeignErrorConvention::Info errorInfo,
 
   llvm_unreachable("Invalid ForeignErrorConvention.");
 }
-                                     
+
 /// Produce the foreign error convention from the imported error info,
 /// error parameter type, and original result type.
 static ForeignErrorConvention
@@ -2020,10 +2120,13 @@ static Type decomposeCompletionHandlerType(
     if (param.isInOut() || param.isVariadic())
       return Type();
 
-    // If there is an error parameter to the completion handler, it is
+    // If there are error-related parameters to the completion handler, they are
     // not part of the result type of the asynchronous function.
     if (info.completionHandlerErrorParamIndex() &&
         paramIdx == *info.completionHandlerErrorParamIndex())
+      continue;
+    if (info.completionHandlerFlagParamIndex() &&
+        paramIdx == *info.completionHandlerFlagParamIndex())
       continue;
 
     resultTypeElts.push_back(param.getPlainType());
@@ -2179,7 +2282,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
     }
 
     bool paramIsCompletionHandler =
-        asyncInfo && paramIndex == asyncInfo->CompletionHandlerParamIndex;
+        asyncInfo && paramIndex == asyncInfo->completionHandlerParamIndex();
 
     // Import the parameter type into Swift.
 
@@ -2201,6 +2304,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
     }
 
     // Special case for NSDictionary's subscript.
+    ImportTypeKind importKind = ImportTypeKind::Parameter;
     Type swiftParamTy;
     bool paramIsIUO;
     if (kind == SpecialMethodKind::NSDictionarySubscriptGetter &&
@@ -2211,11 +2315,18 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
 
       paramIsIUO = optionalityOfParam == OTK_ImplicitlyUnwrappedOptional;
     } else {
-      ImportTypeKind importKind = ImportTypeKind::Parameter;
       if (param->hasAttr<clang::CFReturnsRetainedAttr>())
         importKind = ImportTypeKind::CFRetainedOutParameter;
       else if (param->hasAttr<clang::CFReturnsNotRetainedAttr>())
         importKind = ImportTypeKind::CFUnretainedOutParameter;
+
+      // Figure out if this is a completion handler parameter whose error
+      // parameter is used to indicate throwing.
+      Optional<unsigned> completionHandlerErrorParamIndex;
+      if (paramIsCompletionHandler) {
+        completionHandlerErrorParamIndex =
+            asyncInfo->completionHandlerErrorParamIndex();
+      }
 
       // If this is the throws error parameter, we don't need to convert any
       // NSError** arguments to the sugared NSErrorPointer typealias form,
@@ -2228,7 +2339,8 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
       auto importedParamType =
           importType(paramTy, importKind, allowNSUIntegerAsIntInParam,
                      Bridgeability::Full, optionalityOfParam,
-                     /*resugarNSErrorPointer=*/!paramIsError);
+                     /*resugarNSErrorPointer=*/!paramIsError,
+                     completionHandlerErrorParamIndex);
       paramIsIUO = importedParamType.isImplicitlyUnwrapped();
       swiftParamTy = importedParamType.getType();
     }
@@ -2256,7 +2368,14 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
       if (Type replacedSwiftResultTy =
               decomposeCompletionHandlerType(swiftParamTy, *asyncInfo)) {
         swiftResultTy = replacedSwiftResultTy;
-        completionHandlerType = swiftParamTy->getCanonicalType();
+
+        // Import the original completion handler type without adjustments.
+        Type origSwiftParamTy =  importType(
+            paramTy, importKind, allowNSUIntegerAsIntInParam,
+            Bridgeability::Full, optionalityOfParam,
+            /*resugarNSErrorPointer=*/!paramIsError, None).getType();
+        completionHandlerType = mapGenericArgs(origDC, dc, origSwiftParamTy)
+            ->getCanonicalType();
         continue;
       }
 
@@ -2316,7 +2435,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
 
   // If we have a constructor with no parameters and a name with an
   // argument name, synthesize a Void parameter with that name.
-  if (kind == SpecialMethodKind::Constructor && params.empty() && 
+  if (kind == SpecialMethodKind::Constructor && params.empty() &&
       argNames.size() == 1) {
     addEmptyTupleParameter(argNames[0]);
   }
@@ -2342,7 +2461,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
     return {Type(), false};
   }
 
-  
+
   // Form the parameter list.
   *bodyParams = ParameterList::create(SwiftContext, swiftParams);
 
@@ -2353,8 +2472,10 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
 
   if (asyncInfo) {
     asyncConvention = ForeignAsyncConvention(
-        completionHandlerType, asyncInfo->CompletionHandlerParamIndex,
-        asyncInfo->CompletionHandlerErrorParamIndex);
+        completionHandlerType, asyncInfo->completionHandlerParamIndex(),
+        asyncInfo->completionHandlerErrorParamIndex(),
+        asyncInfo->completionHandlerFlagParamIndex(),
+        asyncInfo->completionHandlerFlagIsErrorOnZero());
   }
 
   if (errorInfo) {
@@ -2461,6 +2582,10 @@ static ModuleDecl *tryLoadModule(ASTContext &C,
 ModuleDecl *ClangImporter::Implementation::tryLoadFoundationModule() {
   return tryLoadModule(SwiftContext, SwiftContext.Id_Foundation,
                        ImportForwardDeclarations, checkedModules);
+}
+
+bool ClangImporter::Implementation::canImportFoundationModule() {
+  return SwiftContext.canImportModule({SwiftContext.Id_Foundation, SourceLoc()});
 }
 
 Type ClangImporter::Implementation::getNamedSwiftType(ModuleDecl *module,

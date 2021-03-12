@@ -548,13 +548,27 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   DefaultCC = SWIFT_DEFAULT_LLVM_CC;
   SwiftCC = llvm::CallingConv::Swift;
 
+  bool isAsyncCCSupported =
+    clangASTContext.getTargetInfo().checkCallingConvention(clang::CC_SwiftAsync)
+    == clang::TargetInfo::CCCR_OK;
+  if (opts.UseAsyncLowering && isAsyncCCSupported) {
+    SwiftAsyncCC = llvm::CallingConv::SwiftTail;
+    AsyncTailCallKind = llvm::CallInst::TCK_MustTail;
+  } else {
+    SwiftAsyncCC = SwiftCC;
+    AsyncTailCallKind = llvm::CallInst::TCK_Tail;
+  }
+
   if (opts.DebugInfoLevel > IRGenDebugInfoLevel::None)
     DebugInfo = IRGenDebugInfo::createIRGenDebugInfo(IRGen.Opts, *CI, *this,
                                                      Module,
                                                  MainInputFilenameForDebugInfo,
                                                      PrivateDiscriminator);
 
-  initClangTypeConverter();
+  if (auto loader = Context.getClangModuleLoader()) {
+    ClangASTContext =
+        &static_cast<ClangImporter *>(loader)->getClangASTContext();
+  }
 
   if (ClangASTContext) {
     auto atomicBoolTy = ClangASTContext->getAtomicType(ClangASTContext->BoolTy);
@@ -587,17 +601,57 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   DynamicReplacementKeyTy = createStructType(*this, "swift.dyn_repl_key",
                                              {RelativeAddressTy, Int32Ty});
 
+  AsyncFunctionPointerTy = createStructType(*this, "swift.async_func_pointer",
+                                            {RelativeAddressTy, Int32Ty}, true);
   SwiftContextTy = createStructType(*this, "swift.context", {});
-  SwiftTaskTy = createStructType(*this, "swift.task", {});
+  auto *ContextPtrTy = llvm::PointerType::getUnqual(SwiftContextTy);
+
+  // This must match the definition of class AsyncTask in swift/ABI/Task.h.
+  SwiftTaskTy = createStructType(*this, "swift.task", {
+    RefCountedStructTy,   // object header
+    Int8PtrTy, Int8PtrTy, // Job.SchedulerPrivate
+    SizeTy,               // Job.Flags
+    FunctionPtrTy,        // Job.RunJob/Job.ResumeTask
+    ContextPtrTy,         // Task.ResumeContext
+    IntPtrTy              // Task.Status
+  });
+
+  SwiftExecutorTy = createStructType(*this, "swift.executor", {});
+  AsyncFunctionPointerPtrTy = AsyncFunctionPointerTy->getPointerTo(DefaultAS);
   SwiftContextPtrTy = SwiftContextTy->getPointerTo(DefaultAS);
   SwiftTaskPtrTy = SwiftTaskTy->getPointerTo(DefaultAS);
+  SwiftTaskGroupPtrTy = Int8PtrTy; // we pass it opaquely (TaskGroup*)
+  SwiftExecutorPtrTy = SwiftExecutorTy->getPointerTo(DefaultAS);
+  SwiftJobTy = createStructType(*this, "swift.job", {
+    RefCountedStructTy,   // object header
+    Int8PtrTy, Int8PtrTy, // SchedulerPrivate
+    SizeTy,               // flags
+    FunctionPtrTy,        // RunJob/ResumeTask
+  });
+  SwiftJobPtrTy = SwiftJobTy->getPointerTo();
+
+  // using TaskContinuationFunction =
+  //   SWIFT_CC(swift)
+  //   void (AsyncTask *, ExecutorRef, AsyncContext *);
+  TaskContinuationFunctionTy = llvm::FunctionType::get(
+      VoidTy, {SwiftTaskPtrTy, SwiftExecutorPtrTy, SwiftContextPtrTy},
+      /*isVarArg*/ false);
+  TaskContinuationFunctionPtrTy = TaskContinuationFunctionTy->getPointerTo();
+
+  AsyncTaskAndContextTy = createStructType(
+      *this, "swift.async_task_and_context",
+      { SwiftTaskPtrTy, SwiftContextPtrTy });
+
+  AsyncContinuationContextTy = createStructType(
+      *this, "swift.async_continuation_context",
+      {SwiftContextPtrTy, SizeTy, ErrorPtrTy, OpaquePtrTy, SwiftExecutorPtrTy});
+  AsyncContinuationContextPtrTy = AsyncContinuationContextTy->getPointerTo();
 
   DifferentiabilityWitnessTy = createStructType(
       *this, "swift.differentiability_witness", {Int8PtrTy, Int8PtrTy});
 }
 
 IRGenModule::~IRGenModule() {
-  destroyClangTypeConverter();
   destroyMetadataLayoutMap();
   destroyPointerAuthCaches();
   delete &Types;
@@ -687,8 +741,26 @@ namespace RuntimeConstants {
     return RuntimeAvailability::AlwaysAvailable;
   }
 
+  RuntimeAvailability
+  GetCanonicalPrespecializedGenericMetadataAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getPrespecializedGenericMetadataAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
   RuntimeAvailability ConcurrencyAvailability(ASTContext &context) {
     auto featureAvailability = context.getConcurrencyAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability DifferentiationAvailability(ASTContext &context) {
+    auto featureAvailability = context.getDifferentiationAvailability();
     if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
       return RuntimeAvailability::ConditionallyAvailable;
     }
@@ -1105,7 +1177,7 @@ llvm::SmallString<32> getTargetDependentLibraryOption(const llvm::Triple &T,
   llvm::SmallString<32> buffer;
 
   if (T.isWindowsMSVCEnvironment() || T.isWindowsItaniumEnvironment()) {
-    bool quote = library.find(' ') != StringRef::npos;
+    bool quote = library.contains(' ');
 
     buffer += "/DEFAULTLIB:";
     if (quote)
@@ -1116,7 +1188,7 @@ llvm::SmallString<32> getTargetDependentLibraryOption(const llvm::Triple &T,
     if (quote)
       buffer += '"';
   } else if (T.isPS4()) {
-    bool quote = library.find(' ') != StringRef::npos;
+    bool quote = library.contains(' ');
 
     buffer += "\01";
     if (quote)
@@ -1511,6 +1583,16 @@ bool IRGenModule::finalize() {
   if (DebugInfo)
     DebugInfo->finalize();
   cleanupClangCodeGenMetadata();
+
+  // Clean up DSOLocal & DLLImport attributes, they cannot be applied together.
+  // The imported declarations are marked as DSO local by default.
+  for (auto &GV : Module.globals())
+    if (GV.hasDLLImportStorageClass())
+      GV.setDSOLocal(false);
+
+  for (auto &F : Module.functions())
+    if (F.hasDLLImportStorageClass())
+      F.setDSOLocal(false);
 
   return true;
 }

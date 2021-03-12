@@ -28,6 +28,7 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/TypeLowering.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -54,7 +55,7 @@ typedef llvm::DenseMap<DomTreeNode *, unsigned> DomTreeLevelMap;
 
 /// Promotes a single AllocStackInst into registers..
 class StackAllocationPromoter {
-  typedef llvm::SmallSetVector<SILBasicBlock *, 16> BlockSet;
+  typedef BasicBlockSetVector<16> BlockSet;
   typedef llvm::DenseMap<SILBasicBlock *, SILInstruction *> BlockToInstMap;
 
   // Use a priority queue keyed on dominator tree level so that inserted nodes
@@ -183,23 +184,43 @@ public:
 /// Returns true if \p I is an address of a LoadInst, skipping struct and
 /// tuple address projections. Sets \p singleBlock to null if the load (or
 /// it's address is not in \p singleBlock.
-static bool isAddressForLoad(SILInstruction *I, SILBasicBlock *&singleBlock) {
-  
-  if (isa<LoadInst>(I))
+/// This function looks for these patterns:
+/// 1. (load %ASI)
+/// 2. (load (struct_element_addr/tuple_element_addr/unchecked_addr_cast %ASI))
+static bool isAddressForLoad(SILInstruction *I, SILBasicBlock *&singleBlock,
+                             bool &hasGuaranteedOwnership) {
+
+  if (isa<LoadInst>(I)) {
+    // SILMem2Reg is disabled when we find:
+    // (load [take] (struct_element_addr/tuple_element_addr %ASI))
+    // struct_element_addr and tuple_element_addr are lowered into
+    // struct_extract and tuple_extract and these SIL instructions have a
+    // guaranteed ownership. For replacing load's users, we need an owned value.
+    // We will need a new copy and destroy of the running val placed after the
+    // last use. This is not implemented currently.
+    if (hasGuaranteedOwnership && cast<LoadInst>(I)->getOwnershipQualifier() ==
+                                      LoadOwnershipQualifier::Take) {
+      return false;
+    }
     return true;
+  }
 
   if (!isa<UncheckedAddrCastInst>(I) && !isa<StructElementAddrInst>(I) &&
       !isa<TupleElementAddrInst>(I))
     return false;
-  
+
+  if (isa<StructElementAddrInst>(I) || isa<TupleElementAddrInst>(I)) {
+    hasGuaranteedOwnership = true;
+  }
+
   // Recursively search for other (non-)loads in the instruction's uses.
   for (auto UI : cast<SingleValueInstruction>(I)->getUses()) {
     SILInstruction *II = UI->getUser();
     if (II->getParent() != singleBlock)
       singleBlock = nullptr;
-    
-    if (!isAddressForLoad(II, singleBlock))
-        return false;
+
+    if (!isAddressForLoad(II, singleBlock, hasGuaranteedOwnership))
+      return false;
   }
   return true;
 }
@@ -233,7 +254,8 @@ static bool isCaptured(AllocStackInst *ASI, bool &inSingleBlock) {
       singleBlock = nullptr;
     
     // Loads are okay.
-    if (isAddressForLoad(II, singleBlock))
+    bool hasGuaranteedOwnership = false;
+    if (isAddressForLoad(II, singleBlock, hasGuaranteedOwnership))
       continue;
 
     // We can store into an AllocStack (but not the pointer).
@@ -302,8 +324,10 @@ promoteDebugValueAddr(DebugValueAddrInst *DVAI, SILValue Value, SILBuilder &B) {
   // Avoid inserting the same debug_value twice.
   for (Operand *Use : Value->getUses())
     if (auto *DVI = dyn_cast<DebugValueInst>(Use->getUser()))
-      if (*DVI->getVarInfo() == *DVAI->getVarInfo())
+      if (*DVI->getVarInfo() == *DVAI->getVarInfo()) {
+        DVAI->eraseFromParent();
         return;
+      }
   B.setInsertionPoint(DVAI);
   B.setCurrentDebugScope(DVAI->getDebugScope());
   B.createDebugValue(DVAI->getLoc(), Value, *DVAI->getVarInfo());
@@ -348,6 +372,8 @@ static void collectLoads(SILInstruction *I, SmallVectorImpl<LoadInst *> &Loads) 
 static void replaceLoad(LoadInst *LI, SILValue val, AllocStackInst *ASI) {
   ProjectionPath projections(val->getType());
   SILValue op = LI->getOperand();
+  SILBuilderWithScope builder(LI);
+
   while (op != ASI) {
     assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
            isa<TupleElementAddrInst>(op));
@@ -355,14 +381,45 @@ static void replaceLoad(LoadInst *LI, SILValue val, AllocStackInst *ASI) {
     projections.push_back(Projection(Inst));
     op = Inst->getOperand(0);
   }
-  SILBuilder builder(LI);
+
+  SmallVector<SILValue, 4> borrowedVals;
   for (auto iter = projections.rbegin(); iter != projections.rend(); ++iter) {
     const Projection &projection = *iter;
+    assert(projection.getKind() == ProjectionKind::BitwiseCast ||
+           projection.getKind() == ProjectionKind::Struct ||
+           projection.getKind() == ProjectionKind::Tuple);
+
+    // struct_extract and tuple_extract expect guaranteed operand ownership
+    // non-trivial RunningVal is owned. Insert borrow operation to convert
+    if (projection.getKind() == ProjectionKind::Struct ||
+        projection.getKind() == ProjectionKind::Tuple) {
+      SILValue opVal = builder.emitBeginBorrowOperation(LI->getLoc(), val);
+      if (opVal != val) {
+        borrowedVals.push_back(opVal);
+        val = opVal;
+      }
+    }
     val = projection.createObjectProjection(builder, LI->getLoc(), val).get();
   }
+
   op = LI->getOperand();
-  LI->replaceAllUsesWith(val);
+  // Replace users of the loaded value with `val`
+  // If we have a load [copy], replace the users with copy_value of `val`
+  if (LI->getOwnershipQualifier() == LoadOwnershipQualifier::Copy) {
+    LI->replaceAllUsesWith(builder.createCopyValue(LI->getLoc(), val));
+  } else {
+    assert(!ASI->getFunction()->hasOwnership() ||
+           val.getOwnershipKind() != OwnershipKind::Guaranteed);
+    LI->replaceAllUsesWith(val);
+  }
+
+  for (auto borrowedVal : borrowedVals) {
+    builder.emitEndBorrowOperation(LI->getLoc(), borrowedVal);
+  }
+
+  // Delete the load
   LI->eraseFromParent();
+
   while (op != ASI && op->use_empty()) {
     assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
            isa<TupleElementAddrInst>(op));
@@ -399,6 +456,7 @@ StoreInst *
 StackAllocationPromoter::promoteAllocationInBlock(SILBasicBlock *BB) {
   LLVM_DEBUG(llvm::dbgs() << "*** Promoting ASI in block: " << *ASI);
 
+  // RunningVal is the current value in the stack location.
   // We don't know the value of the alloca until we find the first store.
   SILValue RunningVal = SILValue();
   // Keep track of the last StoreInst that we found.
@@ -415,12 +473,16 @@ StackAllocationPromoter::promoteAllocationInBlock(SILBasicBlock *BB) {
         // If we are loading from the AllocStackInst and we already know the
         // content of the Alloca then use it.
         LLVM_DEBUG(llvm::dbgs() << "*** Promoting load: " << *Load);
-        
         replaceLoad(Load, RunningVal, ASI);
         ++NumInstRemoved;
-      } else if (Load->getOperand() == ASI) {
+      } else if (Load->getOperand() == ASI &&
+                 Load->getOwnershipQualifier() !=
+                     LoadOwnershipQualifier::Copy) {
         // If we don't know the content of the AllocStack then the loaded
         // value *is* the new value;
+        // Don't use result of load [copy] as a RunningVal, it necessitates
+        // additional logic for cleanup of consuming instructions of the result.
+        // StackAllocationPromoter::fixBranchesAndUses will later handle it.
         LLVM_DEBUG(llvm::dbgs() << "*** First load: " << *Load);
         RunningVal = Load;
       }
@@ -433,16 +495,35 @@ StackAllocationPromoter::promoteAllocationInBlock(SILBasicBlock *BB) {
       if (SI->getDest() != ASI)
         continue;
 
-      // The stored value is the new running value.
-      RunningVal = SI->getSrc();
+      // If we see a store [assign], always convert it to a store [init]. This
+      // simplifies further processing.
+      if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
+        if (RunningVal) {
+          SILBuilderWithScope(SI).createDestroyValue(SI->getLoc(), RunningVal);
+        } else {
+          SILBuilderWithScope localBuilder(SI);
+          auto *newLoad = localBuilder.createLoad(SI->getLoc(), ASI,
+                                                  LoadOwnershipQualifier::Take);
+          localBuilder.createDestroyValue(SI->getLoc(), newLoad);
+        }
+        SI->setOwnershipQualifier(StoreOwnershipQualifier::Init);
+      }
 
       // If we met a store before this one, delete it.
       if (LastStore) {
+        assert(LastStore->getOwnershipQualifier() !=
+                   StoreOwnershipQualifier::Assign &&
+               "store [assign] to the stack location should have been "
+               "transformed to a store [init]");
+        LLVM_DEBUG(llvm::dbgs()
+                   << "*** Removing redundant store: " << *LastStore);
         ++NumInstRemoved;
-        LLVM_DEBUG(llvm::dbgs() << "*** Removing redundant store: "
-                                << *LastStore);
         LastStore->eraseFromParent();
       }
+
+      // The stored value is the new running value.
+      RunningVal = SI->getSrc();
+      // The current store is now the LastStore
       LastStore = SI;
       continue;
     }
@@ -466,13 +547,27 @@ StackAllocationPromoter::promoteAllocationInBlock(SILBasicBlock *BB) {
       continue;
     }
 
+    if (auto *DVI = dyn_cast<DestroyValueInst>(Inst)) {
+      if (DVI->getOperand() == RunningVal) {
+        // Reset LastStore.
+        // So that we don't end up passing dead values as phi args in
+        // StackAllocationPromoter::fixBranchesAndUses
+        LastStore = nullptr;
+      }
+    }
+
     // Stop on deallocation.
     if (auto *DSI = dyn_cast<DeallocStackInst>(Inst)) {
       if (DSI->getOperand() == ASI)
         break;
     }
   }
+
   if (LastStore) {
+    assert(LastStore->getOwnershipQualifier() !=
+               StoreOwnershipQualifier::Assign &&
+           "store [assign] to the stack location should have been "
+           "transformed to a store [init]");
     LLVM_DEBUG(llvm::dbgs() << "*** Finished promotion. Last store: "
                             << *LastStore);
   } else {
@@ -512,6 +607,10 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *ASI) {
     // value.
     if (auto *SI = dyn_cast<StoreInst>(Inst)) {
       if (SI->getDest() == ASI) {
+        if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
+          assert(RunningVal);
+          SILBuilderWithScope(SI).createDestroyValue(SI->getLoc(), RunningVal);
+        }
         RunningVal = SI->getSrc();
         Inst->eraseFromParent();
         ++NumInstRemoved;
@@ -553,15 +652,15 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *ASI) {
     }
 
     // Remove dead address instructions that may be uses of the allocation.
-    SILNode *Node = Inst;
-    while (isa<StructElementAddrInst>(Node) ||
-           isa<TupleElementAddrInst>(Node) ||
-           isa<UncheckedAddrCastInst>(Node)) {
-      auto *I = cast<SingleValueInstruction>(Node);
-      if (!I->use_empty()) break;
-      Node = I->getOperand(0);
-      I->eraseFromParent();
+    auto *addrInst = dyn_cast<SingleValueInstruction>(Inst);
+    while (addrInst && addrInst->use_empty() &&
+           (isa<StructElementAddrInst>(addrInst) ||
+            isa<TupleElementAddrInst>(addrInst) ||
+            isa<UncheckedAddrCastInst>(addrInst))) {
+      SILValue op = addrInst->getOperand(0);
+      addrInst->eraseFromParent();
       ++NumInstRemoved;
+      addrInst = dyn_cast<SingleValueInstruction>(op);
     }
   }
 }
@@ -570,7 +669,7 @@ void StackAllocationPromoter::addBlockArguments(BlockSet &PhiBlocks) {
   LLVM_DEBUG(llvm::dbgs() << "*** Adding new block arguments.\n");
 
   for (auto *Block : PhiBlocks)
-    Block->createPhiArgument(ASI->getElementType(), ValueOwnershipKind::Owned);
+    Block->createPhiArgument(ASI->getElementType(), OwnershipKind::Owned);
 }
 
 SILValue
@@ -590,7 +689,7 @@ StackAllocationPromoter::getLiveOutValue(BlockSet &PhiBlocks,
       }
 
     // If there is a Phi definition in this block:
-    if (PhiBlocks.count(BB)) {
+    if (PhiBlocks.contains(BB)) {
       // Return the dummy instruction that represents the new value that we will
       // add to the basic block.
       SILValue Phi = BB->getArgument(BB->getNumArguments() - 1);
@@ -612,7 +711,7 @@ StackAllocationPromoter::getLiveInValue(BlockSet &PhiBlocks,
   // our loads happen before stores, so we need to first check for Phi nodes
   // in the first block, but stores first in all other stores in the idom
   // chain.
-  if (PhiBlocks.count(BB)) {
+  if (PhiBlocks.contains(BB)) {
     LLVM_DEBUG(llvm::dbgs() << "*** Found a local Phi definition.\n");
     return BB->getArgument(BB->getNumArguments() - 1);
   }
@@ -646,6 +745,7 @@ void StackAllocationPromoter::fixPhiPredBlock(BlockSet &PhiBlocks,
 void StackAllocationPromoter::fixBranchesAndUses(BlockSet &PhiBlocks) {
   // First update uses of the value.
   SmallVector<LoadInst *, 4> collectedLoads;
+
   for (auto UI = ASI->use_begin(), E = ASI->use_end(); UI != E;) {
     auto *Inst = UI->getUser();
     ++UI;
@@ -710,11 +810,22 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSet &PhiBlocks) {
       fixPhiPredBlock(PhiBlocks, Block, PBB);
     }
   }
+
+  // If the owned phi arg we added did not have any uses, create end_lifetime to
+  // end its lifetime. In asserts mode, make sure we have only undef incoming
+  // values for such phi args.
+    for (auto Block : PhiBlocks) {
+      auto *phiArg = cast<SILPhiArgument>(
+          Block->getArgument(Block->getNumArguments() - 1));
+      if (phiArg->use_empty()) {
+        erasePhiArgument(Block, Block->getNumArguments() - 1);
+      }
+    }
 }
 
 void StackAllocationPromoter::pruneAllocStackUsage() {
   LLVM_DEBUG(llvm::dbgs() << "*** Pruning : " << *ASI);
-  BlockSet Blocks;
+  BlockSet Blocks(ASI->getFunction());
 
   // Insert all of the blocks that ASI is live in.
   for (auto UI = ASI->use_begin(), E = ASI->use_end(); UI != E; ++UI)
@@ -753,7 +864,7 @@ void StackAllocationPromoter::promoteAllocationToPhi() {
   LLVM_DEBUG(llvm::dbgs() << "*** Placing Phis for : " << *ASI);
 
   // A list of blocks that will require new Phi values.
-  BlockSet PhiBlocks;
+  BlockSet PhiBlocks(ASI->getFunction());
 
   // The "piggy-bank" data-structure that we use for processing the dom-tree
   // bottom-up.
@@ -921,7 +1032,8 @@ bool MemoryToRegisters::promoteSingleAllocation(AllocStackInst *alloc,
 bool MemoryToRegisters::run() {
   bool Changed = false;
 
-  F.verifyCriticalEdges();
+  if (F.getModule().getOptions().VerifyAll)
+    F.verifyCriticalEdges();
 
   // Compute dominator tree node levels for the function.
   DomTreeLevelMap DomTreeLevels;
@@ -955,10 +1067,6 @@ class SILMem2Reg : public SILFunctionTransform {
 
   void run() override {
     SILFunction *F = getFunction();
-
-    // FIXME: We should be able to support ownership.
-    if (F->hasOwnership())
-      return;
 
     LLVM_DEBUG(llvm::dbgs() << "** Mem2Reg on function: " << F->getName()
                             << " **\n");

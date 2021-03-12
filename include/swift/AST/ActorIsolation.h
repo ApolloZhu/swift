@@ -16,6 +16,7 @@
 #ifndef SWIFT_AST_ACTORISOLATIONSTATE_H
 #define SWIFT_AST_ACTORISOLATIONSTATE_H
 
+#include "swift/AST/Type.h"
 #include "llvm/ADT/Hashing.h"
 
 namespace llvm {
@@ -24,6 +25,7 @@ class raw_ostream;
 
 namespace swift {
 class ClassDecl;
+class SubstitutionMap;
 class Type;
 
 /// Determine whether the given types are (canonically) equal, declared here
@@ -46,20 +48,31 @@ public:
     /// meaning that it can be used from any actor but is also unable to
     /// refer to the isolated state of any given actor.
     Independent,
+    /// The declaration is explicitly specified to be independent of any actor,
+    /// but the programmer promises to protect the declaration from concurrent
+    /// accesses manually. Thus, it is okay if this declaration is a mutable 
+    /// variable that creates storage.
+    IndependentUnsafe,
     /// The declaration is isolated to a global actor. It can refer to other
     /// entities with the same global actor.
     GlobalActor,
+    /// The declaration is isolated to a global actor but with the "unsafe"
+    /// annotation, which means that we only enforce the isolation if we're
+    /// coming from something with specific isolation.
+    GlobalActorUnsafe,
   };
 
 private:
   Kind kind;
   union {
-    ClassDecl *actor;
+    NominalTypeDecl *actor;
     Type globalActor;
     void *pointer;
   };
 
-  ActorIsolation(Kind kind, ClassDecl *actor) : kind(kind), actor(actor) { }
+  ActorIsolation(Kind kind, NominalTypeDecl *actor)
+      : kind(kind), actor(actor) { }
+
   ActorIsolation(Kind kind, Type globalActor)
       : kind(kind), globalActor(globalActor) { }
 
@@ -68,31 +81,55 @@ public:
     return ActorIsolation(Unspecified, nullptr);
   }
 
-  static ActorIsolation forIndependent() {
-    return ActorIsolation(Independent, nullptr);
+  static ActorIsolation forIndependent(ActorIndependentKind indepKind) {
+    ActorIsolation::Kind isoKind;
+    switch (indepKind) {
+      case ActorIndependentKind::Safe:
+        isoKind = Independent;
+        break;
+        
+      case ActorIndependentKind::Unsafe:
+        isoKind = IndependentUnsafe;
+        break;
+    }
+    return ActorIsolation(isoKind, nullptr);
   }
 
-  static ActorIsolation forActorInstance(ClassDecl *actor) {
+  static ActorIsolation forActorInstance(NominalTypeDecl *actor) {
     return ActorIsolation(ActorInstance, actor);
   }
 
-  static ActorIsolation forGlobalActor(Type globalActor) {
-    return ActorIsolation(GlobalActor, globalActor);
+  static ActorIsolation forGlobalActor(Type globalActor, bool unsafe) {
+    return ActorIsolation(
+        unsafe ? GlobalActorUnsafe : GlobalActor, globalActor);
   }
 
   Kind getKind() const { return kind; }
 
   operator Kind() const { return getKind(); }
 
-  ClassDecl *getActor() const {
+  bool isUnspecified() const { return kind == Unspecified; }
+
+  NominalTypeDecl *getActor() const {
     assert(getKind() == ActorInstance);
     return actor;
   }
 
+  bool isGlobalActor() const {
+    return getKind() == GlobalActor || getKind() == GlobalActorUnsafe;
+  }
+
   Type getGlobalActor() const {
-    assert(getKind() == GlobalActor);
+    assert(isGlobalActor());
     return globalActor;
   }
+
+  /// Determine whether this isolation will require substitution to be
+  /// evaluated.
+  bool requiresSubstitution() const;
+
+  /// Substitute into types within the actor isolation.
+  ActorIsolation subst(SubstitutionMap subs) const;
 
   friend bool operator==(const ActorIsolation &lhs,
                          const ActorIsolation &rhs) {
@@ -101,6 +138,7 @@ public:
 
     switch (lhs.kind) {
     case Independent:
+    case IndependentUnsafe:
     case Unspecified:
       return true;
 
@@ -108,6 +146,7 @@ public:
       return lhs.actor == rhs.actor;
 
     case GlobalActor:
+    case GlobalActorUnsafe:
       return areTypesEqual(lhs.globalActor, rhs.globalActor);
     }
   }
@@ -121,6 +160,12 @@ public:
     return llvm::hash_combine(state.kind, state.pointer);
   }
 };
+
+/// Determine how the given value declaration is isolated.
+ActorIsolation getActorIsolation(ValueDecl *value);
+
+/// Determine how the given declaration context is isolated.
+ActorIsolation getActorIsolationOfContext(DeclContext *dc);
 
 void simple_display(llvm::raw_ostream &out, const ActorIsolation &state);
 

@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -enable-invalid-ephemeralness-as-error
+// RUN: %target-typecheck-verify-swift -enable-invalid-ephemeralness-as-error -disable-objc-interop
 
 // Test availability attributes on UnsafePointer initializers.
 // Assume the original source contains no UnsafeRawPointer types.
@@ -113,7 +113,7 @@ func unsafeRawBufferPointerConversions(
   _ = UnsafeRawBufferPointer(start: rp, count: 1)
   _ = UnsafeMutableRawBufferPointer(mrbp)
   _ = UnsafeRawBufferPointer(mrbp)
-  _ = UnsafeMutableRawBufferPointer(rbp) // expected-error {{missing argument label 'mutating:' in call}}
+  _ = UnsafeMutableRawBufferPointer(rbp) // expected-error {{cannot convert value of type 'UnsafeRawBufferPointer' to expected argument type 'UnsafeMutableRawBufferPointer'}}
   _ = UnsafeRawBufferPointer(rbp)
   _ = UnsafeMutableRawBufferPointer(mbpi)
   _ = UnsafeRawBufferPointer(mbpi)

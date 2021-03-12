@@ -346,7 +346,10 @@ static bool shouldIncludeDecl(Decl *D, bool ExcludeDoubleUnderscore) {
     return false;
 
   if (auto *ED = dyn_cast<ExtensionDecl>(D)) {
-    return shouldIncludeDecl(ED->getExtendedNominal(), ExcludeDoubleUnderscore);
+    auto *extended = ED->getExtendedNominal();
+    if (!extended)
+      return false;
+    return shouldIncludeDecl(extended, ExcludeDoubleUnderscore);
   }
   if (ExcludeDoubleUnderscore && hasDoubleUnderscore(D)) {
     return false;
@@ -780,6 +783,76 @@ static void emitBasicLocsRecord(llvm::BitstreamWriter &Out,
   DeclLocsList.emit(scratch, Writer.Buffer);
 }
 
+static void emitFileListRecord(llvm::BitstreamWriter &Out,
+                               ModuleOrSourceFile MSF, StringWriter &FWriter) {
+  assert(MSF);
+
+  struct SourceFileListWriter {
+    StringWriter &FWriter;
+
+    llvm::SmallString<0> Buffer;
+    llvm::StringSet<> seenFilenames;
+
+    void emitSourceFileInfo(const BasicSourceFileInfo &info) {
+      if (info.getFilePath().empty())
+        return;
+      // Make 'FilePath' absolute for serialization;
+      SmallString<128> absolutePath = info.getFilePath();
+      llvm::sys::fs::make_absolute(absolutePath);
+
+      // Don't emit duplicated files.
+      if (!seenFilenames.insert(absolutePath).second)
+        return;
+
+      auto fileID = FWriter.getTextOffset(absolutePath);
+
+      auto fingerprintStrIncludingTypeMembers =
+        info.getInterfaceHashIncludingTypeMembers().getRawValue();
+      auto fingerprintStrExcludingTypeMembers =
+        info.getInterfaceHashExcludingTypeMembers().getRawValue();
+
+      auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           info.getLastModified().time_since_epoch())
+                           .count();
+
+      llvm::raw_svector_ostream out(Buffer);
+      endian::Writer writer(out, little);
+      // FilePath.
+      writer.write<uint32_t>(fileID);
+
+      // InterfaceHashIncludingTypeMembers (fixed length string).
+      assert(fingerprintStrIncludingTypeMembers.size() == Fingerprint::DIGEST_LENGTH);
+      out << fingerprintStrIncludingTypeMembers;
+
+      // InterfaceHashExcludingTypeMembers (fixed length string).
+      assert(fingerprintStrExcludingTypeMembers.size() == Fingerprint::DIGEST_LENGTH);
+      out << fingerprintStrExcludingTypeMembers;
+
+      // LastModified (nanoseconds since epoch).
+      writer.write<uint64_t>(timestamp);
+      // FileSize (num of bytes).
+      writer.write<uint64_t>(info.getFileSize());
+    }
+
+    SourceFileListWriter(StringWriter &FWriter) : FWriter(FWriter) {
+      Buffer.reserve(1024);
+    }
+  } writer(FWriter);
+
+  if (SourceFile *SF = MSF.dyn_cast<SourceFile *>()) {
+    writer.emitSourceFileInfo(BasicSourceFileInfo(SF));
+  } else {
+    auto *M = MSF.get<ModuleDecl *>();
+    M->collectBasicSourceFileInfo([&](const BasicSourceFileInfo &info) {
+      writer.emitSourceFileInfo(info);
+    });
+  }
+
+  const decl_locs_block::SourceFileListLayout FileList(Out);
+  SmallVector<uint64_t, 8> scratch;
+  FileList.emit(scratch, writer.Buffer);
+}
+
 class SourceInfoSerializer : public SerializerBase {
 public:
   using SerializerBase::SerializerBase;
@@ -804,6 +877,7 @@ public:
     BLOCK_RECORD(control_block, TARGET);
 
     BLOCK(DECL_LOCS_BLOCK);
+    BLOCK_RECORD(decl_locs_block, SOURCE_FILE_LIST);
     BLOCK_RECORD(decl_locs_block, BASIC_DECL_LOCS);
     BLOCK_RECORD(decl_locs_block, DECL_USRS);
     BLOCK_RECORD(decl_locs_block, TEXT_DATA);
@@ -846,6 +920,7 @@ void serialization::writeSourceInfoToStream(raw_ostream &os,
       DeclUSRsTableWriter USRWriter;
       StringWriter FPWriter;
       DocRangeWriter DocWriter;
+      emitFileListRecord(S.Out, DC, FPWriter);
       emitBasicLocsRecord(S.Out, DC, USRWriter, FPWriter, DocWriter);
       // Emit USR table mapping from a USR to USR Id.
       // The basic locs record uses USR Id instead of actual USR, so that we

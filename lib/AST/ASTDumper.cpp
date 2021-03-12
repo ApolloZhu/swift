@@ -772,14 +772,14 @@ namespace {
       }
 
       auto VarD = dyn_cast<VarDecl>(VD);
-      if (VD->isFinal() && !(VarD && VarD->isLet()))
+      const auto &attrs = VD->getAttrs();
+      if (attrs.hasAttribute<FinalAttr>() && !(VarD && VarD->isLet()))
         OS << " final";
-      if (VD->getAttrs().hasAttribute<ObjCAttr>())
+      if (attrs.hasAttribute<ObjCAttr>())
         OS << " @objc";
-      if (VD->getAttrs().hasAttribute<DynamicAttr>())
+      if (attrs.hasAttribute<DynamicAttr>())
         OS << " dynamic";
-      if (auto *attr =
-              VD->getAttrs().getAttribute<DynamicReplacementAttr>()) {
+      if (auto *attr = attrs.getAttribute<DynamicReplacementAttr>()) {
         OS << " @_dynamicReplacement(for: \"";
         OS << attr->getReplacedFunctionName();
         OS << "\")";
@@ -1384,6 +1384,9 @@ void swift::printContext(raw_ostream &os, DeclContext *dc) {
       break;
     case InitializerKind::DefaultArgument:
       os << "default argument initializer";
+      break;
+    case InitializerKind::PropertyWrapper:
+      os << "property wrapper initializer";
       break;
     }
     break;
@@ -2267,11 +2270,6 @@ public:
     printRec(E->getResultExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
-  void visitUnresolvedTypeConversionExpr(UnresolvedTypeConversionExpr *E) {
-    printCommon(E, "unresolvedtype_conversion_expr") << '\n';
-    printRec(E->getSubExpr());
-    PrintWithColorRAII(OS, ParenthesisColor) << ')';
-  }
   void visitFunctionConversionExpr(FunctionConversionExpr *E) {
     printCommon(E, "function_conversion_expr") << '\n';
     printRec(E->getSubExpr());
@@ -2505,6 +2503,22 @@ public:
     printCommon(E, name);
     PrintWithColorRAII(OS, DiscriminatorColor)
       << " discriminator=" << E->getDiscriminator();
+
+    switch (auto isolation = E->getActorIsolation()) {
+    case ClosureActorIsolation::Independent:
+      break;
+
+    case ClosureActorIsolation::ActorInstance:
+      PrintWithColorRAII(OS, CapturesColor) << " actor-isolated="
+        << isolation.getActorInstance()->printRef();
+      break;
+
+    case ClosureActorIsolation::GlobalActor:
+      PrintWithColorRAII(OS, CapturesColor) << " global-actor-isolated="
+        << isolation.getGlobalActor().getString();
+      break;
+    }
+
     if (!E->getCaptureInfo().isTrivial()) {
       OS << " ";
       E->getCaptureInfo().print(PrintWithColorRAII(OS, CapturesColor).getOS());
@@ -2515,6 +2529,8 @@ public:
       if (auto fType = Ty->getAs<AnyFunctionType>()) {
         if (!fType->getExtInfo().isNoEscape())
           PrintWithColorRAII(OS, ClosureModifierColor) << " escaping";
+        if (fType->getExtInfo().isConcurrent())
+          PrintWithColorRAII(OS, ClosureModifierColor) << " concurrent";
       }
     }
 
@@ -2569,6 +2585,12 @@ public:
       OS << '\n';
       printRec(value);
     }
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
+  void visitAppliedPropertyWrapperExpr(AppliedPropertyWrapperExpr *E) {
+    printCommon(E, "applied_property_wrapper_expr");
+    printRec(E->getValue());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -3105,6 +3127,11 @@ public:
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
+  void visitPlaceholderTypeRepr(PlaceholderTypeRepr *T) {
+    printCommon("type_placeholder");
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
   void visitFixedTypeRepr(FixedTypeRepr *T) {
     printCommon("type_fixed");
     auto Ty = T->getType();
@@ -3512,8 +3539,8 @@ namespace {
 
     TRIVIAL_TYPE_PRINTER(Unresolved, unresolved)
 
-    void visitHoleType(HoleType *T, StringRef label) {
-      printCommon(label, "hole_type");
+    void visitPlaceholderType(PlaceholderType *T, StringRef label) {
+      printCommon(label, "placeholder_type");
       auto originator = T->getOriginator();
       if (auto *typeVar = originator.dyn_cast<TypeVariableType *>()) {
         printRec("type_variable", typeVar);
@@ -3521,9 +3548,10 @@ namespace {
         VD->dumpRef(PrintWithColorRAII(OS, DeclColor).getOS());
       } else if (auto *EE = originator.dyn_cast<ErrorExpr *>()) {
         printFlag("error_expr");
+      } else if (auto *DMT = originator.dyn_cast<DependentMemberType *>()) {
+        printRec("dependent_member_type", DMT);
       } else {
-        printRec("dependent_member_type",
-                 originator.get<DependentMemberType *>());
+        printFlag("placeholder_type_repr");
       }
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
@@ -3544,7 +3572,10 @@ namespace {
     }
 
     TRIVIAL_TYPE_PRINTER(BuiltinIntegerLiteral, builtin_integer_literal)
+    TRIVIAL_TYPE_PRINTER(BuiltinJob, builtin_job)
+    TRIVIAL_TYPE_PRINTER(BuiltinDefaultActorStorage, builtin_default_actor_storage)
     TRIVIAL_TYPE_PRINTER(BuiltinRawPointer, builtin_raw_pointer)
+    TRIVIAL_TYPE_PRINTER(BuiltinRawUnsafeContinuation, builtin_raw_unsafe_continuation)
     TRIVIAL_TYPE_PRINTER(BuiltinNativeObject, builtin_native_object)
     TRIVIAL_TYPE_PRINTER(BuiltinBridgeObject, builtin_bridge_object)
     TRIVIAL_TYPE_PRINTER(BuiltinUnsafeValueBuffer, builtin_unsafe_value_buffer)
@@ -3791,6 +3822,7 @@ namespace {
                    getSILFunctionTypeRepresentationString(representation));
 
       printFlag(!T->isNoEscape(), "escaping");
+      printFlag(T->isConcurrent(), "concurrent");
       printFlag(T->isAsync(), "async");
       printFlag(T->isThrowing(), "throws");
 

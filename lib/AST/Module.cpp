@@ -95,7 +95,7 @@ void BuiltinUnit::LookupCache::lookupValue(
        SmallVectorImpl<ValueDecl*> &Result) {
   // Only qualified lookup ever finds anything in the builtin module.
   if (LookupKind != NLKind::QualifiedLookup) return;
-  
+
   ValueDecl *&Entry = Cache[Name];
   ASTContext &Ctx = M.getParentModule()->getASTContext();
   if (!Entry) {
@@ -175,7 +175,7 @@ public:
 
   /// Throw away as much memory as possible.
   void invalidate();
-  
+
   void lookupValue(DeclName Name, NLKind LookupKind,
                    SmallVectorImpl<ValueDecl*> &Result);
 
@@ -203,13 +203,13 @@ public:
   void lookupVisibleDecls(ImportPath::Access AccessPath,
                           VisibleDeclConsumer &Consumer,
                           NLKind LookupKind);
-  
+
   void populateMemberCache(const SourceFile &SF);
   void populateMemberCache(const ModuleDecl &Mod);
 
   void lookupClassMembers(ImportPath::Access AccessPath,
                           VisibleDeclConsumer &consumer);
-                          
+
   void lookupClassMember(ImportPath::Access accessPath,
                          DeclName name,
                          SmallVectorImpl<ValueDecl*> &results);
@@ -331,7 +331,7 @@ void SourceLookupCache::lookupValue(DeclName Name, NLKind LookupKind,
                                     SmallVectorImpl<ValueDecl*> &Result) {
   auto I = TopLevelValues.find(Name);
   if (I == TopLevelValues.end()) return;
-  
+
   Result.reserve(I->second.size());
   for (ValueDecl *Elt : I->second)
     Result.push_back(Elt);
@@ -398,7 +398,7 @@ void SourceLookupCache::lookupVisibleDecls(ImportPath::Access AccessPath,
 void SourceLookupCache::lookupClassMembers(ImportPath::Access accessPath,
                                            VisibleDeclConsumer &consumer) {
   assert(accessPath.size() <= 1 && "can only refer to top-level decls");
-  
+
   if (!accessPath.empty()) {
     for (auto &member : ClassMembers) {
       // Non-simple names are also stored under their simple name, so make
@@ -432,11 +432,11 @@ void SourceLookupCache::lookupClassMember(ImportPath::Access accessPath,
                                           DeclName name,
                                           SmallVectorImpl<ValueDecl*> &results) {
   assert(accessPath.size() <= 1 && "can only refer to top-level decls");
-  
+
   auto iter = ClassMembers.find(name);
   if (iter == ClassMembers.end())
     return;
-  
+
   if (!accessPath.empty()) {
     for (ValueDecl *vd : iter->second) {
       auto *nominal = vd->getDeclContext()->getSelfNominalTypeDecl();
@@ -680,6 +680,15 @@ void ModuleDecl::lookupObjCMethods(
   FORWARD(lookupObjCMethods, (selector, results));
 }
 
+Optional<Fingerprint>
+ModuleDecl::loadFingerprint(const IterableDeclContext *IDC) const {
+  for (auto file : getFiles()) {
+    if (auto FP = file->loadFingerprint(IDC))
+      return FP;
+  }
+  return None;
+}
+
 void ModuleDecl::lookupImportedSPIGroups(
                         const ModuleDecl *importedModule,
                         llvm::SmallSetVector<Identifier, 4> &spiGroups) const {
@@ -783,6 +792,11 @@ void ModuleDecl::getTopLevelDecls(SmallVectorImpl<Decl*> &Results) const {
   FORWARD(getTopLevelDecls, (Results));
 }
 
+void ModuleDecl::getExportedPrespecializations(
+    SmallVectorImpl<Decl *> &Results) const {
+  FORWARD(getExportedPrespecializations, (Results));
+}
+
 void ModuleDecl::getTopLevelDeclsWhereAttributesMatch(
               SmallVectorImpl<Decl*> &Results,
               llvm::function_ref<bool(DeclAttributes)> matchAttributes) const {
@@ -864,7 +878,7 @@ SourceFile::getBasicLocsForDecl(const Decl *D) const {
   BasicDeclLocs Result;
   Result.SourceFilePath = SM.getDisplayNameForLoc(D->getLoc());
 
-  for (const auto &SRC : D->getRawComment().Comments) {
+  for (const auto &SRC : D->getRawComment(/*SerializedOK*/false).Comments) {
     Result.DocRanges.push_back(std::make_pair(
       LineColumn { SRC.StartLine, SRC.StartColumn },
       SRC.Range.getByteLength())
@@ -904,8 +918,8 @@ ModuleDecl::lookupExistentialConformance(Type type, ProtocolDecl *protocol) {
 
   // Due to an IRGen limitation, witness tables cannot be passed from an
   // existential to an archetype parameter, so for now we restrict this to
-  // @objc protocols.
-  if (!layout.isObjC()) {
+  // @objc protocols and marker protocols.
+  if (!layout.isObjC() && !protocol->isMarkerProtocol()) {
     // There's a specific exception for protocols with self-conforming
     // witness tables, but the existential has to be *exactly* that type.
     // TODO: synthesize witness tables on-demand for protocol compositions
@@ -953,10 +967,21 @@ ModuleDecl::lookupExistentialConformance(Type type, ProtocolDecl *protocol) {
 
 ProtocolConformanceRef ModuleDecl::lookupConformance(Type type,
                                                      ProtocolDecl *protocol) {
+  // If we are recursively checking for implicit conformance of a nominal
+  // type to ConcurrentValue, fail without evaluating this request. This
+  // squashes cycles.
+  LookupConformanceInModuleRequest request{{this, type, protocol}};
+  if (protocol->isSpecificProtocol(KnownProtocolKind::ConcurrentValue)) {
+    if (auto nominal = type->getAnyNominal()) {
+      GetImplicitConcurrentValueRequest icvRequest{nominal};
+      if (getASTContext().evaluator.hasActiveRequest(icvRequest) ||
+          getASTContext().evaluator.hasActiveRequest(request))
+        return ProtocolConformanceRef::forInvalid();
+    }
+  }
+
   return evaluateOrDefault(
-      getASTContext().evaluator,
-      LookupConformanceInModuleRequest{{this, type, protocol}},
-      ProtocolConformanceRef::forInvalid());
+      getASTContext().evaluator, request, ProtocolConformanceRef::forInvalid());
 }
 
 ProtocolConformanceRef
@@ -1009,8 +1034,8 @@ LookupConformanceInModuleRequest::evaluate(
 
   // UnresolvedType is a placeholder for an unknown type used when generating
   // diagnostics.  We consider it to conform to all protocols, since the
-  // intended type might have.
-  if (type->is<UnresolvedType>())
+  // intended type might have. Same goes for PlaceholderType.
+  if (type->is<UnresolvedType>() || type->is<PlaceholderType>())
     return ProtocolConformanceRef(protocol);
 
   auto nominal = type->getAnyNominal();
@@ -1021,8 +1046,20 @@ LookupConformanceInModuleRequest::evaluate(
 
   // Find the (unspecialized) conformance.
   SmallVector<ProtocolConformance *, 2> conformances;
-  if (!nominal->lookupConformance(mod, protocol, conformances))
-    return ProtocolConformanceRef::forInvalid();
+  if (!nominal->lookupConformance(mod, protocol, conformances)) {
+    if (!protocol->isSpecificProtocol(KnownProtocolKind::ConcurrentValue))
+      return ProtocolConformanceRef::forInvalid();
+
+    // Try to infer ConcurrentValue conformance.
+    GetImplicitConcurrentValueRequest cvRequest{nominal};
+    if (auto conformance = evaluateOrDefault(
+            ctx.evaluator, cvRequest, nullptr)) {
+      conformances.clear();
+      conformances.push_back(conformance);
+    } else {
+      return ProtocolConformanceRef::forInvalid();
+    }
+  }
 
   // FIXME: Ambiguity resolution.
   auto conformance = conformances.front();
@@ -1074,15 +1111,36 @@ LookupConformanceInModuleRequest::evaluate(
   return ProtocolConformanceRef(conformance);
 }
 
-void SourceFile::getInterfaceHash(llvm::SmallString<32> &str) const {
+Fingerprint SourceFile::getInterfaceHash() const {
   assert(hasInterfaceHash() && "Interface hash not enabled");
   auto &eval = getASTContext().evaluator;
   auto *mutableThis = const_cast<SourceFile *>(this);
-  auto md5 = *evaluateOrDefault(eval, ParseSourceFileRequest{mutableThis}, {})
-                  .InterfaceHash;
-  llvm::MD5::MD5Result result;
-  md5.final(result);
-  llvm::MD5::stringifyResult(result, str);
+  Optional<StableHasher> interfaceHasher =
+      evaluateOrDefault(eval, ParseSourceFileRequest{mutableThis}, {})
+              .InterfaceHasher;
+  return Fingerprint{StableHasher{interfaceHasher.getValue()}.finalize()};
+}
+
+Fingerprint SourceFile::getInterfaceHashIncludingTypeMembers() const {
+  /// FIXME: Gross. Hashing multiple "hash" values.
+  auto hash = StableHasher::defaultHasher();
+  hash.combine(getInterfaceHash());
+
+  std::function<void(IterableDeclContext *)> hashTypeBodyFingerprints =
+      [&](IterableDeclContext *IDC) {
+        if (auto fp = IDC->getBodyFingerprint())
+          hash.combine(*fp);
+        for (auto *member : IDC->getParsedMembers())
+          if (auto *childIDC = dyn_cast<IterableDeclContext>(member))
+            hashTypeBodyFingerprints(childIDC);
+      };
+
+  for (auto *D : getTopLevelDecls()) {
+    if (auto IDC = dyn_cast<IterableDeclContext>(D))
+      hashTypeBodyFingerprints(IDC);
+  }
+
+  return Fingerprint{std::move(hash)};
 }
 
 syntax::SourceFileSyntax SourceFile::getSyntaxRoot() const {
@@ -1095,7 +1153,7 @@ syntax::SourceFileSyntax SourceFile::getSyntaxRoot() const {
 
 void DirectOperatorLookupRequest::writeDependencySink(
     evaluator::DependencyCollector &reqTracker,
-    TinyPtrVector<OperatorDecl *> ops) const {
+    const TinyPtrVector<OperatorDecl *> &ops) const {
   auto &desc = std::get<0>(getStorage());
   reqTracker.addTopLevelName(desc.name);
 }
@@ -1130,7 +1188,7 @@ void SourceFile::lookupOperatorDirect(
 
 void DirectPrecedenceGroupLookupRequest::writeDependencySink(
     evaluator::DependencyCollector &reqTracker,
-    TinyPtrVector<PrecedenceGroupDecl *> groups) const {
+    const TinyPtrVector<PrecedenceGroupDecl *> &groups) const {
   auto &desc = std::get<0>(getStorage());
   reqTracker.addTopLevelName(desc.name);
 }
@@ -1163,13 +1221,6 @@ void SourceFile::lookupPrecedenceGroupDirect(
 
 void ModuleDecl::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
                                     ModuleDecl::ImportFilter filter) const {
-  assert(filter.containsAny(ImportFilter({
-      ModuleDecl::ImportFilterKind::Exported,
-      ModuleDecl::ImportFilterKind::Default,
-      ModuleDecl::ImportFilterKind::ImplementationOnly}))
-    && "filter should have at least one of Exported|Private|ImplementationOnly"
-  );
-
   FORWARD(getImportedModules, (modules, filter));
 }
 
@@ -1194,11 +1245,10 @@ SourceFile::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
       requiredFilter |= ModuleDecl::ImportFilterKind::Exported;
     else if (desc.options.contains(ImportFlags::ImplementationOnly))
       requiredFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
+    else if (desc.options.contains(ImportFlags::SPIAccessControl))
+      requiredFilter |= ModuleDecl::ImportFilterKind::SPIAccessControl;
     else
       requiredFilter |= ModuleDecl::ImportFilterKind::Default;
-
-    if (desc.options.contains(ImportFlags::SPIAccessControl))
-      requiredFilter |= ModuleDecl::ImportFilterKind::SPIAccessControl;
 
     if (!separatelyImportedOverlays.lookup(desc.module.importedModule).empty())
       requiredFilter |= ModuleDecl::ImportFilterKind::ShadowedByCrossImportOverlay;
@@ -1342,6 +1392,10 @@ bool ModuleDecl::isSwiftShimsModule() const {
 
 bool ModuleDecl::isOnoneSupportModule() const {
   return !getParent() && getName().str() == SWIFT_ONONE_SUPPORT;
+}
+
+bool ModuleDecl::isFoundationModule() const {
+  return !getParent() && getName() == getASTContext().Id_Foundation;
 }
 
 bool ModuleDecl::isBuiltinModule() const {
@@ -1502,6 +1556,38 @@ const clang::Module *ModuleDecl::findUnderlyingClangModule() const {
       return Mod;
   }
   return nullptr;
+}
+
+void ModuleDecl::collectBasicSourceFileInfo(
+    llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const {
+  for (const FileUnit *fileUnit : getFiles()) {
+    if (const auto *SF = dyn_cast<SourceFile>(fileUnit)) {
+      callback(BasicSourceFileInfo(SF));
+    } else if (auto *serialized = dyn_cast<LoadedFile>(fileUnit)) {
+      serialized->collectBasicSourceFileInfo(callback);
+    }
+  }
+}
+
+Fingerprint ModuleDecl::getFingerprint() const {
+  StableHasher hasher = StableHasher::defaultHasher();
+  SmallVector<Fingerprint, 16> FPs;
+  collectBasicSourceFileInfo([&](const BasicSourceFileInfo &bsfi) {
+    // For incremental imports, the hash must be insensitive to type-body
+    // changes, so use the one without type members.
+    FPs.emplace_back(bsfi.getInterfaceHashExcludingTypeMembers());
+  });
+  
+  // Sort the fingerprints lexicographically so we have a stable hash despite
+  // an unstable ordering of files across rebuilds.
+  // FIXME: If we used a commutative hash combine (say, if we could take an
+  // XOR here) we could avoid this sort.
+  std::sort(FPs.begin(), FPs.end(), std::less<Fingerprint>());
+  for (const auto &FP : FPs) {
+    hasher.combine(FP);
+  }
+
+  return Fingerprint{std::move(hasher)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -1987,6 +2073,8 @@ bool SourceFile::isImportedImplementationOnly(const ModuleDecl *module) const {
 }
 
 bool ModuleDecl::isImportedImplementationOnly(const ModuleDecl *module) const {
+  if (module == this) return false;
+
   auto &imports = getASTContext().getImportCache();
 
   // Look through non-implementation-only imports to see if module is imported
@@ -2005,6 +2093,30 @@ bool ModuleDecl::isImportedImplementationOnly(const ModuleDecl *module) const {
   }
 
   return true;
+}
+
+bool ModuleDecl::
+canBeUsedForCrossModuleOptimization(NominalTypeDecl *nominal) const {
+  ModuleDecl *moduleOfNominal = nominal->getParentModule();
+
+  // If the nominal is defined in the same module, it's fine.
+  if (moduleOfNominal == this)
+    return true;
+
+  // See if nominal is imported in a "regular" way, i.e. not with
+  // @_implementationOnly or @_spi.
+  ModuleDecl::ImportFilter filter = {
+    ModuleDecl::ImportFilterKind::Exported,
+    ModuleDecl::ImportFilterKind::Default};
+  SmallVector<ImportedModule, 4> results;
+  getImportedModules(results, filter);
+
+  auto &imports = getASTContext().getImportCache();
+  for (auto &desc : results) {
+    if (imports.isImportedBy(moduleOfNominal, desc.importedModule))
+      return true;
+  }
+  return false;
 }
 
 void SourceFile::lookupImportedSPIGroups(
@@ -2338,8 +2450,6 @@ bool SourceFile::hasDelayedBodyParsing() const {
   // Not supported right now.
   if (Kind == SourceFileKind::SIL)
     return false;
-  if (hasInterfaceHash())
-    return false;
   if (shouldCollectTokens())
     return false;
   if (shouldBuildSyntaxTree())
@@ -2374,7 +2484,7 @@ bool FileUnit::walk(ASTWalker &walker) {
 #ifndef NDEBUG
     PrettyStackTraceDecl debugStack("walking into decl", D);
 #endif
-    
+
     if (D->walk(walker))
       return true;
 
@@ -2513,7 +2623,7 @@ SourceFile::lookupOpaqueResultType(StringRef MangledName) {
   auto found = ValidatedOpaqueReturnTypes.find(MangledName);
   if (found != ValidatedOpaqueReturnTypes.end())
     return found->second;
-    
+
   // If there are unvalidated decls with opaque types, go through and validate
   // them now.
   (void) getOpaqueReturnTypeDecls();
@@ -2521,7 +2631,7 @@ SourceFile::lookupOpaqueResultType(StringRef MangledName) {
   found = ValidatedOpaqueReturnTypes.find(MangledName);
   if (found != ValidatedOpaqueReturnTypes.end())
     return found->second;
-  
+
   // Otherwise, we don't have a matching opaque decl.
   return nullptr;
 }

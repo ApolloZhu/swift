@@ -98,11 +98,8 @@ public:
   /// instruction. For alloc_box though it returns the project_box associated
   /// with the memory info.
   SingleValueInstruction *getUninitializedValue() const {
-    if (auto *mui = dyn_cast<MarkUninitializedInst>(MemoryInst)) {
-      if (auto *pbi = mui->getSingleUserOfType<ProjectBoxInst>()) {
-        return pbi;
-      }
-    }
+    if (auto *pbi = MemoryInst->getSingleUserOfType<ProjectBoxInst>())
+      return pbi;
     return MemoryInst;
   }
 
@@ -194,7 +191,7 @@ public:
 
   /// True if this is an initializer that initializes stored properties.
   bool isNonDelegatingInit() const {
-    switch (MemoryInst->getKind()) {
+    switch (MemoryInst->getMarkUninitializedKind()) {
     case MarkUninitializedInst::Var:
       return false;
     case MarkUninitializedInst::RootSelf:
@@ -210,7 +207,8 @@ public:
   }
 
   bool isRootSelf() const {
-    return MemoryInst->getKind() == MarkUninitializedInst::RootSelf;
+    return MemoryInst->getMarkUninitializedKind() ==
+           MarkUninitializedInst::RootSelf;
   }
 
   bool isDelegatingSelfAllocated() const {
@@ -281,6 +279,9 @@ enum DIUseKind {
   /// This instruction is a load that's only used to answer a `type(of: self)`
   /// question.
   LoadForTypeOfSelf,
+
+  /// This instruction is a value_metatype on the address of 'self'.
+  TypeOfSelf
 };
 
 /// This struct represents a single classified access to the memory object
@@ -294,12 +295,10 @@ struct DIMemoryUse {
 
   /// For memory objects of (potentially recursive) tuple type, this keeps
   /// track of which tuple elements are affected.
-  unsigned short FirstElement, NumElements;
+  unsigned FirstElement, NumElements;
 
   DIMemoryUse(SILInstruction *Inst, DIUseKind Kind, unsigned FE, unsigned NE)
       : Inst(Inst), Kind(Kind), FirstElement(FE), NumElements(NE) {
-    assert(FE == FirstElement && NumElements == NE &&
-           "more than 64K elements not supported yet");
   }
 
   DIMemoryUse() : Inst(nullptr) {}

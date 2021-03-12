@@ -15,41 +15,31 @@ import Swift
 
 /// Common protocol to which all actor classes conform.
 ///
-/// The \c Actor protocol provides the core functionality of an actor class,
-/// which involves enqueuing new partial tasks to be executed at some
-/// point. Actor classes implicitly conform to this protocol as part of their
-/// primary class definition.
-public protocol Actor: AnyObject {
-  /// Enqueue a new partial task that will be executed in the actor's context.
-  func enqueue(partialTask: PartialAsyncTask)
+/// The \c Actor protocol generalizes over all actor types. Actor types
+/// implicitly conform to this protocol.
+public protocol Actor: AnyObject, ConcurrentValue {
 }
 
-/// A native actor queue, which schedules partial tasks onto a serial queue.
-public struct _NativeActorQueue {
-  // TODO: This is just a stub for now
-}
+/// Called to initialize the default actor instance in an actor.
+/// The implementation will call this within the actor's initializer.
+@_silgen_name("swift_defaultActor_initialize")
+public func _defaultActorInitialize(_ actor: AnyObject)
 
-/// The default type to be used for an actor's queue when an actor does not
-/// provide its own implementation of `enqueue(partialTask:)`.
-public typealias _DefaultActorQueue = _NativeActorQueue
+/// Called to destroy the default actor instance in an actor.
+/// The implementation will call this within the actor's deinit.
+@_silgen_name("swift_defaultActor_destroy")
+public func _defaultActorDestroy(_ actor: AnyObject)
 
-/// Called to create a new default actor queue instance for a class of the given
-/// type.  The implementation will call this within the actor's initializer to
-/// initialize the actor queue.
-public func _defaultActorQueueCreate(
-  _ actorClass: AnyObject.Type
-) -> _DefaultActorQueue {
-  _DefaultActorQueue()
-}
+/// FIXME: only exists for the quick-and-dirty MainActor implementation.
+@_silgen_name("swift_MainActor_register")
+fileprivate func _registerMainActor(actor: AnyObject)
 
-/// Called by the synthesized implementation of enqueue(partialTask:).
-///
-/// The implementation is provided with the address of the synthesized instance
-/// property for the actor queue, so that it need not be at a fixed offset.
-public func _defaultActorQueueEnqueuePartialTask(
-  actor: AnyObject,
-  queue: inout _DefaultActorQueue,
-  partialTask: PartialAsyncTask
-) {
-  // TODO: Implement queueing.
+/// A singleton actor whose executor is equivalent to 
+/// \c DispatchQueue.main, which is the main dispatch queue.
+@globalActor public actor MainActor {
+  public static let shared = MainActor()
+  
+  init() {
+    _registerMainActor(actor: self)
+  }
 }

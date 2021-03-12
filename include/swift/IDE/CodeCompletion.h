@@ -17,6 +17,7 @@
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/TrailingObjects.h"
@@ -29,6 +30,7 @@ namespace swift {
 class CodeCompletionCallbacksFactory;
 class Decl;
 class DeclContext;
+class FrontendOptions;
 class ModuleDecl;
 
 namespace ide {
@@ -89,11 +91,8 @@ public:
     /// The "override" keyword.
     OverrideKeyword,
 
-    /// The "throws" keyword.
-    ThrowsKeyword,
-
-    /// The "rethrows" keyword.
-    RethrowsKeyword,
+    /// The "throws", "rethrows" and "async" keyword.
+    EffectsSpecifierKeyword,
 
     /// The keyword part of a declaration before the name, like "func".
     DeclIntroducer,
@@ -220,8 +219,7 @@ public:
   static bool chunkHasText(ChunkKind Kind) {
     return Kind == ChunkKind::AccessControlKeyword ||
            Kind == ChunkKind::OverrideKeyword ||
-           Kind == ChunkKind::ThrowsKeyword ||
-           Kind == ChunkKind::RethrowsKeyword ||
+           Kind == ChunkKind::EffectsSpecifierKeyword ||
            Kind == ChunkKind::DeclAttrKeyword ||
            Kind == ChunkKind::DeclIntroducer ||
            Kind == ChunkKind::Keyword ||
@@ -549,6 +547,7 @@ enum class CompletionKind {
   AccessorBeginning,
   AttributeBegin,
   AttributeDeclParen,
+  EffectsSpecifier,
   PoundAvailablePlatform,
   CallArg,
   LabeledTrailingClosure,
@@ -603,6 +602,7 @@ public:
   enum NotRecommendedReason {
     Redundant,
     Deprecated,
+    InvalidContext,
     NoReason,
   };
 
@@ -865,6 +865,26 @@ struct CodeCompletionResultSink {
 
   CodeCompletionResultSink()
       : Allocator(std::make_shared<llvm::BumpPtrAllocator>()) {}
+};
+
+/// A utility for calculating the import depth of a given module. Direct imports
+/// have depth 1, imports of those modules have depth 2, etc.
+///
+/// Special modules such as Playground auxiliary sources are considered depth
+/// 0.
+class ImportDepth {
+  llvm::StringMap<uint8_t> depths;
+
+public:
+  ImportDepth() = default;
+  ImportDepth(ASTContext &context, const FrontendOptions &frontendOptions);
+
+  Optional<uint8_t> lookup(StringRef module) {
+    auto I = depths.find(module);
+    if (I == depths.end())
+      return None;
+    return I->getValue();
+  }
 };
 
 class CodeCompletionContext {

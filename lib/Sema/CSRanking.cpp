@@ -32,74 +32,92 @@ using namespace constraints;
 #define DEBUG_TYPE "Constraint solver overall"
 STATISTIC(NumDiscardedSolutions, "Number of solutions discarded");
 
+static StringRef getScoreKindName(ScoreKind kind) {
+  switch (kind) {
+  case SK_Hole:
+    return "hole in the constraint system";
+
+  case SK_Unavailable:
+    return "use of an unavailable declaration";
+
+  case SK_AsyncInSyncMismatch:
+    return "async-in-synchronous mismatch";
+
+  case SK_SyncInAsync:
+    return "sync-in-asynchronous";
+
+  case SK_ForwardTrailingClosure:
+    return "forward scan when matching a trailing closure";
+
+  case SK_Fix:
+    return "attempting to fix the source";
+
+  case SK_DisfavoredOverload:
+    return "disfavored overload";
+
+  case SK_UnresolvedMemberViaOptional:
+    return "unwrapping optional at unresolved member base";
+
+  case SK_ForceUnchecked:
+    return "force of an implicitly unwrapped optional";
+
+  case SK_UserConversion:
+    return "user conversion";
+
+  case SK_FunctionConversion:
+    return "function conversion";
+
+  case SK_NonDefaultLiteral:
+    return "non-default literal";
+
+  case SK_CollectionUpcastConversion:
+    return "collection upcast conversion";
+
+  case SK_ValueToOptional:
+    return "value to optional";
+
+  case SK_EmptyExistentialConversion:
+    return "empty-existential conversion";
+
+  case SK_KeyPathSubscript:
+    return "key path subscript";
+
+  case SK_ValueToPointerConversion:
+    return "value-to-pointer conversion";
+
+  case SK_FunctionToAutoClosureConversion:
+    return "function to autoclosure parameter";
+  }
+}
+
 void ConstraintSystem::increaseScore(ScoreKind kind, unsigned value) {
-  unsigned index = static_cast<unsigned>(kind);
-  CurrentScore.Data[index] += value;
+  if (isForCodeCompletion()) {
+    switch (kind) {
+    case SK_NonDefaultLiteral:
+      // Don't increase score for non-default literals in expressions involving
+      // a code completion. In the below example, members of EnumA and EnumB
+      // should be ranked equally:
+      //   func overloaded(_ x: Float, _ y: EnumA) {}
+      //   func overloaded(_ x: Int, _ y: EnumB) {}
+      //   func overloaded(_ x: Float) -> EnumA {}
+      //   func overloaded(_ x: Int) -> EnumB {}
+      //
+      //   overloaded(1, .<complete>) {}
+      //   overloaded(1).<complete>
+      return;
+    default:
+      break;
+    }
+  }
 
   if (isDebugMode() && value > 0) {
     if (solverState)
       llvm::errs().indent(solverState->depth * 2);
-    llvm::errs() << "(increasing score due to ";
-    switch (kind) {
-    case SK_Hole:
-      llvm::errs() << "hole in the constraint system";
-      break;
-
-    case SK_Unavailable:
-      llvm::errs() << "use of an unavailable declaration";
-      break;
-
-    case SK_AsyncSyncMismatch:
-      llvm::errs() << "async/synchronous mismatch";
-      break;
-
-    case SK_ForwardTrailingClosure:
-      llvm::errs() << "forward scan when matching a trailing closure";
-      break;
-
-    case SK_Fix:
-      llvm::errs() << "attempting to fix the source";
-      break;
-
-    case SK_DisfavoredOverload:
-      llvm::errs() << "disfavored overload";
-      break;
-
-    case SK_ForceUnchecked:
-      llvm::errs() << "force of an implicitly unwrapped optional";
-      break;
-
-    case SK_UserConversion:
-      llvm::errs() << "user conversion";
-      break;
-
-    case SK_FunctionConversion:
-      llvm::errs() << "function conversion";
-      break;
-
-    case SK_NonDefaultLiteral:
-      llvm::errs() << "non-default literal";
-      break;
-        
-    case SK_CollectionUpcastConversion:
-      llvm::errs() << "collection upcast conversion";
-      break;
-        
-    case SK_ValueToOptional:
-      llvm::errs() << "value to optional";
-      break;
-    case SK_EmptyExistentialConversion:
-      llvm::errs() << "empty-existential conversion";
-      break;
-    case SK_KeyPathSubscript:
-      llvm::errs() << "key path subscript";
-      break;
-    case SK_ValueToPointerConversion:
-      llvm::errs() << "value-to-pointer conversion";
-      break;
-    }
-    llvm::errs() << ")\n";
+    llvm::errs() << "(increasing score due to " << getScoreKindName(kind) << ")\n";
   }
+
+  unsigned index = static_cast<unsigned>(kind);
+  CurrentScore.Data[index] += value;
 }
 
 bool ConstraintSystem::worseThanBestSolution() const {
@@ -742,13 +760,47 @@ static void addKeyPathDynamicMemberOverloads(
   }
 }
 
+SolutionCompareResult compareSolutionsForCodeCompletion(
+    ConstraintSystem &cs, ArrayRef<Solution> solutions, unsigned idx1,
+    unsigned idx2) {
+
+  // When solving for code completion we can't consider one solution worse than
+  // another according to the same rules as regular compilation. For example,
+  // with the code below:
+  //
+  //  func foo(_ x: Int) -> Int {}
+  //  func foo<T>(_ x: T) -> String {}
+  //  foo(3).<complete here> // Still want solutions with for both foo
+  //                         // overloads - String and Int members are both
+  //                         // valid here.
+  //
+  // the comparison for regular compilation considers the solution with the more
+  // specialized `foo` overload `foo(_: Int)` to be better than the solution
+  // with the generic overload `foo(_: T)` even though both are otherwise
+  // viable. For code completion purposes offering members of 'String' based
+  // on the solution with the generic overload is equally as import as offering
+  // members of 'Int' as choosing one of those completions will then result in
+  // regular compilation resolving the call to the generic overload instead.
+
+  if (solutions[idx1].getFixedScore() == solutions[idx2].getFixedScore())
+    return SolutionCompareResult::Incomparable;
+  return solutions[idx1].getFixedScore() < solutions[idx2].getFixedScore()
+             ? SolutionCompareResult::Better
+             : SolutionCompareResult::Worse;
+}
+
+
 SolutionCompareResult ConstraintSystem::compareSolutions(
     ConstraintSystem &cs, ArrayRef<Solution> solutions,
-    const SolutionDiff &diff, unsigned idx1, unsigned idx2) {
+    const SolutionDiff &diff, unsigned idx1, unsigned idx2,
+    bool isForCodeCompletion) {
   if (cs.isDebugMode()) {
     llvm::errs().indent(cs.solverState->depth * 2)
       << "comparing solutions " << idx1 << " and " << idx2 <<"\n";
   }
+
+  if (isForCodeCompletion)
+    return compareSolutionsForCodeCompletion(cs, solutions, idx1, idx2);
 
   // Whether the solutions are identical.
   bool identical = true;
@@ -785,7 +837,7 @@ SolutionCompareResult ConstraintSystem::compareSolutions(
 
   SmallVector<SolutionDiff::OverloadDiff, 4> overloadDiff(diff.overloads);
   // Single type of keypath dynamic member lookup could refer to different
-  // member overlaods, we have to do a pair-wise comparison in such cases
+  // member overloads, we have to do a pair-wise comparison in such cases
   // otherwise ranking would miss some viable information e.g.
   // `_ = arr[0..<3]` could refer to subscript through writable or read-only
   // key path and each of them could also pick overload which returns `Slice<T>`
@@ -1285,7 +1337,8 @@ ConstraintSystem::findBestSolution(SmallVectorImpl<Solution> &viable,
   SmallVector<bool, 16> losers(viable.size(), false);
   unsigned bestIdx = 0;
   for (unsigned i = 1, n = viable.size(); i != n; ++i) {
-    switch (compareSolutions(*this, viable, diff, i, bestIdx)) {
+    switch (compareSolutions(*this, viable, diff, i, bestIdx,
+                             isForCodeCompletion())) {
     case SolutionCompareResult::Identical:
       // FIXME: Might want to warn about this in debug builds, so we can
       // find a way to eliminate the redundancy in the search space.
@@ -1309,7 +1362,8 @@ ConstraintSystem::findBestSolution(SmallVectorImpl<Solution> &viable,
     if (i == bestIdx)
       continue;
 
-    switch (compareSolutions(*this, viable, diff, bestIdx, i)) {
+    switch (compareSolutions(*this, viable, diff, bestIdx, i,
+                             isForCodeCompletion())) {
     case SolutionCompareResult::Identical:
       // FIXME: Might want to warn about this in debug builds, so we can
       // find a way to eliminate the redundancy in the search space.
@@ -1361,7 +1415,8 @@ ConstraintSystem::findBestSolution(SmallVectorImpl<Solution> &viable,
       if (losers[j])
         continue;
 
-      switch (compareSolutions(*this, viable, diff, i, j)) {
+      switch (compareSolutions(*this, viable, diff, i, j,
+                               isForCodeCompletion())) {
       case SolutionCompareResult::Identical:
         // FIXME: Dub one of these the loser arbitrarily?
         break;

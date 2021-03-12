@@ -21,6 +21,7 @@
 #include "swift/SIL/SILLinkage.h"
 #include "swift/SIL/SILLocation.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -247,8 +248,15 @@ SILLinkage SILDeclRef::getLinkage(ForDefinition_t forDefinition) const {
     return forDefinition ? linkage : addExternalToLinkage(linkage);
   };
 
-  // Function-local declarations have private linkage, unless serialized.
   ValueDecl *d = getDecl();
+
+  // Property wrapper generators of public functions have PublicNonABI linkage
+  if (isPropertyWrapperBackingInitializer() && isa<ParamDecl>(d)) {
+    if (isSerialized())
+      return maybeAddExternal(SILLinkage::PublicNonABI);
+  }
+
+  // Function-local declarations have private linkage, unless serialized.
   DeclContext *moduleContext = d->getDeclContext();
   while (!moduleContext->isModuleScopeContext()) {
     if (moduleContext->isLocalContext()) {
@@ -446,8 +454,15 @@ bool SILDeclRef::isTransparent() const {
 
   if (hasAutoClosureExpr()) {
     auto *ace = getAutoClosureExpr();
-    if (ace->getThunkKind() == AutoClosureExpr::Kind::None)
+    switch (ace->getThunkKind()) {
+    case AutoClosureExpr::Kind::None:
       return true;
+
+    case AutoClosureExpr::Kind::AsyncLet:
+    case AutoClosureExpr::Kind::DoubleCurryThunk:
+    case AutoClosureExpr::Kind::SingleCurryThunk:
+      break;
+    }
   }
 
   if (hasDecl()) {
@@ -480,9 +495,16 @@ IsSerialized_t SILDeclRef::isSerialized() const {
 
   auto *d = getDecl();
 
-  // Default argument generators are serialized if the containing
-  // declaration is public.
-  if (isDefaultArgGenerator()) {
+  // Default and property wrapper argument generators are serialized if the
+  // containing declaration is public.
+  if (isDefaultArgGenerator() || (isPropertyWrapperBackingInitializer() &&
+                                  isa<ParamDecl>(d))) {
+    if (isPropertyWrapperBackingInitializer()) {
+      if (auto *func = dyn_cast_or_null<ValueDecl>(d->getDeclContext()->getAsDecl())) {
+        d = func;
+      }
+    }
+
     // Ask the AST if we're inside an @inlinable context.
     if (d->getDeclContext()->getResilienceExpansion()
           == ResilienceExpansion::Minimal) {
@@ -530,6 +552,11 @@ IsSerialized_t SILDeclRef::isSerialized() const {
   // Anything else that is not public is not serializable.
   if (d->getEffectiveAccess() < AccessLevel::Public)
     return IsNotSerialized;
+
+  // Enum element constructors are serializable if the enum is
+  // @usableFromInline or public.
+  if (isEnumElement())
+    return IsSerializable;
 
   // 'read' and 'modify' accessors synthesized on-demand are serialized if
   // visible outside the module.
@@ -679,20 +706,19 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
   using namespace Mangle;
   ASTMangler mangler;
 
-  auto *derivativeFunctionIdentifier = getDerivativeFunctionIdentifier();
-  if (derivativeFunctionIdentifier) {
+  if (auto *derivativeFunctionIdentifier = getDerivativeFunctionIdentifier()) {
     std::string originalMangled = asAutoDiffOriginalFunction().mangle(MKind);
     auto *silParameterIndices = autodiff::getLoweredParameterIndices(
         derivativeFunctionIdentifier->getParameterIndices(),
         getDecl()->getInterfaceType()->castTo<AnyFunctionType>());
-    auto &ctx = getDecl()->getASTContext();
-    auto *resultIndices = IndexSubset::get(ctx, 1, {0});
+    auto *resultIndices = IndexSubset::get(getDecl()->getASTContext(), 1, {0});
     AutoDiffConfig silConfig(
         silParameterIndices, resultIndices,
         derivativeFunctionIdentifier->getDerivativeGenericSignature());
-    auto derivativeFnKind = derivativeFunctionIdentifier->getKind();
-    return mangler.mangleAutoDiffDerivativeFunctionHelper(
-        originalMangled, derivativeFnKind, silConfig);
+    return mangler.mangleAutoDiffDerivativeFunction(
+        asAutoDiffOriginalFunction().getAbstractFunctionDecl(),
+        derivativeFunctionIdentifier->getKind(),
+        silConfig);
   }
 
   // As a special case, Clang functions and globals don't get mangled at all.
@@ -712,6 +738,16 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
             return SS.str();
           }
           return namedClangDecl->getName().str();
+        } else if (auto objcDecl = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
+          if (objcDecl->isDirectMethod()) {
+            std::string storage;
+            llvm::raw_string_ostream SS(storage);
+            clang::ASTContext &ctx = clangDecl->getASTContext();
+            std::unique_ptr<clang::MangleContext> mangler(ctx.createMangleContext());
+            mangler->mangleObjCMethodName(objcDecl, SS, /*includePrefixByte=*/true,
+                                          /*includeCategoryNamespace=*/false);
+            return SS.str();
+          }
         }
       }
     }
@@ -740,6 +776,9 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
       break;
     case SILDeclRef::ManglingKind::DynamicThunk:
       SKind = ASTMangler::SymbolKind::DynamicThunk;
+      break;
+    case SILDeclRef::ManglingKind::AsyncHandlerBody:
+      SKind = ASTMangler::SymbolKind::AsyncHandlerBody;
       break;
   }
 
@@ -813,13 +852,17 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
   case SILDeclRef::Kind::PropertyWrapperBackingInitializer:
     return mangler.mangleBackingInitializerEntity(cast<VarDecl>(getDecl()),
                                                   SKind);
+
+  case SILDeclRef::Kind::PropertyWrapperInitFromProjectedValue:
+    return mangler.mangleInitFromProjectedValueEntity(cast<VarDecl>(getDecl()),
+                                                      SKind);
   }
 
   llvm_unreachable("bad entity kind!");
 }
 
 // Returns true if the given JVP/VJP SILDeclRef requires a new vtable entry.
-// FIXME(TF-1213): Also consider derived declaration `@derivative` attributes.
+// FIXME(SR-14131): Also consider derived declaration `@derivative` attributes.
 static bool derivativeFunctionRequiresNewVTableEntry(SILDeclRef declRef) {
   assert(declRef.getDerivativeFunctionIdentifier() &&
          "Expected a derivative function SILDeclRef");
@@ -1203,4 +1246,14 @@ bool SILDeclRef::isDynamicallyReplaceable() const {
   // For now, we only support this behavior if -enable-implicit-dynamic is
   // enabled.
   return decl->shouldUseNativeMethodReplacement();
+}
+
+bool SILDeclRef::hasAsync() const {
+  if (hasDecl()) {
+    if (auto afd = dyn_cast<AbstractFunctionDecl>(getDecl())) {
+      return afd->hasAsync();
+    }
+    return false;
+  }
+  return getAbstractClosureExpr()->isBodyAsync();
 }

@@ -30,9 +30,11 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/Basic/Debug.h"
+#include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
-#include "swift/Basic/STLExtras.h"
+#include "swift/Parse/Lexer.h"
+#include "clang/AST/DeclObjC.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Debug.h"
@@ -137,10 +139,47 @@ void DebuggerClient::anchor() {}
 void AccessFilteringDeclConsumer::foundDecl(
     ValueDecl *D, DeclVisibilityKind reason,
     DynamicLookupInfo dynamicLookupInfo) {
-  if (D->hasInterfaceType() && D->isInvalid())
-    return;
   if (!D->isAccessibleFrom(DC))
     return;
+
+  ChainedConsumer.foundDecl(D, reason, dynamicLookupInfo);
+}
+
+void UsableFilteringDeclConsumer::foundDecl(ValueDecl *D,
+    DeclVisibilityKind reason, DynamicLookupInfo dynamicLookupInfo) {
+  // Skip when Loc is within the decl's own initializer
+  if (auto *VD = dyn_cast<VarDecl>(D)) {
+    Expr *init = VD->getParentInitializer();
+    if (auto *PD = dyn_cast<ParamDecl>(D)) {
+      init = PD->getStructuralDefaultExpr();
+    }
+
+    // Only check if the VarDecl has the same (or parent) context to avoid
+    // grabbing the end location for every decl with an initializer
+    if (init != nullptr) {
+      auto *varContext = VD->getDeclContext();
+      if (DC == varContext || DC->isChildContextOf(varContext)) {
+        auto initRange = Lexer::getCharSourceRangeFromSourceRange(
+            SM, init->getSourceRange());
+        if (initRange.isValid() && initRange.contains(Loc))
+          return;
+      }
+    }
+  }
+
+  switch (reason) {
+  case DeclVisibilityKind::LocalVariable:
+    // Skip if Loc is before the found decl, unless its a TypeDecl (whose use
+    // before its declaration is still allowed)
+    if (!isa<TypeDecl>(D) && !SM.isBeforeInBuffer(D->getLoc(), Loc))
+      return;
+    break;
+  default:
+    // The rest of the file is currently skipped, so no need to check
+    // decl location for VisibleAtTopLevel. Other visibility kinds are always
+    // usable
+    break;
+  }
 
   ChainedConsumer.foundDecl(D, reason, dynamicLookupInfo);
 }
@@ -466,6 +505,21 @@ static void recordShadowedDeclsAfterTypeMatch(
 
           // Otherwise, the first declaration is shadowed by the second. There is
           // no point in continuing to compare the first declaration to others.
+          shadowed.insert(firstDecl);
+          break;
+        }
+      }
+
+      // Next, prefer any other module over the _Concurrency module.
+      if (auto concurModule = ctx.getLoadedModule(ctx.Id_Concurrency)) {
+        if ((firstModule == concurModule) != (secondModule == concurModule)) {
+          // If second module is _Concurrency, then it is shadowed by first.
+          if (secondModule == concurModule) {
+            shadowed.insert(secondDecl);
+            continue;
+          }
+
+          // Otherwise, the first declaration is shadowed by the second.
           shadowed.insert(firstDecl);
           break;
         }
@@ -1005,7 +1059,7 @@ public:
   /// Returns \c true if the lookup table has a complete accounting of the
   /// given name.
   bool isLazilyComplete(DeclBaseName name) const {
-    return LazilyCompleteNames.find(name) != LazilyCompleteNames.end();
+    return LazilyCompleteNames.contains(name);
   }
 
   /// Mark a given lazily-loaded name as being complete.
@@ -1502,8 +1556,9 @@ static bool isAcceptableLookupResult(const DeclContext *dc,
   // Check access.
   if (!(options & NL_IgnoreAccessControl) &&
       !dc->getASTContext().isAccessControlDisabled()) {
-    bool allowInlinable = options & NL_IncludeUsableFromInlineAndInlineable;
-    return decl->isAccessibleFrom(dc, /*forConformance*/ false, allowInlinable);
+    bool allowUsableFromInline = options & NL_IncludeUsableFromInline;
+    return decl->isAccessibleFrom(dc, /*forConformance*/ false,
+                                  allowUsableFromInline);
   }
 
   return true;
@@ -1817,6 +1872,11 @@ AnyObjectLookupRequest::evaluate(Evaluator &evaluator, const DeclContext *dc,
   using namespace namelookup;
   QualifiedLookupResult decls;
 
+#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
+  // Avoid calling `clang::ObjCMethodDecl::isDirectMethod()`.
+  return decls;
+#endif
+
   // Type-only lookup won't find anything on AnyObject.
   if (options & NL_OnlyTypes)
     return decls;
@@ -1836,6 +1896,17 @@ AnyObjectLookupRequest::evaluate(Evaluator &evaluator, const DeclContext *dc,
     if (!decl->isObjC())
       continue;
 
+    // If the declaration is objc_direct, it cannot be called dynamically.
+    if (auto clangDecl = decl->getClangDecl()) {
+      if (auto objCMethod = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
+        if (objCMethod->isDirectMethod())
+          continue;
+      } else if (auto objCProperty = dyn_cast<clang::ObjCPropertyDecl>(clangDecl)) {
+        if (objCProperty->isDirectProperty())
+          continue;
+      }
+    }
+
     // If the declaration has an override, name lookup will also have
     // found the overridden method. Skip this declaration, because we
     // prefer the overridden method.
@@ -1847,7 +1918,6 @@ AnyObjectLookupRequest::evaluate(Evaluator &evaluator, const DeclContext *dc,
 
     // If we didn't see this declaration before, and it's an acceptable
     // result, add it to the list.
-    // declaration to the list.
     if (knownDecls.insert(decl).second &&
         isAcceptableLookupResult(dc, options, decl,
                                  /*onlyCompleteObjectInits=*/false))
@@ -2161,6 +2231,7 @@ directReferencesForTypeRepr(Evaluator &evaluator,
   case TypeReprKind::Protocol:
   case TypeReprKind::Shared:
   case TypeReprKind::SILBox:
+  case TypeReprKind::Placeholder:
     return { };
       
   case TypeReprKind::OpaqueReturn:
@@ -2629,8 +2700,7 @@ swift::getDirectlyInheritedNominalTypeDecls(
       if (!req.getFirstType()->isEqual(protoSelfTy))
         continue;
 
-      result.emplace_back(req.getSecondType()->castTo<ProtocolType>()->getDecl(),
-                          loc);
+      result.emplace_back(req.getProtocolDecl(), loc);
     }
     return result;
   }

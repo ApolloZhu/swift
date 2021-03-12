@@ -96,8 +96,7 @@ void MapOpaqueArchetypes::replace() {
   cloneFunctionBody(&fn, clonedEntryBlock, entryArgs,
                     true /*replaceOriginalFunctionInPlace*/);
   // Insert the new entry block at the beginning.
-  fn.getBlocks().splice(fn.getBlocks().begin(), fn.getBlocks(),
-                        clonedEntryBlock);
+  fn.moveBlockBefore(clonedEntryBlock, fn.begin());
   removeUnreachableBlocks(fn);
 }
 
@@ -339,6 +338,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::GetAsyncContinuationInst:
   case SILInstructionKind::GetAsyncContinuationAddrInst:
   case SILInstructionKind::AwaitAsyncContinuationInst:
+  case SILInstructionKind::HopToExecutorInst:
     // Handle by operand and result check.
     break;
 

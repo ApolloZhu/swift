@@ -222,7 +222,7 @@ void ParentConditionalConformance::diagnoseConformanceStack(
 
 namespace {
 /// Produce any additional syntactic diagnostics for the body of a function
-/// that had a function builder applied.
+/// that had a result builder applied.
 class FunctionSyntacticDiagnosticWalker : public ASTWalker {
   SmallVector<DeclContext *, 4> dcStack;
 
@@ -254,7 +254,7 @@ public:
   }
 
   std::pair<bool, Stmt *> walkToStmtPre(Stmt *stmt) override {
-    performStmtDiagnostics(dcStack.back()->getASTContext(), stmt);
+    performStmtDiagnostics(stmt, dcStack.back());
     return {true, stmt};
   }
 
@@ -326,14 +326,6 @@ TypeChecker::typeCheckExpression(
                                   "typecheck-expr", expr);
   PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
 
-  // First let's check whether given expression has a code completion
-  // token which requires special handling.
-  if (Context.CompletionCallback &&
-      typeCheckForCodeCompletion(target, [&](const constraints::Solution &S) {
-        Context.CompletionCallback->sawSolution(S);
-      }))
-    return None;
-
   // First, pre-check the expression, validating any types that occur in the
   // expression and folding sequence expressions.
   if (ConstraintSystem::preCheckExpression(
@@ -342,6 +334,15 @@ TypeChecker::typeCheckExpression(
     return None;
   }
   target.setExpr(expr);
+
+  // Check whether given expression has a code completion token which requires
+  // special handling.
+  if (Context.CompletionCallback &&
+      typeCheckForCodeCompletion(target, /*needsPrecheck*/false,
+                                 [&](const constraints::Solution &S) {
+        Context.CompletionCallback->sawSolution(S);
+      }))
+    return None;
 
   // Construct a constraint system from this expression.
   ConstraintSystemOptions csOptions = ConstraintSystemFlags::AllowFixes;
@@ -561,7 +562,9 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
   };
 
   auto sequenceProto = TypeChecker::getProtocol(
-      dc->getASTContext(), stmt->getForLoc(), KnownProtocolKind::Sequence);
+      dc->getASTContext(), stmt->getForLoc(), 
+      stmt->getAwaitLoc().isValid() ? 
+        KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
   if (!sequenceProto)
     return failed();
 
@@ -585,6 +588,25 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
       stmt, sequenceProto, dc, /*bindPatternVarsOneWay=*/false);
   if (!typeCheckExpression(target))
     return failed();
+
+  // check to see if the sequence expr is throwing (and async), if so require 
+  // the stmt to have a try loc
+  if (stmt->getAwaitLoc().isValid()) {
+    // fetch the sequence out of the statement
+    // else wise the value is potentially unresolved
+    auto Ty = stmt->getSequence()->getType();
+    auto module = dc->getParentModule();
+    auto conformanceRef = module->lookupConformance(Ty, sequenceProto);
+    
+    if (conformanceRef.hasEffect(EffectKind::Throws) &&
+        stmt->getTryLoc().isInvalid()) {
+      auto &diags = dc->getASTContext().Diags;
+      diags.diagnose(stmt->getAwaitLoc(), diag::throwing_call_unhandled)
+        .fixItInsert(stmt->getAwaitLoc(), "try");
+
+      return failed();
+    }
+  }
 
   return false;
 }
@@ -1135,7 +1157,7 @@ void ConstraintSystem::print(raw_ostream &out) const {
         out << " as ";
         Type(fixed).print(out, PO);
       } else {
-        const_cast<ConstraintSystem *>(this)->inferBindingsFor(tv).dump(out, 1);
+        const_cast<ConstraintSystem *>(this)->getBindingsFor(tv).dump(out, 1);
       }
     } else {
       out << " equivalent to ";
@@ -1309,7 +1331,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
   // Anything bridges to AnyObject.
   if (toType->isAnyObject())
     return CheckedCastKind::BridgingCoercion;
-  
+
   if (isObjCBridgedTo(fromType, toType, dc, &unwrappedIUO) && !unwrappedIUO){
     return CheckedCastKind::BridgingCoercion;
   }
@@ -1370,114 +1392,6 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
                                  SourceLoc(), nullptr, SourceRange())) {
     case CheckedCastKind::Coercion:
     case CheckedCastKind::BridgingCoercion: {
-      // FIXME: Add a Fix-It, when the caller provides us with enough
-      // information.
-      if (!suppressDiagnostics) {
-        bool isBridged =
-          !fromType->isEqual(toType) && !isConvertibleTo(fromType, toType, dc);
-
-        switch (contextKind) {
-        case CheckedCastContextKind::None:
-        case CheckedCastContextKind::Coercion:
-          llvm_unreachable("suppressing diagnostics");
-
-        case CheckedCastContextKind::ForcedCast: {
-          std::string extraFromOptionalsStr(extraFromOptionals, '!');
-          auto diag = diags.diagnose(diagLoc, diag::downcast_same_type,
-                                     origFromType, origToType,
-                                     extraFromOptionalsStr,
-                                     isBridged);
-          diag.highlight(diagFromRange);
-          diag.highlight(diagToRange);
-
-          /// Add the '!''s needed to adjust the type.
-          diag.fixItInsertAfter(diagFromRange.End,
-                                std::string(extraFromOptionals, '!'));
-          if (isBridged) {
-            // If it's bridged, we still need the 'as' to perform the bridging.
-            diag.fixItReplaceChars(diagLoc, diagLoc.getAdvancedLocOrInvalid(3),
-                                   "as");
-          } else {
-            // Otherwise, implicit conversions will handle it in most cases.
-            SourceLoc afterExprLoc = Lexer::getLocForEndOfToken(Context.SourceMgr,
-                                                                diagFromRange.End);
-
-            diag.fixItRemove(SourceRange(afterExprLoc, diagToRange.End));
-          }
-          break;
-        }
-
-        case CheckedCastContextKind::ConditionalCast:
-          // If we're only unwrapping a single optional, that optional value is
-          // effectively carried through to the underlying conversion, making this
-          // the moral equivalent of a map. Complain that one can do this with
-          // 'as' more effectively.
-          if (extraFromOptionals == 1) {
-            // A single optional is carried through. It's better to use 'as' to
-            // the appropriate optional type.
-            auto diag = diags.diagnose(diagLoc,
-                                       diag::conditional_downcast_same_type,
-                                       origFromType, origToType,
-                                       fromType->isEqual(toType) ? 0
-                                                     : isBridged ? 2
-                                                     : 1);
-            diag.highlight(diagFromRange);
-            diag.highlight(diagToRange);
-
-            if (isBridged) {
-              // For a bridged cast, replace the 'as?' with 'as'.
-              diag.fixItReplaceChars(diagLoc, diagLoc.getAdvancedLocOrInvalid(3),
-                                     "as");
-
-              // Make sure we'll cast to the appropriately-optional type by adding
-              // the '?'.
-              // FIXME: Parenthesize!
-              diag.fixItInsertAfter(diagToRange.End, "?");
-            } else {
-              // Just remove the cast; implicit conversions will handle it.
-              SourceLoc afterExprLoc =
-                Lexer::getLocForEndOfToken(Context.SourceMgr, diagFromRange.End);
-
-              if (afterExprLoc.isValid() && diagToRange.isValid())
-                diag.fixItRemove(SourceRange(afterExprLoc, diagToRange.End));
-            }
-          }
-
-          // If there is more than one extra optional, don't do anything: this
-          // conditional cast is trying to unwrap some levels of optional;
-          // let the runtime handle it.
-          break;
-
-        case CheckedCastContextKind::IsExpr:
-          // If we're only unwrapping a single optional, we could have just
-          // checked for 'nil'.
-          if (extraFromOptionals == 1) {
-            auto diag = diags.diagnose(diagLoc, diag::is_expr_same_type,
-                                       origFromType, origToType);
-            diag.highlight(diagFromRange);
-            diag.highlight(diagToRange);
-
-            diag.fixItReplace(SourceRange(diagLoc, diagToRange.End), "!= nil");
-
-            // Add parentheses if needed.
-            if (!fromExpr->canAppendPostfixExpression()) {
-              diag.fixItInsert(fromExpr->getStartLoc(), "(");
-              diag.fixItInsertAfter(fromExpr->getEndLoc(), ")");
-            }
-          }
-
-          // If there is more than one extra optional, don't do anything: this
-          // is performing a deeper check that the runtime will handle.
-          break;
-
-        case CheckedCastContextKind::IsPattern:
-        case CheckedCastContextKind::EnumElementPattern:
-          // Note: Don't diagnose these, because the code is testing whether
-          // the optionals can be unwrapped.
-          break;
-        }
-      }
-
       // Treat this as a value cast so we preserve the semantics.
       return CheckedCastKind::ValueCast;
     }
@@ -1679,7 +1593,6 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
       }
 
       return CheckedCastKind::ValueCast;
-      break;
 
     case CheckedCastContextKind::IsPattern:
     case CheckedCastContextKind::EnumElementPattern:

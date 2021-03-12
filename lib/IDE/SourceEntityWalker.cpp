@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/SourceEntityWalker.h"
-#include "swift/Parse/Lexer.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
@@ -23,7 +22,9 @@
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/Parse/Lexer.h"
 #include "clang/Basic/Module.h"
 
 using namespace swift;
@@ -83,7 +84,7 @@ private:
 
   bool passCallArgNames(Expr *Fn, TupleExpr *TupleE);
 
-  bool shouldIgnore(Decl *D, bool &ShouldVisitChildren);
+  bool shouldIgnore(Decl *D);
 
   ValueDecl *extractDecl(Expr *Fn) const {
     Fn = Fn->getSemanticsProvidingExpr();
@@ -105,9 +106,8 @@ bool SemaAnnotator::walkToDeclPre(Decl *D) {
   if (isDone())
     return false;
 
-  bool ShouldVisitChildren;
-  if (shouldIgnore(D, ShouldVisitChildren))
-    return ShouldVisitChildren;
+  if (shouldIgnore(D))
+    return isa<PatternBindingDecl>(D);
 
   if (!handleCustomAttributes(D)) {
     Cancelled = true;
@@ -176,14 +176,14 @@ bool SemaAnnotator::walkToDeclPre(Decl *D) {
       }
       return false;
     }
-  } else {
-    return true;
   }
 
   CharSourceRange Range = (Loc.isValid()) ? CharSourceRange(Loc, NameLen)
                                           : CharSourceRange();
-  ShouldVisitChildren = SEWalker.walkToDeclPre(D, Range);
-  if (ShouldVisitChildren && IsExtension) {
+  bool ShouldVisitChildren = SEWalker.walkToDeclPre(D, Range);
+  // walkToDeclPost is only called when visiting children, so make sure to only
+  // push the extension decl in that case (otherwise it won't be popped)
+  if (IsExtension && ShouldVisitChildren) {
     ExtDecls.push_back(static_cast<ExtensionDecl*>(D));
   }
   return ShouldVisitChildren;
@@ -193,18 +193,13 @@ bool SemaAnnotator::walkToDeclPost(Decl *D) {
   if (isDone())
     return false;
 
-  bool ShouldVisitChildren;
-  if (shouldIgnore(D, ShouldVisitChildren))
+  if (shouldIgnore(D))
     return true;
 
   if (isa<ExtensionDecl>(D)) {
     assert(ExtDecls.back() == D);
     ExtDecls.pop_back();
   }
-
-  if (!isa<ValueDecl>(D) && !isa<ExtensionDecl>(D) && !isa<ImportDecl>(D) &&
-      !isa<IfConfigDecl>(D))
-    return true;
 
   bool Continue = SEWalker.walkToDeclPost(D);
   if (!Continue)
@@ -771,14 +766,10 @@ bool SemaAnnotator::passCallArgNames(Expr *Fn, TupleExpr *TupleE) {
   return true;
 }
 
-bool SemaAnnotator::shouldIgnore(Decl *D, bool &ShouldVisitChildren) {
-  if (D->isImplicit() &&
-      !isa<PatternBindingDecl>(D) &&
-      !isa<ConstructorDecl>(D)) {
-    ShouldVisitChildren = false;
-    return true;
-  }
-  return false;
+bool SemaAnnotator::shouldIgnore(Decl *D) {
+  // TODO: There should really be a separate field controlling whether
+  //       constructors are visited or not
+  return D->isImplicit() && !isa<ConstructorDecl>(D);
 }
 
 bool SourceEntityWalker::walk(SourceFile &SrcFile) {

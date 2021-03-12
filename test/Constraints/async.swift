@@ -1,16 +1,18 @@
 // RUN: %target-typecheck-verify-swift -enable-experimental-concurrency
 
+// REQUIRES: concurrency
+
 func doAsynchronously() async { }
 func doSynchronously() { }
 
-func testNonConversions() async {
-  let _: () -> Void = doAsynchronously // expected-error{{cannot convert value of type '() async -> ()' to specified type '() -> Void'}}
-  let _: () async -> Void = doSynchronously // expected-error{{cannot convert value of type '() -> ()' to specified type '() async -> Void'}}
+func testConversions() async {
+  let _: () -> Void = doAsynchronously // expected-error{{invalid conversion from 'async' function of type '() async -> ()' to synchronous function type '() -> Void'}}
+  let _: () async -> Void = doSynchronously // okay
 }
 
 // Overloading
 @available(swift, deprecated: 4.0, message: "synchronous is no fun")
-func overloadedSame() -> String { "synchronous" }
+func overloadedSame(_: Int = 0) -> String { "synchronous" }
 
 func overloadedSame() async -> String { "asynchronous" }
 
@@ -57,7 +59,7 @@ func testOverloadedAsync() async {
   let _: String? = await overloadedOptDifference() // no warning
 
   let _ = await overloaded()
-  let _ = overloaded() // expected-error{{call is 'async' but is not marked with 'await'}}
+  let _ = overloaded() // expected-error{{call is 'async' but is not marked with 'await'}}{{11-11=await }}
 
   let fn = {
     overloaded()
@@ -91,4 +93,48 @@ func testPassAsyncClosure() {
 
   let b = takesAsyncClosure { overloadedSame() } // expected-warning{{synchronous is no fun}}
   let _: Double = b // expected-error{{convert value of type 'String'}}
+}
+
+struct FunctionTypes {
+  var syncNonThrowing: () -> Void
+  var syncThrowing: () throws -> Void
+  var asyncNonThrowing: () async -> Void
+  var asyncThrowing: () async throws -> Void
+
+  mutating func demonstrateConversions() {
+    // Okay to add 'async' and/or 'throws'
+    asyncNonThrowing = syncNonThrowing
+    asyncThrowing = syncThrowing
+    syncThrowing = syncNonThrowing
+    asyncThrowing = asyncNonThrowing
+
+    // Error to remove 'async' or 'throws'
+    syncNonThrowing = asyncNonThrowing // expected-error{{invalid conversion}}
+    syncThrowing = asyncThrowing       // expected-error{{invalid conversion}}
+    syncNonThrowing = syncThrowing     // expected-error{{invalid conversion}}
+    asyncNonThrowing = syncThrowing    // expected-error{{invalid conversion}}
+  }
+}
+
+// Overloading when there is conversion from sync to async.
+func bar(_ f: (Int) -> Int) -> Int {
+  return f(2)
+}
+
+func bar(_ f: (Int) async -> Int) async -> Int {
+  return await f(2)
+}
+
+func incrementSync(_ x: Int) -> Int {
+  return x + 1
+}
+
+func incrementAsync(_ x: Int) async -> Int {
+  return x + 1
+}
+
+func testAsyncWithConversions() async {
+  _ = bar(incrementSync)
+  _ = bar { -$0 }
+  _ = bar(incrementAsync) // expected-error{{call is 'async' but is not marked with 'await'}}
 }

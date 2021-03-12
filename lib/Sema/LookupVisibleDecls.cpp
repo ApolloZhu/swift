@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "TypeChecker.h"
+#include "clang/AST/DeclObjC.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/GenericSignatureBuilder.h"
@@ -314,6 +315,17 @@ static void doDynamicLookup(VisibleDeclConsumer &Consumer,
       if (!D->isObjC())
         return;
 
+      // If the declaration is objc_direct, it cannot be called dynamically.
+      if (auto clangDecl = D->getClangDecl()) {
+        if (auto objCMethod = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
+          if (objCMethod->isDirectMethod())
+            return;
+        } else if (auto objCProperty = dyn_cast<clang::ObjCPropertyDecl>(clangDecl)) {
+          if (objCProperty->isDirectProperty())
+            return;
+        }
+      }
+
       if (D->isRecursiveValidation())
         return;
 
@@ -595,8 +607,6 @@ static void lookupVisibleMemberDeclsImpl(
     // The metatype represents an arbitrary named type: dig through to the
     // declared type to see what we're dealing with.
     Type Ty = MTT->getInstanceType();
-    if (auto dynSelfTy = Ty->getAs<DynamicSelfType>())
-      Ty = dynSelfTy->getSelfType();
     if (Ty->is<AnyMetatypeType>())
       return;
 
@@ -691,6 +701,12 @@ static void lookupVisibleMemberDeclsImpl(
       }
       return;
     }
+  }
+
+  // The members of a dynamic 'Self' type are the members of its static
+  // class type.
+  if (auto *const DS = BaseTy->getAs<DynamicSelfType>()) {
+    BaseTy = DS->getSelfType();
   }
 
   auto lookupTy = BaseTy;
@@ -1083,8 +1099,8 @@ static void lookupVisibleDynamicMemberLookupDecls(
       { ctx, DeclBaseName::createSubscript(), { ctx.Id_dynamicMember} });
 
   SmallVector<ValueDecl *, 2> subscripts;
-  dc->lookupQualified(baseType, subscriptName, NL_QualifiedDefault,
-                      subscripts);
+  dc->lookupQualified(baseType, subscriptName,
+                      NL_QualifiedDefault | NL_ProtocolMembers, subscripts);
 
   for (ValueDecl *VD : subscripts) {
     auto *subscript = dyn_cast<SubscriptDecl>(VD);
@@ -1290,55 +1306,9 @@ void swift::lookupVisibleDecls(VisibleDeclConsumer &Consumer,
     lookupVisibleDeclsImpl(Consumer, DC, IncludeTopLevel, Loc);
     return;
   }
-
-  // Filtering out unusable values.
-  class LocalConsumer : public VisibleDeclConsumer {
-    const SourceManager &SM;
-    SourceLoc Loc;
-    VisibleDeclConsumer &Consumer;
-
-    bool isUsableValue(ValueDecl *VD, DeclVisibilityKind Reason) {
-
-      // Check "use within its own initial value" case.
-      if (auto *varD = dyn_cast<VarDecl>(VD)) {
-        if (auto *initExpr = varD->getParentInitializer())
-          if (SM.rangeContainsTokenLoc(initExpr->getSourceRange(), Loc))
-            return false;
-      }
-
-      switch (Reason) {
-      case DeclVisibilityKind::LocalVariable:
-        // Use of 'TypeDecl's before declaration is allowed.
-        if (isa<TypeDecl>(VD))
-          return true;
-
-        return SM.isBeforeInBuffer(VD->getLoc(), Loc);
-
-      case DeclVisibilityKind::VisibleAtTopLevel:
-        // TODO: Implement forward reference rule for script mode? Currently,
-        // it's not needed because the rest of the file hasn't been parsed.
-        // See: https://bugs.swift.org/browse/SR-284 for the rule.
-        return true;
-
-      default:
-        // Other visibility kind are always usable.
-        return true;
-      }
-    }
-
-  public:
-    LocalConsumer(const SourceManager &SM, SourceLoc Loc,
-                  VisibleDeclConsumer &Consumer)
-        : SM(SM), Loc(Loc), Consumer(Consumer) {}
-
-    void foundDecl(ValueDecl *VD, DeclVisibilityKind Reason,
-                   DynamicLookupInfo dynamicLookupInfo) override {
-      if (isUsableValue(VD, Reason))
-        Consumer.foundDecl(VD, Reason, dynamicLookupInfo);
-    }
-  } LocalConsumer(DC->getASTContext().SourceMgr, Loc, Consumer);
-
-  lookupVisibleDeclsImpl(LocalConsumer, DC, IncludeTopLevel, Loc);
+  UsableFilteringDeclConsumer FilteringConsumer(DC->getASTContext().SourceMgr,
+                                                DC, Loc, Consumer);
+  lookupVisibleDeclsImpl(FilteringConsumer, DC, IncludeTopLevel, Loc);
 }
 
 void swift::lookupVisibleMemberDecls(VisibleDeclConsumer &Consumer, Type BaseTy,

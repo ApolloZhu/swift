@@ -344,9 +344,19 @@ void swift::performWholeModuleTypeChecking(SourceFile &SF) {
   auto &Ctx = SF.getASTContext();
   FrontendStatsTracer tracer(Ctx.Stats,
                              "perform-whole-module-type-checking");
-  diagnoseObjCMethodConflicts(SF);
-  diagnoseObjCUnsatisfiedOptReqConflicts(SF);
-  diagnoseUnintendedObjCMethodOverrides(SF);
+  switch (SF.Kind) {
+  case SourceFileKind::Library:
+  case SourceFileKind::Main:
+    diagnoseObjCMethodConflicts(SF);
+    diagnoseObjCUnsatisfiedOptReqConflicts(SF);
+    diagnoseUnintendedObjCMethodOverrides(SF);
+    return;
+  case SourceFileKind::SIL:
+  case SourceFileKind::Interface:
+    // SIL modules and .swiftinterface files don't benefit from whole-module
+    // ObjC checking - skip it.
+    return;
+  }
 }
 
 bool swift::isAdditiveArithmeticConformanceDerivationEnabled(SourceFile &SF) {
@@ -372,12 +382,18 @@ Type swift::performTypeResolution(TypeRepr *TyR, ASTContext &Ctx,
   if (isSILType)
     options |= TypeResolutionFlags::SILType;
 
-  const auto resolution =
-      TypeResolution::forContextual(DC, GenericEnv, options,
-                                    [](auto unboundTy) {
+  const auto resolution = TypeResolution::forContextual(
+      DC, GenericEnv, options,
+      [](auto unboundTy) {
         // FIXME: Don't let unbound generic types escape type resolution.
         // For now, just return the unbound generic type.
         return unboundTy;
+      },
+      /*placeholderHandler*/
+      [&](auto placeholderRepr) {
+        // FIXME: Don't let placeholder types escape type resolution.
+        // For now, just return the placeholder type.
+        return PlaceholderType::get(Ctx, placeholderRepr);
       });
 
   Optional<DiagnosticSuppression> suppression;

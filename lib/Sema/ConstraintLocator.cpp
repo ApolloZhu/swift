@@ -18,6 +18,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Types.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Sema/ConstraintLocator.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/StringExtras.h"
@@ -44,7 +45,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::ClosureResult:
   case ConstraintLocator::ClosureBody:
   case ConstraintLocator::ConstructorMember:
-  case ConstraintLocator::FunctionBuilderBodyResult:
+  case ConstraintLocator::ResultBuilderBodyResult:
   case ConstraintLocator::InstanceType:
   case ConstraintLocator::AutoclosureResult:
   case ConstraintLocator::OptionalPayload:
@@ -54,7 +55,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::ParentType:
   case ConstraintLocator::ExistentialSuperclassType:
   case ConstraintLocator::LValueConversion:
-  case ConstraintLocator::RValueAdjustment:
+  case ConstraintLocator::DynamicType:
   case ConstraintLocator::SubscriptMember:
   case ConstraintLocator::OpenedGeneric:
   case ConstraintLocator::GenericParameter:
@@ -66,6 +67,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::KeyPathComponent:
   case ConstraintLocator::ConditionalRequirement:
   case ConstraintLocator::TypeParameterRequirement:
+  case ConstraintLocator::ConformanceRequirement:
   case ConstraintLocator::ImplicitlyUnwrappedDisjunctionChoice:
   case ConstraintLocator::DynamicLookupResult:
   case ConstraintLocator::ContextualType:
@@ -82,6 +84,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::PatternMatch:
   case ConstraintLocator::ArgumentAttribute:
   case ConstraintLocator::UnresolvedMemberChainResult:
+  case ConstraintLocator::PlaceholderType:
     return 0;
 
   case ConstraintLocator::FunctionArgument:
@@ -198,8 +201,8 @@ bool ConstraintLocator::isForOptionalTry() const {
   return directlyAt<OptionalTryExpr>();
 }
 
-bool ConstraintLocator::isForFunctionBuilderBodyResult() const {
-  return isFirstElement<LocatorPathElt::FunctionBuilderBodyResult>();
+bool ConstraintLocator::isForResultBuilderBodyResult() const {
+  return isFirstElement<LocatorPathElt::ResultBuilderBodyResult>();
 }
 
 GenericTypeParamType *ConstraintLocator::getGenericParameter() const {
@@ -300,8 +303,8 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
       out << "function result";
       break;
 
-    case FunctionBuilderBodyResult:
-      out << "function builder body result";
+    case ResultBuilderBodyResult:
+      out << "result builder body result";
       break;
 
     case SequenceElementType:
@@ -350,8 +353,8 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
       out << "@lvalue-to-inout conversion";
       break;
 
-    case RValueAdjustment:
-      out << "rvalue adjustment";
+    case DynamicType:
+      out << "`.dynamicType` reference";
       break;
 
     case SubscriptMember:
@@ -394,6 +397,15 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
       auto reqElt = elt.castTo<LocatorPathElt::TypeParameterRequirement>();
       out << "type parameter requirement #" << llvm::utostr(reqElt.getIndex());
       dumpReqKind(reqElt.getRequirementKind());
+      break;
+    }
+
+    case ConformanceRequirement: {
+      auto *conformance =
+          elt.castTo<LocatorPathElt::ConformanceRequirement>().getConformance();
+      out << "conformance requirement (";
+      conformance->getProtocol()->dumpRef(out);
+      out << ")";
       break;
     }
 
@@ -471,6 +483,10 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
       case AttrLoc::Attribute::Escaping:
         out << "@escaping";
         break;
+
+      case AttrLoc::Attribute::Concurrent:
+        out << "@concurrent";
+        break;
       }
 
       break;
@@ -478,6 +494,10 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
 
     case UnresolvedMemberChainResult:
       out << "unresolved chain result";
+      break;
+
+    case PlaceholderType:
+      out << "placeholder type";
       break;
     }
   }

@@ -140,6 +140,10 @@ struct SILDeclRef {
     /// References the wrapped value injection function used to initialize
     /// the backing storage property from a wrapped value.
     PropertyWrapperBackingInitializer,
+
+    /// References the function used to initialize a property wrapper storage
+    /// instance from a projected value.
+    PropertyWrapperInitFromProjectedValue,
   };
   
   /// The ValueDecl or AbstractClosureExpr represented by this SILDeclRef.
@@ -221,6 +225,7 @@ struct SILDeclRef {
   enum class ManglingKind {
     Default,
     DynamicThunk,
+    AsyncHandlerBody
   };
 
   /// Produce a mangled form of this constant.
@@ -263,7 +268,8 @@ struct SILDeclRef {
   /// True if the SILDeclRef references the initializer for the backing storage
   /// of a property wrapper.
   bool isPropertyWrapperBackingInitializer() const {
-    return kind == Kind::PropertyWrapperBackingInitializer;
+    return (kind == Kind::PropertyWrapperBackingInitializer ||
+            kind == Kind::PropertyWrapperInitFromProjectedValue);
   }
 
   /// True if the SILDeclRef references the ivar initializer or deinitializer of
@@ -427,6 +433,8 @@ struct SILDeclRef {
     assert(isAutoDiffDerivativeFunction());
     return pointer.get<AutoDiffDerivativeFunctionIdentifier *>();
   }
+  
+  bool hasAsync() const;
 
 private:
   friend struct llvm::DenseMapInfo<swift::SILDeclRef>;

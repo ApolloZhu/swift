@@ -39,6 +39,7 @@ class TypeLoc;
 class VarDecl;
 class Pattern;
 class SourceManager;
+class ProtocolConformance;
 
 namespace constraints {
 
@@ -222,8 +223,8 @@ public:
   /// Determine whether this locator points to the `try?` expression.
   bool isForOptionalTry() const;
 
-  /// Determine whether this locator is for a function builder body result type.
-  bool isForFunctionBuilderBodyResult() const;
+  /// Determine whether this locator is for a result builder body result type.
+  bool isForResultBuilderBodyResult() const;
 
   /// Determine whether this locator points directly to a given expression.
   template <typename E> bool directlyAt() const {
@@ -510,12 +511,14 @@ public:
   }
 };
 
-class LocatorPathElt::SynthesizedArgument final : public StoredIntegerElement<1> {
+class LocatorPathElt::SynthesizedArgument final : public StoredIntegerElement<2> {
 public:
-  SynthesizedArgument(unsigned index)
-      : StoredIntegerElement(ConstraintLocator::SynthesizedArgument, index) {}
+  SynthesizedArgument(unsigned index, bool afterCodeCompletionLoc = false)
+      : StoredIntegerElement(ConstraintLocator::SynthesizedArgument, index,
+                             afterCodeCompletionLoc) {}
 
-  unsigned getIndex() const { return getValue(); }
+  unsigned getIndex() const { return getValue<0>(); }
+  bool isAfterCodeCompletionLoc() const { return getValue<1>(); }
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::SynthesizedArgument;
@@ -740,7 +743,7 @@ public:
 
 class LocatorPathElt::ArgumentAttribute final : public StoredIntegerElement<1> {
 public:
-  enum Attribute : uint8_t { InOut, Escaping };
+  enum Attribute : uint8_t { InOut, Escaping, Concurrent };
 
 private:
   ArgumentAttribute(Attribute attr)
@@ -757,8 +760,40 @@ public:
     return ArgumentAttribute(Attribute::Escaping);
   }
 
+  static ArgumentAttribute forConcurrent() {
+    return ArgumentAttribute(Attribute::Concurrent);
+  }
+
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::ArgumentAttribute;
+  }
+};
+
+class LocatorPathElt::ConformanceRequirement final
+    : public StoredPointerElement<ProtocolConformance> {
+public:
+  ConformanceRequirement(ProtocolConformance *conformance)
+      : StoredPointerElement(PathElementKind::ConformanceRequirement,
+                             conformance) {}
+
+  ProtocolConformance *getConformance() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::ConformanceRequirement;
+  }
+};
+
+class LocatorPathElt::PlaceholderType final
+    : public StoredPointerElement<PlaceholderTypeRepr> {
+public:
+  PlaceholderType(PlaceholderTypeRepr *placeholderRepr)
+      : StoredPointerElement(PathElementKind::PlaceholderType,
+                             placeholderRepr) {}
+
+  PlaceholderTypeRepr *getPlaceholderRepr() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::PlaceholderType;
   }
 };
 

@@ -200,9 +200,7 @@ function(_add_target_variant_swift_compile_flags
     ${ARGN})
 
   # On Windows, we don't set SWIFT_SDK_WINDOWS_PATH_ARCH_{ARCH}_PATH, so don't include it.
-  # On Android the sdk is split to two different paths for includes and libs, so these
-  # need to be set manually.
-  if (NOT "${sdk}" STREQUAL "WINDOWS" AND NOT "${sdk}" STREQUAL "ANDROID")
+  if (NOT "${sdk}" STREQUAL "WINDOWS")
     list(APPEND result "-sdk" "${SWIFT_SDK_${sdk}_ARCH_${arch}_PATH}")
   endif()
 
@@ -219,13 +217,6 @@ function(_add_target_variant_swift_compile_flags
   else()
     list(APPEND result
         "-target" "${SWIFT_SDK_${sdk}_ARCH_${arch}_TRIPLE}")
-  endif()
-
-  if("${sdk}" STREQUAL "ANDROID")
-    swift_android_include_for_arch(${arch} ${arch}_swift_include)
-    foreach(path IN LISTS ${arch}_swift_include)
-      list(APPEND result "\"${CMAKE_INCLUDE_FLAG_C}${path}\"")
-    endforeach()
   endif()
 
   if(NOT BUILD_STANDALONE)
@@ -664,6 +655,12 @@ function(_compile_swift_files
       math(EXPR old_interface_file_index "${interface_file_index} + 1")
       list(REMOVE_AT maccatalyst_swift_module_flags ${old_interface_file_index})
     endif()
+
+    # We still need to change the main swift flags
+    # so we can use the correct modules
+    # when building for macOS
+    list(APPEND swift_flags
+      "-I" "${SWIFTLIB_DIR}/${library_subdir}")
   elseif(maccatalyst_build_flavor STREQUAL "ios-like")
     compute_library_subdir(maccatalyst_library_subdir
       "MACCATALYST" "${SWIFTFILE_ARCHITECTURE}")
@@ -795,6 +792,7 @@ function(_compile_swift_files
           ${source_files} ${SWIFTFILE_DEPENDS}
           ${swift_ide_test_dependency}
           ${create_dirs_dependency_target}
+          ${copy_legacy_layouts_dep}
         COMMENT "Generating ${module_file}")
 
     if(SWIFTFILE_STATIC)
@@ -851,6 +849,7 @@ function(_compile_swift_files
           ${SWIFTFILE_DEPENDS}
           ${swift_ide_test_dependency}
           ${obj_dirs_dependency_target}
+          ${copy_legacy_layouts_dep}
         COMMENT
           "Generating ${maccatalyst_module_file}")
 
@@ -874,6 +873,7 @@ function(_compile_swift_files
           ${swift_compiler_tool_dep}
           ${source_files} ${SWIFTFILE_DEPENDS}
           ${create_dirs_dependency_target}
+          ${copy_legacy_layouts_dep}
         COMMENT "Generating ${sib_file}"
         EXCLUDE_FROM_ALL)
     set("${dependency_sib_target_out_var_name}" "${sib_dependency_target}" PARENT_SCOPE)
@@ -890,6 +890,7 @@ function(_compile_swift_files
           ${swift_compiler_tool_dep}
           ${source_files} ${SWIFTFILE_DEPENDS}
           ${create_dirs_dependency_target}
+          ${copy_legacy_layouts_dep}
         COMMENT "Generating ${sibopt_file}"
         EXCLUDE_FROM_ALL)
     set("${dependency_sibopt_target_out_var_name}" "${sibopt_dependency_target}" PARENT_SCOPE)
@@ -907,6 +908,7 @@ function(_compile_swift_files
           ${swift_compiler_tool_dep}
           ${source_files} ${SWIFTFILE_DEPENDS}
           ${create_dirs_dependency_target}
+          ${copy_legacy_layouts_dep}
           COMMENT "Generating ${sibgen_file}"
           EXCLUDE_FROM_ALL)
     set("${dependency_sibgen_target_out_var_name}" "${sibgen_dependency_target}" PARENT_SCOPE)

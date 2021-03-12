@@ -334,7 +334,7 @@ static bool isAccessedAddressTBAASafe(SILValue V) {
   if (!V->getType().isAddress())
     return false;
 
-  SILValue accessedAddress = getAccessedAddress(V);
+  SILValue accessedAddress = getTypedAccessAddress(V);
   if (isa<SILFunctionArgument>(accessedAddress))
     return true;
 
@@ -538,6 +538,27 @@ bool AliasAnalysis::typesMayAlias(SILType T1, SILType T2,
   return MA;
 }
 
+void AliasAnalysis::handleDeleteNotification(SILNode *node) {
+  // The pointer 'node' is going away.  We can't scan the whole cache
+  // and remove all of the occurrences of the pointer. Instead we remove
+  // the pointer from the index caches.
+
+  if (auto *value = dyn_cast<ValueBase>(node))
+    ValueToIndex.invalidateValue(value);
+
+  if (auto *inst = dyn_cast<SILInstruction>(node)) {
+    InstructionToIndex.invalidateValue(inst);
+    
+    // When a MultipleValueInstruction is deleted, we have to invalidate all
+    // the instruction results.
+    if (auto *mvi = dyn_cast<MultipleValueInstruction>(inst)) {
+      for (unsigned idx = 0, end = mvi->getNumResults(); idx < end; ++idx) {
+        ValueToIndex.invalidateValue(mvi->getResult(idx));
+      }
+    }
+  }
+}
+
 //===----------------------------------------------------------------------===//
 //                                Entry Points
 //===----------------------------------------------------------------------===//
@@ -557,10 +578,6 @@ AliasResult AliasAnalysis::alias(SILValue V1, SILValue V2,
   // Flush the cache if the size of the cache is too large.
   if (AliasCache.size() > AliasAnalysisMaxCacheSize) {
     AliasCache.clear();
-    AliasValueBaseToIndex.clear();
-
-    // Key is no longer valid as we cleared the AliasValueBaseToIndex.
-    Key = toAliasKey(V1, V2, TBAAType1, TBAAType2);
   }
 
   // Calculate the aliasing result and store it in the cache.
@@ -706,8 +723,18 @@ bool AliasAnalysis::canApplyDecrementRefCount(FullApplySite FAS, SILValue Ptr) {
     if (ArgEffect.mayRelease()) {
       // The function may release this argument, so check if the pointer can
       // escape to it.
-      if (EA->mayReleaseContent(FAS.getArgument(Idx), Ptr))
-        return true;
+      auto arg = FAS.getArgument(Idx);
+      if (arg->getType().isAddress()) {
+        // Handle indirect argument as if they are a release to any references
+        // pointed to by the argument's address.
+        if (EA->mayReleaseAddressContent(arg, Ptr))
+          return true;
+      } else {
+        // Handle direct arguments as if they are a direct release of the
+        // reference (just like a destroy_value).
+        if (EA->mayReleaseReferenceContent(arg, Ptr))
+          return true;
+      }
     }
   }
   return false;
@@ -723,12 +750,18 @@ bool AliasAnalysis::canBuiltinDecrementRefCount(BuiltinInst *BI, SILValue Ptr) {
       continue;
 
     // A builtin can only release an object if it can escape to one of the
-    // builtin's arguments. 'EscapeAnalysis::mayReleaseContent()' expects 'Arg'
-    // to be an owned reference and disallows addresses. Conservatively handle
-    // address type arguments as and conservatively treat all other values
-    // potential owned references.
-    if (Arg->getType().isAddress() || EA->mayReleaseContent(Arg, Ptr))
-      return true;
+    // builtin's arguments.
+    if (Arg->getType().isAddress()) {
+      // Handle indirect argument as if they are a release to any references
+      // pointed to by the argument's address.
+      if (EA->mayReleaseAddressContent(Arg, Ptr))
+        return true;
+    } else {
+      // Handle direct arguments as if they are a direct release of the
+      // reference (just like a destroy_value).
+      if (EA->mayReleaseReferenceContent(Arg, Ptr))
+        return true;
+    }
   }
   return false;
 }
@@ -771,7 +804,7 @@ bool AliasAnalysis::mayValueReleaseInterfereWithInstruction(
   // accessedPointer. Access to any objects beyond the first released refcounted
   // object are irrelevant--they must already have sufficient refcount that they
   // won't be released when releasing Ptr.
-  return EA->mayReleaseContent(releasedReference, accessedPointer);
+  return EA->mayReleaseReferenceContent(releasedReference, accessedPointer);
 }
 
 void AliasAnalysis::initialize(SILPassManager *PM) {
@@ -785,10 +818,10 @@ SILAnalysis *swift::createAliasAnalysis(SILModule *M) {
 
 AliasKeyTy AliasAnalysis::toAliasKey(SILValue V1, SILValue V2,
                                      SILType Type1, SILType Type2) {
-  size_t idx1 = AliasValueBaseToIndex.getIndex(V1);
+  size_t idx1 = ValueToIndex.getIndex(V1);
   assert(idx1 != std::numeric_limits<size_t>::max() &&
          "~0 index reserved for empty/tombstone keys");
-  size_t idx2 = AliasValueBaseToIndex.getIndex(V2);
+  size_t idx2 = ValueToIndex.getIndex(V2);
   assert(idx2 != std::numeric_limits<size_t>::max() &&
          "~0 index reserved for empty/tombstone keys");
   void *t1 = Type1.getOpaqueValue();

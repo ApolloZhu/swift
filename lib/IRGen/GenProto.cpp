@@ -266,8 +266,7 @@ irgen::enumerateGenericSignatureRequirements(CanGenericSignature signature,
 
       case RequirementKind::Conformance: {
         auto type = CanType(reqt.getFirstType());
-        auto protocol =
-          cast<ProtocolType>(CanType(reqt.getSecondType()))->getDecl();
+        auto protocol = reqt.getProtocolDecl();
         if (Lowering::TypeConverter::protocolRequiresWitnessTable(protocol)) {
           callback({type, protocol});
         }
@@ -926,7 +925,7 @@ static bool isDependentConformance(
     if (req.getKind() != RequirementKind::Conformance)
       continue;
 
-    auto assocProtocol = req.getSecondType()->castTo<ProtocolType>()->getDecl();
+    auto assocProtocol = req.getProtocolDecl();
     if (assocProtocol->isObjC())
       continue;
 
@@ -1336,7 +1335,11 @@ public:
       SILFunction *Func = entry.getMethodWitness().Witness;
       llvm::Constant *witness = nullptr;
       if (Func) {
-        witness = IGM.getAddrOfSILFunction(Func, NotForDefinition);
+        if (Func->isAsync()) {
+          witness = IGM.getAddrOfAsyncFunctionPointer(Func);
+        } else {
+          witness = IGM.getAddrOfSILFunction(Func, NotForDefinition);
+        }
       } else {
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
@@ -1674,7 +1677,10 @@ void ResilientWitnessTableBuilder::collectResilientWitnesses(
     SILFunction *Func = entry.getMethodWitness().Witness;
     llvm::Constant *witness;
     if (Func) {
-      witness = IGM.getAddrOfSILFunction(Func, NotForDefinition);
+      if (Func->isAsync())
+        witness = IGM.getAddrOfAsyncFunctionPointer(Func);
+      else
+        witness = IGM.getAddrOfSILFunction(Func, NotForDefinition);
     } else {
       // The method is removed by dead method elimination.
       // It should be never called. We add a null pointer.
@@ -2141,7 +2147,7 @@ void IRGenModule::emitSILWitnessTable(SILWitnessTable *wt) {
   IRGen.ensureRelativeSymbolCollocation(*wt);
 
   auto conf = wt->getConformance();
-  PrettyStackTraceConformance _st(Context, "emitting witness table for", conf);
+  PrettyStackTraceConformance _st("emitting witness table for", conf);
 
   unsigned tableSize = 0;
   llvm::GlobalVariable *global = nullptr;
@@ -2690,30 +2696,32 @@ void irgen::emitPolymorphicParametersFromArray(IRGenFunction &IGF,
 
 Size NecessaryBindings::getBufferSize(IRGenModule &IGM) const {
   // We need one pointer for each archetype or witness table.
-  return IGM.getPointerSize() * Requirements.size();
+  return IGM.getPointerSize() * size();
 }
 
 void NecessaryBindings::restore(IRGenFunction &IGF, Address buffer,
                                 MetadataState metadataState) const {
-  bindFromGenericRequirementsBuffer(IGF, Requirements.getArrayRef(), buffer,
+  bindFromGenericRequirementsBuffer(IGF, getRequirements(), buffer,
                                     metadataState,
-                                    [&](CanType type) { return type;});
+                                    [&](CanType type) { return type; });
 }
 
 template <typename Transform>
 static void save(const NecessaryBindings &bindings, IRGenFunction &IGF,
                  Address buffer, Transform transform) {
   emitInitOfGenericRequirementsBuffer(
-      IGF, bindings.getRequirements().getArrayRef(), buffer,
+      IGF, bindings.getRequirements(), buffer,
       [&](GenericRequirement requirement) -> llvm::Value * {
         CanType type = requirement.TypeParameter;
         if (auto protocol = requirement.Protocol) {
-          if (auto archetype = dyn_cast<ArchetypeType>(type)) {
+          CanArchetypeType archetype;
+          ProtocolConformanceRef conformance =
+              bindings.getConformance(requirement);
+          if ((archetype = dyn_cast<ArchetypeType>(type)) && !conformance) {
             auto wtable =
                 emitArchetypeWitnessTableRef(IGF, archetype, protocol);
             return transform(requirement, wtable);
           } else {
-            auto conformance = bindings.getConformance(requirement);
             auto wtable = emitWitnessTableRef(IGF, type, conformance);
             return transform(requirement, wtable);
           }
@@ -2744,8 +2752,16 @@ void NecessaryBindings::save(IRGenFunction &IGF, Address buffer) const {
 void NecessaryBindings::addTypeMetadata(CanType type) {
   assert(!isa<InOutType>(type));
 
+  // If the bindings are for an async function, we will always need the type
+  // metadata.  The opportunities to reconstruct it available in the context of
+  // partial apply forwarders are not available here.
+  if (forAsyncFunction()) {
+    addRequirement({type, nullptr});
+    return;
+  }
+
   // Bindings are only necessary at all if the type is dependent.
-  if (!type->hasArchetype() && !forAsyncFunction())
+  if (!type->hasArchetype())
     return;
 
   // Break down structural types so that we don't eagerly pass metadata
@@ -2772,26 +2788,24 @@ void NecessaryBindings::addTypeMetadata(CanType type) {
   // Generic types are trickier, because they can require conformances.
 
   // Otherwise, just record the need for this metadata.
-  Requirements.insert({type, nullptr});
+  addRequirement({type, nullptr});
 }
 
 /// Add all the abstract conditional conformances in the specialized
 /// conformance to the \p requirements.
-static void addAbstractConditionalRequirements(
-    SpecializedProtocolConformance *specializedConformance,
-    llvm::SetVector<GenericRequirement> &requirements) {
+void NecessaryBindings::addAbstractConditionalRequirements(
+    SpecializedProtocolConformance *specializedConformance) {
   auto subMap = specializedConformance->getSubstitutionMap();
   auto condRequirements = specializedConformance->getConditionalRequirements();
   for (auto req : condRequirements) {
     if (req.getKind() != RequirementKind::Conformance)
       continue;
-    auto *proto =
-        req.getSecondType()->castTo<ProtocolType>()->getDecl();
+    auto *proto = req.getProtocolDecl();
     auto ty = req.getFirstType()->getCanonicalType();
     auto archetype = dyn_cast<ArchetypeType>(ty);
     if (!archetype)
       continue;
-    requirements.insert({ty, proto});
+    addRequirement({ty, proto});
   }
   // Recursively add conditional requirements.
   for (auto &conf : subMap.getConformances()) {
@@ -2801,7 +2815,7 @@ static void addAbstractConditionalRequirements(
         dyn_cast<SpecializedProtocolConformance>(conf.getConcrete());
     if (!specializedConf)
       continue;
-    addAbstractConditionalRequirements(specializedConf, requirements);
+    addAbstractConditionalRequirements(specializedConf);
   }
 }
 
@@ -2813,8 +2827,8 @@ void NecessaryBindings::addProtocolConformance(CanType type,
         dyn_cast<SpecializedProtocolConformance>(concreteConformance);
     // The partial apply forwarder does not have the context to reconstruct
     // abstract conditional conformance requirements.
-    if (forPartialApply && specializedConf) {
-      addAbstractConditionalRequirements(specializedConf, Requirements);
+    if (forPartialApply() && specializedConf) {
+      addAbstractConditionalRequirements(specializedConf);
     } else if (forAsyncFunction()) {
       ProtocolDecl *protocol = conf.getRequirement();
       GenericRequirement requirement;
@@ -2823,7 +2837,7 @@ void NecessaryBindings::addProtocolConformance(CanType type,
       std::pair<GenericRequirement, ProtocolConformanceRef> pair{requirement,
                                                                  conf};
       Conformances.insert(pair);
-      Requirements.insert({type, concreteConformance->getProtocol()});
+      addRequirement({type, concreteConformance->getProtocol()});
     }
     return;
   }
@@ -2831,7 +2845,7 @@ void NecessaryBindings::addProtocolConformance(CanType type,
 
   // TODO: pass something about the root conformance necessary to
   // reconstruct this.
-  Requirements.insert({type, conf.getAbstract()});
+  addRequirement({type, conf.getAbstract()});
 }
 
 llvm::Value *irgen::emitWitnessTableRef(IRGenFunction &IGF,
@@ -3035,7 +3049,8 @@ NecessaryBindings NecessaryBindings::computeBindings(
     bool forPartialApplyForwarder, bool considerParameterSources) {
 
   NecessaryBindings bindings;
-  bindings.forPartialApply = forPartialApplyForwarder;
+  bindings.kind =
+      forPartialApplyForwarder ? Kind::PartialApply : Kind::AsyncFunction;
 
   // Bail out early if we don't have polymorphic parameters.
   if (!hasPolymorphicParameters(origType))
@@ -3043,20 +3058,6 @@ NecessaryBindings NecessaryBindings::computeBindings(
 
   // Figure out what we're actually required to pass:
   PolymorphicConvention convention(IGM, origType, considerParameterSources);
-
-  //  - unfulfilled requirements
-  convention.enumerateUnfulfilledRequirements(
-                                        [&](GenericRequirement requirement) {
-    CanType type = requirement.TypeParameter.subst(subs)->getCanonicalType();
-
-    if (requirement.Protocol) {
-      auto conf = subs.lookupConformance(requirement.TypeParameter,
-                                         requirement.Protocol);
-      bindings.addProtocolConformance(type, conf);
-    } else {
-      bindings.addTypeMetadata(type);
-    }
-  });
 
   //   - extra sources
   for (auto &source : convention.getSources()) {
@@ -3083,6 +3084,20 @@ NecessaryBindings NecessaryBindings::computeBindings(
     }
     llvm_unreachable("bad source kind");
   }
+
+  //  - unfulfilled requirements
+  convention.enumerateUnfulfilledRequirements(
+                                        [&](GenericRequirement requirement) {
+    CanType type = requirement.TypeParameter.subst(subs)->getCanonicalType();
+
+    if (requirement.Protocol) {
+      auto conf = subs.lookupConformance(requirement.TypeParameter,
+                                         requirement.Protocol);
+      bindings.addProtocolConformance(type, conf);
+    } else {
+      bindings.addTypeMetadata(type);
+    }
+  });
 
   return bindings;
 }
@@ -3341,7 +3356,7 @@ FunctionPointer irgen::emitWitnessMethodValue(IRGenFunction &IGF,
   auto &schema = IGF.getOptions().PointerAuth.ProtocolWitnesses;
   auto authInfo = PointerAuthInfo::emit(IGF, schema, slot, member);
 
-  return FunctionPointer(witnessFnPtr, authInfo, signature);
+  return FunctionPointer(fnType, witnessFnPtr, authInfo, signature);
 }
 
 FunctionPointer irgen::emitWitnessMethodValue(

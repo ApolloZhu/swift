@@ -24,6 +24,7 @@
 // RUN: %target-run %t/a.swift5.O.out
 //
 // REQUIRES: executable_test
+// REQUIRES: concurrency
 // UNSUPPORTED: use_os_stdlib
 
 import StdlibUnittest
@@ -521,12 +522,7 @@ class ClassInt: Equatable, Hashable {
   static func == (lhs: ClassInt, rhs: ClassInt) -> Bool {return true}
   func hash(into hasher: inout Hasher) {}
 }
-CastsTests.test("AnyHashable(Class) -> Obj-C -> Class")
-.skip(.custom({
-      !_isDebugAssertConfiguration()
-    },
-    reason: "Cast optimizer breaks this test"))
-.code {
+CastsTests.test("AnyHashable(Class) -> Obj-C -> Class") {
   let a = ClassInt()
   let b = runtimeCast(a, to: AnyHashable.self)!
   let c = _bridgeAnythingToObjectiveC(b)
@@ -758,6 +754,174 @@ CastsTests.test("Async function types") {
   expectTrue(asyncFnType is (() async -> Void).Type)
   expectFalse(fnType is (() async -> Void).Type)
   expectFalse(asyncFnType is (() -> Void).Type)
+}
+
+// `Optional<Int>` is Hashable, so it must cast to AnyHashable,
+// even if it contains a nil.  (This was broken in 5.3 and earlier,
+// but was fixed by the new dynamic cast runtime.)
+CastsTests.test("Optional nil -> AnyHashable") {
+  let a : Int? = nil
+  expectNotNil(a as? AnyHashable)
+}
+
+#if _runtime(_ObjC)
+// See below for notes about missing Linux functionality
+// that prevents us from running this test there.
+CastsTests.test("AnyObject.Type -> AnyObject") {
+  class C {}
+  let a = C.self
+  let b = a as? AnyObject.Type
+  expectNotNil(b)
+  // Note: On macOS, the following cast generates a call to
+  // `swift_dynamicCastMetatypeToObjectConditional` That function is currently
+  // unimplemented on Linux, so this cast always fails on Linux.
+  let c = b as? AnyObject
+  expectNotNil(c)
+  // Note: The following cast currently succeeds on Linux only by stuffing the
+  // source into a `__SwiftValue` container, which breaks the checks below.
+  let d = runtimeCast(b, to: AnyObject.self)
+  expectNotNil(d)
+  let e = c as? C.Type
+  expectNotNil(e)
+  let f = runtimeCast(d, to: C.Type.self)
+  expectNotNil(f)
+  // Verify that the round-trip casts yield exactly the same pointer.  In
+  // particular, none of the casts above should fall back on stuffing the source
+  // into a `__SwiftValue` container.
+  expectTrue(c! === a)
+  expectTrue(d! === a)
+  expectTrue(e! === a)
+  expectTrue(f! === a)
+}
+#endif
+
+protocol Fruit {}
+CastsTests.test("Generic type validation [SR-13812]") {
+  func check<A, B>(a: A.Type, b: B.Type) -> Bool {
+    return (a is B.Type)
+  }
+  struct Apple: Fruit {}
+  expectFalse(check(a: Apple.self, b: Fruit.self))
+  expectFalse(Apple.self is Fruit.Protocol)
+  expectTrue(Apple.self is Fruit.Type)
+}
+
+CastsTests.test("Cast failure for Any! holding Error struct [SR-8964]") {
+  struct MyError: Error {}
+  let a: Any! = MyError()
+  let b: Any = a
+  expectTrue(b is Error)
+}
+
+CastsTests.test("Cannot cast from Any? to Existential [SR-1999]") {
+  let a = Float(1) as Any as? Float
+  expectNotNil(a)
+
+  let b = Float(1) as Any as? CustomStringConvertible
+  expectNotNil(b)
+
+  let c = Optional.some(Float(1)) as Any as? Float
+  expectNotNil(c)
+
+  let d = Optional.some(Float(1)) as Any as? CustomStringConvertible
+  expectNotNil(d)
+}
+
+protocol A {}
+CastsTests.test("Failing cast from Any to Optional<Protocol> [SR-6279]") {
+  struct B: A {}
+
+  // If we have an optional instance, stored as an `Any`
+  let b: A? = B()
+  let c = b as Any
+
+  // This fails to cast, should succeed.
+  let d = c as? A
+  expectNotNil(d)
+
+  // There is a workaround, but not ideal.
+  func cast<T, U>(_ t: T, to: U.Type) -> U? {
+    return t as? U
+  }
+  let f = cast(c, to: Any?.self) as? A
+  expectNotNil(f)
+}
+
+protocol SuperProtocol{}
+CastsTests.test("Casting Objects retained from KeyPaths to Protocols is not working properly") {
+  // This is the simplified reproduction from rdar://59844232 which doesn't
+  // actually use KeyPaths
+  class SubClass : SuperProtocol{}
+  let value = SubClass() as Any? as Any
+
+  expectNotNil(value as? SubClass)
+  expectNotNil(value as? SuperProtocol)
+}
+
+#if _runtime(_ObjC)
+// Known to still be broken, but we can document the issue here
+public protocol SomeProtocol {}
+extension NSString: SomeProtocol {}
+CastsTests.test("NSDictionary -> Dictionary casting [SR-12025]") {
+  // Create NSDictionary with one entry
+  var a = NSMutableDictionary()
+  a[NSString("key")] = NSString("value")
+
+  let v = NSString("value")
+  let v2 = v as? SomeProtocol
+  expectNotNil(v2)
+
+  // Test casting of the dictionary
+  let b = a as? [String:SomeProtocol]
+  expectFailure { expectNotNil(b) } // Expect non-nil, but see nil
+  let c = a as? [String:Any]
+  expectNotNil(c)  // Non-nil (as expected)
+  let d = c as? [String:SomeProtocol]
+  expectNotNil(d) // Non-nil (as expected)
+}
+#endif
+
+// Casting optionals to AnyHashable is a little peculiar
+// TODO: It would be nice if AnyHashable(Optional("Foo")) == AnyHashable("Foo")
+// (including as dictionary keys).  That would make this a lot less confusing.
+CastsTests.test("Optional cast to AnyHashable") {
+  let d: [String?: String] = ["FooKey": "FooValue", nil: "NilValue"]
+  // In Swift 5.3, this cast DOES unwrap the non-nil key
+  // We've deliberately tried to preserve that behavior in Swift 5.4
+  let d2 = d as [AnyHashable: String]
+
+  // After SR-9047, all four of the following should work:
+  let d3 = d2["FooKey" as String? as AnyHashable]
+  expectNil(d3)
+  let d4 = d2["FooKey" as String?]
+  expectNil(d4)
+  let d5 = d2["FooKey"]
+  expectNotNil(d5)
+  let d6 = d2["FooKey" as AnyHashable]
+  expectNotNil(d6)
+
+  // The nil key should be preserved and still function
+  let d7 = d2[String?.none as AnyHashable]
+  expectNotNil(d7)
+
+  // Direct casts via the runtime unwrap the optional
+  let a: String = "Foo"
+  let ah: AnyHashable = a
+  let b: String? = a
+  let bh = runtimeCast(b, to: AnyHashable.self)
+  expectEqual(bh, ah)
+
+  // Direct casts that don't go through the runtime don't unwrap the optional
+  // This is inconsistent with the runtime cast behavior above.  We should
+  // probably change the runtime behavior above to work the same as this,
+  // but that should wait until SR-9047 lands.
+  let x: String = "Baz"
+  let xh = x as AnyHashable
+  let y: String? = x
+  let yh = y as AnyHashable // Doesn't unwrap the optional
+  // xh is AnyHashable("Baz")
+  // yh is AnyHashable(Optional("Baz"))
+  expectNotEqual(xh, yh)
 }
 
 runAllTests()

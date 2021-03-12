@@ -23,7 +23,7 @@
 #include "swift/AST/FineGrainedDependencyFormat.h"
 #include "swift/AST/Types.h"
 #include "llvm/ADT/PointerEmbeddedInt.h"
-#include "llvm/Bitcode/RecordLayout.h"
+#include "llvm/Bitcode/BitcodeConvenience.h"
 #include "llvm/Bitstream/BitCodes.h"
 
 namespace swift {
@@ -56,7 +56,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 582; // sil specialize attribute module parameter
+const uint16_t SWIFTMODULE_VERSION_MINOR = 602; // noasync apply
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -237,10 +237,12 @@ using FunctionTypeRepresentationField = BCFixed<4>;
 // the module version.
 enum class DifferentiabilityKind : uint8_t {
   NonDifferentiable = 0,
+  Forward,
+  Reverse,
   Normal,
   Linear,
 };
-using DifferentiabilityKindField = BCFixed<2>;
+using DifferentiabilityKindField = BCFixed<3>;
 
 // These IDs must \em not be renumbered or reordered without incrementing the
 // module version.
@@ -787,7 +789,8 @@ namespace options_block {
     IS_TESTABLE,
     RESILIENCE_STRATEGY,
     ARE_PRIVATE_IMPORTS_ENABLED,
-    IS_IMPLICIT_DYNAMIC_ENABLED
+    IS_IMPLICIT_DYNAMIC_ENABLED,
+    IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED
   };
 
   using SDKPathLayout = BCRecordLayout<
@@ -820,6 +823,10 @@ namespace options_block {
   using ResilienceStrategyLayout = BCRecordLayout<
     RESILIENCE_STRATEGY,
     BCFixed<2>
+  >;
+
+  using IsAllowModuleWithCompilerErrorsEnabledLayout = BCRecordLayout<
+    IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED
   >;
 }
 
@@ -919,6 +926,17 @@ namespace decls_block {
     BCArray<BCVBR<6>>
   >;
 
+  /// A flag to mark a decl as being invalid
+  using ErrorFlagLayout = BCRecordLayout<
+    ERROR_FLAG
+  >;
+
+  /// A placeholder for invalid types
+  using ErrorTypeLayout = BCRecordLayout<
+    ERROR_TYPE,
+    TypeIDField // original type (if any)
+  >;
+
   using BuiltinAliasTypeLayout = BCRecordLayout<
     BUILTIN_ALIAS_TYPE,
     DeclIDField, // typealias decl
@@ -972,6 +990,7 @@ namespace decls_block {
     FunctionTypeRepresentationField, // representation
     ClangTypeIDField, // type
     BCFixed<1>,  // noescape?
+    BCFixed<1>,   // concurrent?
     BCFixed<1>,   // async?
     BCFixed<1>,   // throws?
     DifferentiabilityKindField // differentiability kind
@@ -1048,6 +1067,7 @@ namespace decls_block {
     GENERIC_FUNCTION_TYPE,
     TypeIDField,         // output
     FunctionTypeRepresentationField, // representation
+    BCFixed<1>,          // concurrent?
     BCFixed<1>,          // async?
     BCFixed<1>,          // throws?
     DifferentiabilityKindField, // differentiability kind
@@ -1058,6 +1078,7 @@ namespace decls_block {
 
   using SILFunctionTypeLayout = BCRecordLayout<
     SIL_FUNCTION_TYPE,
+    BCFixed<1>,                         // concurrent?
     BCFixed<1>,                         // async?
     SILCoroutineKindField, // coroutine kind
     ParameterConventionField, // callee convention
@@ -1192,6 +1213,7 @@ namespace decls_block {
     DeclContextIDField,     // context decl
     BCFixed<1>,             // implicit?
     BCFixed<1>,             // explicitly objc?
+    BCFixed<1>,             // Explicitly actor?
     BCFixed<1>,             // inherits convenience initializers from its superclass?
     BCFixed<1>,             // has missing designated initializers?
     GenericSignatureIDField, // generic environment
@@ -1753,6 +1775,15 @@ namespace decls_block {
     TypeIDField                       // result type
   >;
 
+  using ForeignAsyncConventionLayout = BCRecordLayout<
+    FOREIGN_ASYNC_CONVENTION,
+    TypeIDField, // completion handler type
+    BCVBR<4>,    // completion handler parameter index
+    BCVBR<4>,    // completion handler error parameter index (+1)
+    BCVBR<4>,    // completion handler error flag parameter index (+1)
+    BCFixed<1>   // completion handler error flag polarity
+  >;
+
   using AbstractClosureExprLayout = BCRecordLayout<
     ABSTRACT_CLOSURE_EXPR_CONTEXT,
     TypeIDField, // type
@@ -1807,6 +1838,11 @@ namespace decls_block {
     BCFixed<2>  // inline value
   >;
 
+  using ActorIndependentDeclAttrLayout = BCRecordLayout<
+    ActorIndependent_DECL_ATTR,
+    BCFixed<1>  // unsafe flag
+  >;
+
   using OptimizeDeclAttrLayout = BCRecordLayout<
     Optimize_DECL_ATTR,
     BCFixed<2>  // optimize value
@@ -1858,7 +1894,7 @@ namespace decls_block {
   using DifferentiableDeclAttrLayout = BCRecordLayout<
     Differentiable_DECL_ATTR,
     BCFixed<1>, // Implicit flag.
-    BCFixed<1>, // Linear flag.
+    DifferentiabilityKindField, // Differentiability kind.
     GenericSignatureIDField, // Derivative generic signature.
     BCArray<BCFixed<1>> // Differentiation parameter indices' bitvector.
   >;
@@ -1880,6 +1916,12 @@ namespace decls_block {
     IdentifierIDField, // Original name.
     DeclIDField, // Original function declaration.
     BCArray<BCFixed<1>> // Transposed parameter indices' bitvector.
+  >;
+
+  using HasAsyncAlternativeDeclAttrLayout = BCRecordLayout<
+    HasAsyncAlternative_DECL_ATTR,
+    BCFixed<1>,                // True if compound name
+    BCArray<IdentifierIDField> // Name and parameters
   >;
 
 #define SIMPLE_DECL_ATTR(X, CLASS, ...)         \
@@ -1906,9 +1948,9 @@ namespace decls_block {
   using CustomDeclAttrLayout = BCRecordLayout<
     Custom_DECL_ATTR,
     BCFixed<1>,  // implicit flag
-    TypeIDField // type referenced by this custom attribute
+    TypeIDField, // type referenced by this custom attribute
+    BCFixed<1>   // is the argument (unsafe)
   >;
-
 }
 
 /// Returns the encoding kind for the given decl.
@@ -1994,14 +2036,16 @@ namespace index_block {
     PRECEDENCE_GROUPS,
     NESTED_TYPE_DECLS,
     DECL_MEMBER_NAMES,
+    DECL_FINGERPRINTS,
 
     ORDERED_TOP_LEVEL_DECLS,
 
     SUBSTITUTION_MAP_OFFSETS,
     CLANG_TYPE_OFFSETS,
-    LastRecordKind = CLANG_TYPE_OFFSETS,
+    EXPORTED_PRESPECIALIZATION_DECLS,
+    LastRecordKind = EXPORTED_PRESPECIALIZATION_DECLS,
   };
-  
+
   constexpr const unsigned RecordIDFieldWidth = 5;
   static_assert(LastRecordKind < (1 << RecordIDFieldWidth),
                 "not enough bits for all record kinds");
@@ -2061,6 +2105,12 @@ namespace index_block {
   using OrderedDeclsLayout = BCGenericRecordLayout<
     RecordIDField,        // record ID
     BCArray<DeclIDField>  // list of decls by ID
+  >;
+
+  using DeclFingerprintsLayout = BCRecordLayout<
+    DECL_FINGERPRINTS, // record ID
+    BCVBR<16>,   // table offset within the blob (see below)
+    BCBlob       // map from member DeclIDs to strings
   >;
 }
 

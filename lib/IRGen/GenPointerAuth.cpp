@@ -71,9 +71,9 @@ llvm::Value *irgen::emitPointerAuthStrip(IRGenFunction &IGF,
 FunctionPointer irgen::emitPointerAuthResign(IRGenFunction &IGF,
                                              const FunctionPointer &fn,
                                           const PointerAuthInfo &newAuthInfo) {
-  llvm::Value *fnPtr = emitPointerAuthResign(IGF, fn.getPointer(),
+  llvm::Value *fnPtr = emitPointerAuthResign(IGF, fn.getRawPointer(),
                                              fn.getAuthInfo(), newAuthInfo);
-  return FunctionPointer(fnPtr, newAuthInfo, fn.getSignature());
+  return FunctionPointer(fn.getKind(), fnPtr, newAuthInfo, fn.getSignature());
 }
 
 llvm::Value *irgen::emitPointerAuthResign(IRGenFunction &IGF,
@@ -399,17 +399,6 @@ PointerAuthEntity::getDeclDiscriminator(IRGenModule &IGM) const {
     // trivial.
     assert(!constant.isForeign &&
            "discriminator for foreign declaration not supported yet!");
-
-    // Special case: methods that are witnesses to Actor.enqueue(partialTask:)
-    // have their own discriminator, which is shared across all actor classes.
-    if (constant.hasFuncDecl()) {
-      auto func = dyn_cast<FuncDecl>(constant.getFuncDecl());
-      if (func->isActorEnqueuePartialTaskWitness()) {
-        cache = IGM.getSize(
-            Size(SpecialPointerAuthDiscriminators::ActorEnqueuePartialTask));
-        return cache;
-      }
-    }
 
     auto mangling = constant.mangle();
     cache = getDiscriminatorForString(IGM, mangling);

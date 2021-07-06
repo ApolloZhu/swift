@@ -1788,12 +1788,12 @@ bool ClangImporter::canImportModule(ImportPath::Module modulePath,
     return false;
   }
 
-  auto &ctx = Impl.getClangASTContext();
-  auto &lo = ctx.getLangOpts();
-  auto &ti = getTargetInfo();
   clang::Module::Requirement r;
   clang::Module::UnresolvedHeaderDirective mh;
   clang::Module *m;
+  auto &ctx = Impl.getClangASTContext();
+  auto &lo = ctx.getLangOpts();
+  auto &ti = getTargetInfo();
 
   auto available = clangModule->isAvailable(lo, ti, r, mh, m);
   if (!available)

@@ -351,7 +351,6 @@ private:
   /// Cache of module names that fail the 'canImport' test in this context.
   mutable llvm::StringSet<> FailedModuleImportNames;
 
-
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;

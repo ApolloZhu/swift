@@ -1779,7 +1779,7 @@ std::error_code ExplicitSwiftModuleLoader::findModuleFilesInDirectory(
 }
 
 bool ExplicitSwiftModuleLoader::canImportModule(
-  ImportPath::Module path, llvm::VersionTuple version, bool underlyingVersion) {
+    ImportPath::Module path, llvm::VersionTuple version, bool underlyingVersion) {
   // FIXME: Swift submodules?
   ImportPath::Element mID = path.front();
   StringRef moduleName = mID.Item.str();

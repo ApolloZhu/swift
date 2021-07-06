@@ -66,12 +66,18 @@ class ModuleFileSharedCore {
   /// The Swift compatibility version in use when this module was built.
   version::Version CompatibilityVersion;
 
+  /// User-defined module version number.
+  llvm::VersionTuple UserModuleVersion;
+
   /// The data blob containing all of the module's identifiers.
   StringRef IdentifierData;
 
   /// Full blob from the misc. version field of the metadata block. This should
   /// include the version string of the compiler that built the module.
   StringRef MiscVersion;
+
+  /// The module ABI name.
+  StringRef ModuleABIName;
 
   /// \c true if this module has incremental dependency information.
   bool HasIncrementalInfo = false;
@@ -320,6 +326,9 @@ private:
     /// Whether this module file is actually a .sib file.
     unsigned IsSIB: 1;
 
+    /// Whether this module is compiled as static library.
+    unsigned IsStaticLibrary: 1;
+
     /// Whether this module file is compiled with '-enable-testing'.
     unsigned IsTestable : 1;
 
@@ -362,12 +371,12 @@ private:
 
   /// Emits one last diagnostic, logs the error, and then aborts for the stack
   /// trace.
-  LLVM_ATTRIBUTE_NORETURN static void fatal(llvm::Error error);
-  void fatalIfNotSuccess(llvm::Error error) {
+  LLVM_ATTRIBUTE_NORETURN void fatal(llvm::Error error) const;
+  void fatalIfNotSuccess(llvm::Error error) const {
     if (error)
       fatal(std::move(error));
   }
-  template <typename T> T fatalIfUnexpected(llvm::Expected<T> expected) {
+  template <typename T> T fatalIfUnexpected(llvm::Expected<T> expected) const {
     if (expected)
       return std::move(expected.get());
     fatal(expected.takeError());
@@ -499,6 +508,9 @@ public:
     return info;
   }
 
+  /// Outputs information useful for diagnostics to \p out
+  void outputDiagnosticInfo(llvm::raw_ostream &os) const;
+  
   // Out of line to avoid instantiation OnDiskChainedHashTable here.
   ~ModuleFileSharedCore();
 
@@ -515,6 +527,13 @@ public:
   /// Returns \c true if this module file contains a section with incremental
   /// information.
   bool hasIncrementalInfo() const { return HasIncrementalInfo; }
+
+  /// Returns \c true if a corresponding .swiftsourceinfo has been found.
+  bool hasSourceInfoFile() const { return !!ModuleSourceInfoInputBuffer; }
+
+  /// Returns \c true if a corresponding .swiftsourceinfo has been found *and
+  /// read*.
+  bool hasSourceInfo() const;
 };
 
 template <typename T, typename RawData>

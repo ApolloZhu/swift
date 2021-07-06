@@ -14,18 +14,16 @@
 #include "ModuleFileCoreTableInfo.h"
 #include "BCReadingExtras.h"
 #include "DeserializationErrors.h"
+#include "swift/Basic/LangOptions.h"
 #include "swift/Strings.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/OnDiskHashTable.h"
+#include "llvm/Support/PrettyStackTrace.h"
 
 using namespace swift;
 using namespace swift::serialization;
 using namespace llvm::support;
 using llvm::Expected;
-
-StringRef swift::getNameOfModule(const ModuleFileSharedCore *MF) {
-  return MF->getName();
-}
 
 static bool checkModuleSignature(llvm::BitstreamCursor &cursor,
                                  ArrayRef<unsigned char> signature) {
@@ -131,6 +129,9 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
       options_block::IsSIBLayout::readRecord(scratch, IsSIB);
       extendedInfo.setIsSIB(IsSIB);
       break;
+    case options_block::IS_STATIC_LIBRARY:
+      extendedInfo.setIsStaticLibrary(true);
+      break;
     case options_block::IS_TESTABLE:
       extendedInfo.setIsTestable(true);
       break;
@@ -147,6 +148,9 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
       break;
     case options_block::IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED:
       extendedInfo.setAllowModuleWithCompilerErrorsEnabled(true);
+      break;
+    case options_block::MODULE_ABI_NAME:
+      extendedInfo.setModuleABIName(blobData);
       break;
     default:
       // Unknown options record, possibly for use by a future version of the
@@ -248,7 +252,24 @@ validateControlBlock(llvm::BitstreamCursor &cursor,
       // These fields were added later; be resilient against their absence.
       switch (scratch.size()) {
       default:
-        // Add new cases here, in descending order.
+      // Add new cases here, in descending order.
+      case 8:
+      case 7:
+      case 6:
+      case 5: {
+        auto subMinor = 0;
+        auto build = 0;
+        // case 7 and 8 were added after case 5 and 6, so we need to have this
+        // special handling to make sure we can still load the module without
+        // case 7 and case 8 successfully.
+        if (scratch.size() >= 8) {
+          subMinor = scratch[6];
+          build = scratch[7];
+        }
+        result.userModuleVersion = llvm::VersionTuple(scratch[4], scratch[5],
+                                                      subMinor, build);
+        LLVM_FALLTHROUGH;
+      }
       case 4:
         if (scratch[3] != 0) {
           result.compatibilityVersion =
@@ -449,11 +470,29 @@ std::string ModuleFileSharedCore::Dependency::getPrettyPrintedPath() const {
   return output;
 }
 
-void ModuleFileSharedCore::fatal(llvm::Error error) {
-  logAllUnhandledErrors(std::move(error), llvm::errs(),
-                        "\n*** DESERIALIZATION FAILURE (please include this "
-                        "section in any bug report) ***\n");
+void ModuleFileSharedCore::fatal(llvm::Error error) const {
+  llvm::SmallString<0> errorStr;
+  llvm::raw_svector_ostream out(errorStr);
+
+  out << "*** DESERIALIZATION FAILURE ***\n";
+  outputDiagnosticInfo(out);
+  out << "\n";
+  if (error) {
+    handleAllErrors(std::move(error), [&](const llvm::ErrorInfoBase &ei) {
+      ei.log(out);
+      out << "\n";
+    });
+  }
+
+  llvm::PrettyStackTraceString trace(errorStr.c_str());
   abort();
+}
+
+void ModuleFileSharedCore::outputDiagnosticInfo(llvm::raw_ostream &os) const {
+  os << "module '" << Name << "' with full misc version '" << MiscVersion
+      << "'";
+  if (Bits.IsAllowModuleWithCompilerErrorsEnabled)
+    os << " (built with -experimental-allow-module-with-compiler-errors)";
 }
 
 ModuleFileSharedCore::~ModuleFileSharedCore() { }
@@ -1169,14 +1208,17 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       Name = info.name;
       TargetTriple = info.targetTriple;
       CompatibilityVersion = info.compatibilityVersion;
+      UserModuleVersion = info.userModuleVersion;
       Bits.ArePrivateImportsEnabled = extInfo.arePrivateImportsEnabled();
       Bits.IsSIB = extInfo.isSIB();
+      Bits.IsStaticLibrary = extInfo.isStaticLibrary();
       Bits.IsTestable = extInfo.isTestable();
       Bits.ResilienceStrategy = unsigned(extInfo.getResilienceStrategy());
       Bits.IsImplicitDynamicEnabled = extInfo.isImplicitDynamicEnabled();
       Bits.IsAllowModuleWithCompilerErrorsEnabled =
           extInfo.isAllowModuleWithCompilerErrorsEnabled();
       MiscVersion = info.miscVersion;
+      ModuleABIName = extInfo.getModuleABIName();
 
       hasValidControlBlock = true;
       break;
@@ -1485,4 +1527,8 @@ ModuleFileSharedCore::ModuleFileSharedCore(
     info.status = error(Status::MalformedDocumentation);
     return;
   }
+}
+
+bool ModuleFileSharedCore::hasSourceInfo() const {
+  return !!DeclUSRsTable;
 }

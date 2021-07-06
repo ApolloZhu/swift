@@ -262,7 +262,10 @@ static Flags getMethodDescriptorFlags(ValueDecl *fn) {
     }
     llvm_unreachable("bad kind");
   }();
-  return Flags(kind).withIsInstance(!fn->isStatic());
+  bool hasAsync = false;
+  if (auto *afd = dyn_cast<AbstractFunctionDecl>(fn))
+    hasAsync = afd->hasAsync();
+  return Flags(kind).withIsInstance(!fn->isStatic()).withIsAsync(hasAsync);
 }
 
 static void buildMethodDescriptorFields(IRGenModule &IGM,
@@ -279,7 +282,9 @@ static void buildMethodDescriptorFields(IRGenModule &IGM,
     flags = flags.withIsDynamic(true);
 
   // Include the pointer-auth discriminator.
-  if (auto &schema = IGM.getOptions().PointerAuth.SwiftClassMethods) {
+  if (auto &schema = func->hasAsync()
+                         ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
+                         : IGM.getOptions().PointerAuth.SwiftClassMethods) {
     auto discriminator =
       PointerAuthInfo::getOtherDiscriminator(IGM, schema, fn);
     flags = flags.withExtraDiscriminator(discriminator->getZExtValue());
@@ -492,7 +497,7 @@ namespace {
     }
     
     void addName() {
-      B.addRelativeAddress(IGM.getAddrOfGlobalString(M->getName().str(),
+      B.addRelativeAddress(IGM.getAddrOfGlobalString(M->getABIName().str(),
                                            /*willBeRelativelyAddressed*/ true));
     }
     
@@ -911,6 +916,10 @@ namespace {
         if (!entry.isValid() || entry.getKind() != SILWitnessTable::Method ||
             entry.getMethodWitness().Requirement != func)
           continue;
+        auto silFunc = entry.getMethodWitness().Witness;
+        if (silFunc->isAsync()) {
+          return IGM.getAddrOfAsyncFunctionPointer(silFunc);
+        }
         return IGM.getAddrOfSILFunction(entry.getMethodWitness().Witness,
                                         NotForDefinition);
       }
@@ -1614,6 +1623,13 @@ namespace {
 
         if (MetadataLayout->hasResilientSuperclass())
           flags.class_setHasResilientSuperclass(true);
+
+        if (getType()->isActor())
+          flags.class_setIsActor(true);
+
+        if (getType()->isDefaultActor(IGM.getSwiftModule(),
+                                      ResilienceExpansion::Maximal))
+          flags.class_setIsDefaultActor(true);
       }
 
       if (ResilientSuperClassRef) {
@@ -2934,6 +2950,7 @@ namespace {
                                  swift::irgen::ConstantReference::Direct);
       }
       }
+      llvm_unreachable("covered switch");
     }
 
     void addValueWitnessTable() {
@@ -2992,6 +3009,7 @@ namespace {
       case ClassMetadataStrategy::Fixed:
         return false;
       }
+      llvm_unreachable("covered switch");
     }
 
     void addSuperclass() {
@@ -3159,6 +3177,7 @@ namespace {
       // Find the vtable entry.
       assert(VTable && "no vtable?!");
       auto entry = VTable->getEntry(IGM.getSILModule(), fn);
+      auto *afd = cast<AbstractFunctionDecl>(fn.getDecl());
 
       // The class is fragile. Emit a direct reference to the vtable entry.
       llvm::Constant *ptr;
@@ -3172,11 +3191,19 @@ namespace {
       } else {
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
-        ptr = llvm::ConstantExpr::getBitCast(IGM.getDeletedMethodErrorFn(),
-                                             IGM.FunctionPtrTy);
+        if (afd->hasAsync()) {
+          ptr = llvm::ConstantExpr::getBitCast(
+              IGM.getDeletedAsyncMethodErrorAsyncFunctionPointer(),
+              IGM.FunctionPtrTy);
+        } else {
+          ptr = llvm::ConstantExpr::getBitCast(IGM.getDeletedMethodErrorFn(),
+                                               IGM.FunctionPtrTy);
+        }
       }
 
-      auto &schema = IGM.getOptions().PointerAuth.SwiftClassMethods;
+      PointerAuthSchema schema =
+          afd->hasAsync() ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
+                          : IGM.getOptions().PointerAuth.SwiftClassMethods;
       B.addSignedPointer(ptr, schema, fn);
     }
 
@@ -5138,8 +5165,13 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Differentiable:
   case KnownProtocolKind::FloatingPoint:
   case KnownProtocolKind::Actor:
-  case KnownProtocolKind::ConcurrentValue:
-  case KnownProtocolKind::UnsafeConcurrentValue:
+  case KnownProtocolKind::ActorTransport:
+  case KnownProtocolKind::DistributedActor:
+  case KnownProtocolKind::SerialExecutor:
+  case KnownProtocolKind::Sendable:
+  case KnownProtocolKind::UnsafeSendable:
+  case KnownProtocolKind::RangeReplaceableCollection:
+  case KnownProtocolKind::GlobalActor:
     return SpecialProtocol::None;
   }
 

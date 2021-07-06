@@ -26,10 +26,11 @@
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/RawComment.h"
 #include "swift/AST/USRGeneration.h"
-#include "swift/Demangling/Demangle.h"
+#include "swift/Basic/BasicSourceInfo.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/Basic/LLVMInitialize.h"
+#include "swift/Demangling/Demangle.h"
 #include "swift/Driver/FrontendUtil.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -265,6 +266,12 @@ static llvm::cl::list<std::string>
 BuildConfigs("D", llvm::cl::desc("Conditional compilation flags"),
              llvm::cl::cat(Category));
 
+static llvm::cl::opt<bool>
+ParseAsLibrary("parse-as-library",
+               llvm::cl::desc("Parse '-source-filename' as a library source file"),
+               llvm::cl::cat(Category),
+               llvm::cl::init(false));
+
 static llvm::cl::opt<std::string>
 SDK("sdk", llvm::cl::desc("path to the SDK to build against"),
     llvm::cl::cat(Category));
@@ -375,12 +382,6 @@ static llvm::cl::opt<bool> CodeCompleteCallPatternHeuristics(
 static llvm::cl::opt<bool>
 ObjCForwardDeclarations("enable-objc-forward-declarations",
     llvm::cl::desc("Import Objective-C forward declarations when possible"),
-    llvm::cl::cat(Category),
-    llvm::cl::init(false));
-
-static llvm::cl::opt<bool>
-InferImportAsMember("enable-infer-import-as-member",
-    llvm::cl::desc("Infer when a global could be imported as a member"),
     llvm::cl::cat(Category),
     llvm::cl::init(false));
 
@@ -756,6 +757,31 @@ static llvm::cl::opt<bool>
 EnableExperimentalConcurrency("enable-experimental-concurrency",
                               llvm::cl::desc("Enable experimental concurrency model"),
                               llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+DisableImplicitConcurrencyImport("disable-implicit-concurrency-module-import",
+                                 llvm::cl::desc("Disable implicit import of _Concurrency module"),
+                                 llvm::cl::init(false));
+
+static llvm::cl::opt<bool> EnableExperimentalOpaqueReturnTypes(
+    "enable-experimental-opaque-return-types",
+    llvm::cl::desc(
+        "Enable experimental extensions to opaque return type support"),
+    llvm::cl::Hidden, llvm::cl::cat(Category), llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+EnableExperimentalDistributed("enable-experimental-distributed",
+                              llvm::cl::desc("Enable experimental distributed actors and functions"),
+                              llvm::cl::init(false));
+
+static llvm::cl::list<std::string>
+AccessNotesPath("access-notes-path", llvm::cl::desc("Path to access notes file"),
+                llvm::cl::cat(Category));
+
+static llvm::cl::opt<bool>
+AllowCompilerErrors("allow-compiler-errors",
+                    llvm::cl::desc("Whether to attempt to continue despite compiler errors"),
+                    llvm::cl::init(false));
 
 } // namespace options
 
@@ -2511,6 +2537,7 @@ static int doPrintModuleGroups(const CompilerInvocation &InitInvok,
 
 static void printModuleMetadata(ModuleDecl *MD) {
   auto &OS = llvm::outs();
+  OS << "user module version: " << MD->getUserModuleVersion().getAsString() << "\n";
   OS << "fingerprint=" << MD->getFingerprint().getRawValue() << "\n";
   MD->collectLinkLibraries([&](LinkLibrary lib) {
     OS << "link library: " << lib.getName()
@@ -3043,30 +3070,16 @@ public:
     }
   }
 
-  void printSerializedLoc(Decl *D) {
-    auto moduleLoc = cast<FileUnit>(D->getDeclContext()->getModuleScopeContext())->
-      getBasicLocsForDecl(D);
-    if (!moduleLoc.hasValue())
-      return;
-    if (!moduleLoc->Loc.isValid())
-      return;
-    OS << moduleLoc->SourceFilePath
-       << ":" << moduleLoc->Loc.Line
-       << ":" << moduleLoc->Loc.Column << ": ";
-  }
-
   bool walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
       return true;
 
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
-      SourceLoc Loc = D->getLoc();
+      SourceLoc Loc = D->getLoc(/*SerializedOK=*/true);
       if (Loc.isValid()) {
         auto LineAndColumn = SM.getPresumedLineAndColumnForLoc(Loc);
         OS << SM.getDisplayNameForLoc(Loc)
            << ":" << LineAndColumn.first << ":" << LineAndColumn.second << ": ";
-      } else {
-        printSerializedLoc(D);
       }
       OS << Decl::getKindName(VD->getKind()) << "/";
       printDeclName(VD);
@@ -3079,13 +3092,11 @@ public:
       printDocComment(D);
       OS << "\n";
     } else if (isa<ExtensionDecl>(D)) {
-      SourceLoc Loc = D->getLoc();
+      SourceLoc Loc = D->getLoc(/*SerializedOK=*/true);
       if (Loc.isValid()) {
         auto LineAndColumn = SM.getPresumedLineAndColumnForLoc(Loc);
         OS << SM.getDisplayNameForLoc(Loc)
         << ":" << LineAndColumn.first << ":" << LineAndColumn.second << ": ";
-      } else {
-        printSerializedLoc(D);
       }
       OS << Decl::getKindName(D->getKind()) << "/";
       OS << " ";
@@ -3854,12 +3865,20 @@ int main(int argc, char *argv[]) {
   if (options::EnableExperimentalConcurrency) {
     InitInvok.getLangOptions().EnableExperimentalConcurrency = true;
   }
+  if (options::DisableImplicitConcurrencyImport) {
+    InitInvok.getLangOptions().DisableImplicitConcurrencyModuleImport = true;
+  }
+  if (options::EnableExperimentalOpaqueReturnTypes) {
+    InitInvok.getLangOptions().EnableExperimentalOpaqueReturnTypes = true;
+  }
 
-  // We disable source location resolutions from .swiftsourceinfo files by
-  // default to match sourcekitd-test's and ide clients' expected behavior
-  // (passing optimize-for-ide in the global configuration request).
-  if (!options::EnableSwiftSourceInfo)
-    InitInvok.getFrontendOptions().IgnoreSwiftSourceInfo = true;
+  if (options::EnableExperimentalDistributed) {
+    // distributed implies concurrency features:
+    InitInvok.getLangOptions().EnableExperimentalConcurrency = true;
+    // enable 'distributed' parsing and features
+    InitInvok.getLangOptions().EnableExperimentalDistributed = true;
+  }
+
   if (!options::Triple.empty())
     InitInvok.setTargetTriple(options::Triple);
   if (!options::SwiftVersion.empty()) {
@@ -3877,6 +3896,14 @@ int main(int argc, char *argv[]) {
     // Honor the *last* -module-cache-path specified.
     InitInvok.getClangImporterOptions().ModuleCachePath =
         options::ModuleCachePath[options::ModuleCachePath.size()-1];
+  }
+  if (!options::AccessNotesPath.empty()) {
+    InitInvok.getFrontendOptions().AccessNotesPath =
+        options::AccessNotesPath[options::AccessNotesPath.size()-1];
+  }
+  if (options::ParseAsLibrary) {
+    InitInvok.getFrontendOptions().InputMode =
+        swift::FrontendOptions::ParseInputMode::SwiftLibrary;
   }
   InitInvok.getClangImporterOptions().PrecompiledHeaderOutputDir =
     options::PCHOutputDir;
@@ -3901,14 +3928,10 @@ int main(int argc, char *argv[]) {
       options::CodeCompleteInitsInPostfixExpr;
   InitInvok.getLangOptions().CodeCompleteCallPatternHeuristics |=
       options::CodeCompleteCallPatternHeuristics;
-  InitInvok.getLangOptions().InferImportAsMember |=
-    options::InferImportAsMember;
   InitInvok.getLangOptions().EnableSwift3ObjCInference =
     options::EnableSwift3ObjCInference;
   InitInvok.getClangImporterOptions().ImportForwardDeclarations |=
     options::ObjCForwardDeclarations;
-  InitInvok.getClangImporterOptions().InferImportAsMember |=
-    options::InferImportAsMember;
   if (!options::ResourceDir.empty()) {
     InitInvok.setRuntimeResourcePath(options::ResourceDir);
   }
@@ -3930,6 +3953,12 @@ int main(int argc, char *argv[]) {
       options::ExplicitSwiftModuleMap;
     InitInvok.getFrontendOptions().DisableImplicitModules = true;
   }
+
+  if (options::AllowCompilerErrors) {
+    InitInvok.getFrontendOptions().AllowModuleWithCompilerErrors = true;
+    InitInvok.getLangOptions().AllowModuleWithCompilerErrors = true;
+  }
+
   // Process the clang arguments last and allow them to override previously
   // set options.
   if (!CCArgs.empty()) {

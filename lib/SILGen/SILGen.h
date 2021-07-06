@@ -86,8 +86,6 @@ public:
   /// Set of delayed conformances that have already been forced.
   llvm::DenseSet<NormalProtocolConformance *> forcedConformances;
 
-  SILFunction *emitTopLevelFunction(SILLocation Loc);
-
   size_t anonymousSymbolCounter = 0;
 
   Optional<SILDeclRef> StringToNSStringFn;
@@ -119,7 +117,11 @@ public:
 
   Optional<ProtocolConformance *> NSErrorConformanceToError;
 
-  Optional<FuncDecl*> RunChildTask;
+  Optional<FuncDecl*> AsyncLetStart;
+  Optional<FuncDecl*> AsyncLetGet;
+  Optional<FuncDecl*> AsyncLetGetThrowing;
+  Optional<FuncDecl*> EndAsyncLet;
+
   Optional<FuncDecl*> TaskFutureGet;
   Optional<FuncDecl*> TaskFutureGetThrowing;
 
@@ -127,7 +129,7 @@ public:
   Optional<FuncDecl*> ResumeUnsafeContinuation;
   Optional<FuncDecl*> ResumeUnsafeThrowingContinuation;
   Optional<FuncDecl*> ResumeUnsafeThrowingContinuationWithError;
-  Optional<FuncDecl*> RunAsyncHandler;
+  Optional<FuncDecl*> CheckExpectedExecutor;
 
 public:
   SILGenModule(SILModule &M, ModuleDecl *SM);
@@ -173,7 +175,8 @@ public:
                                            CanSILFunctionType thunkType,
                                            CanSILFunctionType fromType,
                                            CanSILFunctionType toType,
-                                           CanType dynamicSelfType);
+                                           CanType dynamicSelfType,
+                                           CanType fromGlobalActor);
   
   /// Get or create the declaration of a completion handler block
   /// implementation function for an ObjC API that was imported
@@ -238,7 +241,7 @@ public:
   /// - The last result in the returned pullback.
   SILFunction *getOrCreateCustomDerivativeThunk(
       AbstractFunctionDecl *originalAFD, SILFunction *originalFn,
-      SILFunction *customDerivativeFn, AutoDiffConfig config,
+      SILFunction *customDerivativeFn, const AutoDiffConfig &config,
       AutoDiffDerivativeFunctionKind kind);
 
   /// Get or create a derivative function vtable entry thunk for the given
@@ -324,6 +327,9 @@ public:
 
   /// Emits a thunk from a Swift function to the native Swift convention.
   void emitNativeToForeignThunk(SILDeclRef thunk);
+
+  /// Emits a thunk from an actor function to a potentially distributed call.
+  void emitDistributedThunk(SILDeclRef thunk);
   
   void preEmitFunction(SILDeclRef constant, SILFunction *F, SILLocation L);
   void postEmitFunction(SILDeclRef constant, SILFunction *F);
@@ -447,6 +453,10 @@ public:
 #define FUNC_DECL(NAME, ID) \
   FuncDecl *get##NAME(SILLocation loc);
 #include "swift/AST/KnownDecls.def"
+
+#define KNOWN_SDK_FUNC_DECL(MODULE, NAME, ID) \
+  FuncDecl *get##NAME(SILLocation loc);
+#include "swift/AST/KnownSDKDecls.def"
   
   /// Retrieve the _ObjectiveCBridgeable protocol definition.
   ProtocolDecl *getObjectiveCBridgeable(SILLocation loc);
@@ -481,8 +491,14 @@ public:
   /// Retrieve the conformance of NSError to the Error protocol.
   ProtocolConformance *getNSErrorConformanceToError();
 
-  /// Retrieve the _Concurrency._runChildTask intrinsic.
-  FuncDecl *getRunChildTask();
+  /// Retrieve the _Concurrency._asyncLetStart intrinsic.
+  FuncDecl *getAsyncLetStart();
+  /// Retrieve the _Concurrency._asyncLetGet intrinsic.
+  FuncDecl *getAsyncLetGet();
+  /// Retrieve the _Concurrency._asyncLetGetThrowing intrinsic.
+  FuncDecl *getAsyncLetGetThrowing();
+  /// Retrieve the _Concurrency._asyncLetEnd intrinsic.
+  FuncDecl *getEndAsyncLet();
 
   /// Retrieve the _Concurrency._taskFutureGet intrinsic.
   FuncDecl *getTaskFutureGet();
@@ -496,10 +512,10 @@ public:
   FuncDecl *getResumeUnsafeThrowingContinuation();
   /// Retrieve the _Concurrency._resumeUnsafeThrowingContinuationWithError intrinsic.
   FuncDecl *getResumeUnsafeThrowingContinuationWithError();
-  /// Retrieve the _Concurrency._runAsyncHandler intrinsic.
-  FuncDecl *getRunAsyncHandler();
   /// Retrieve the _Concurrency._runTaskForBridgedAsyncMethod intrinsic.
   FuncDecl *getRunTaskForBridgedAsyncMethod();
+  /// Retrieve the _Concurrency._checkExpectedExecutor intrinsic.
+  FuncDecl *getCheckExpectedExecutor();
 
   SILFunction *getKeyPathProjectionCoroutine(bool isReadAccess,
                                              KeyPathTypeKind typeKind);

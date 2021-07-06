@@ -108,6 +108,7 @@ toStableDifferentiabilityKind(swift::DifferentiabilityKind kind) {
   case swift::DifferentiabilityKind::Linear:
     return (unsigned)serialization::DifferentiabilityKind::Linear;
   }
+  llvm_unreachable("covered switch");
 }
 
 namespace {
@@ -1381,6 +1382,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::BeginCOWMutationInst:
   case SILInstructionKind::EndCOWMutationInst:
   case SILInstructionKind::HopToExecutorInst:
+  case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::AbortApplyInst:
   case SILInstructionKind::EndApplyInst:
   case SILInstructionKind::ReturnInst:
@@ -1402,6 +1404,8 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
       Attr = unsigned(SILValue(UOCI).getOwnershipKind());
     } else if (auto *IEC = dyn_cast<IsEscapingClosureInst>(&SI)) {
       Attr = IEC->getVerificationType();
+    } else if (auto *HTE = dyn_cast<HopToExecutorInst>(&SI)) {
+      Attr = HTE->isMandatory();
     } else if (auto *DVI = dyn_cast<DestroyValueInst>(&SI)) {
       Attr = DVI->poisonRefs();
     } else if (auto *BCMI = dyn_cast<BeginCOWMutationInst>(&SI)) {

@@ -1,10 +1,24 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2021 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+
 import Swift
 
+@available(SwiftStdlib 5.5, *)
 @_silgen_name("swift_continuation_logFailedCheck")
 internal func logFailedCheck(_ message: UnsafeRawPointer)
 
 /// Implementation class that holds the `UnsafeContinuation` instance for
 /// a `CheckedContinuation`.
+@available(SwiftStdlib 5.5, *)
 internal final class CheckedContinuationCanary {
   // The instance state is stored in tail-allocated raw memory, so that
   // we can atomically check the continuation state.
@@ -95,6 +109,7 @@ internal final class CheckedContinuationCanary {
 /// of `withCheckedContinuation` or `withCheckedThrowingContinuation` should be
 /// enough to obtain the extra checking without further source modification in
 /// most circumstances.
+@available(SwiftStdlib 5.5, *)
 public struct CheckedContinuation<T, E: Error> {
   private let canary: CheckedContinuationCanary
   
@@ -131,11 +146,11 @@ public struct CheckedContinuation<T, E: Error> {
   /// After `resume` enqueues the task, control is immediately returned to
   /// the caller. The task will continue executing when its executor is
   /// able to reschedule it.
-  public func resume(returning x: __owned T) {
+  public func resume(returning value: __owned T) {
     if let c: UnsafeContinuation<T, E> = canary.takeContinuation() {
-      c.resume(returning: x)
+      c.resume(returning: value)
     } else {
-      fatalError("SWIFT TASK CONTINUATION MISUSE: \(canary.function) tried to resume its continuation more than once, returning \(x)!\n")
+      fatalError("SWIFT TASK CONTINUATION MISUSE: \(canary.function) tried to resume its continuation more than once, returning \(value)!\n")
     }
   }
   
@@ -151,15 +166,16 @@ public struct CheckedContinuation<T, E: Error> {
   /// After `resume` enqueues the task, control is immediately returned to
   /// the caller. The task will continue executing when its executor is
   /// able to reschedule it.
-  public func resume(throwing x: __owned E) {
+  public func resume(throwing error: __owned E) {
     if let c: UnsafeContinuation<T, E> = canary.takeContinuation() {
-      c.resume(throwing: x)
+      c.resume(throwing: error)
     } else {
-      fatalError("SWIFT TASK CONTINUATION MISUSE: \(canary.function) tried to resume its continuation more than once, throwing \(x)!\n")
+      fatalError("SWIFT TASK CONTINUATION MISUSE: \(canary.function) tried to resume its continuation more than once, throwing \(error)!\n")
     }
   }
 }
 
+@available(SwiftStdlib 5.5, *)
 extension CheckedContinuation {
   /// Resume the task awaiting the continuation by having it either
   /// return normally or throw an error based on the state of the given
@@ -225,6 +241,7 @@ extension CheckedContinuation {
   }
 }
 
+@available(SwiftStdlib 5.5, *)
 public func withCheckedContinuation<T>(
     function: String = #function,
     _ body: (CheckedContinuation<T, Never>) -> Void
@@ -234,6 +251,7 @@ public func withCheckedContinuation<T>(
   }
 }
 
+@available(SwiftStdlib 5.5, *)
 public func withCheckedThrowingContinuation<T>(
     function: String = #function,
     _ body: (CheckedContinuation<T, Error>) -> Void

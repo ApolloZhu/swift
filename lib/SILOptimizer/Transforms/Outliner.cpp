@@ -26,7 +26,7 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/SIL/BasicBlockBits.h"
+#include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
@@ -306,6 +306,13 @@ CanSILFunctionType BridgedProperty::getOutlinedFunctionType(SILModule &M) {
   return FunctionType;
 }
 
+static void eraseBlock(SILBasicBlock *block) {
+  for (SILInstruction &inst : *block) {
+    inst.replaceAllUsesOfAllResultsWithUndef();
+  }
+  block->eraseFromParent();
+}
+
 std::pair<SILFunction *, SILBasicBlock::iterator>
 BridgedProperty::outline(SILModule &M) {
   // Get the function type.
@@ -362,14 +369,10 @@ BridgedProperty::outline(SILModule &M) {
     // Delete the outlined instructions/blocks.
     if (Release)
       Release->eraseFromParent();
-    OutlinedEntryBB->eraseInstructions();
-    OutlinedEntryBB->eraseFromParent();
-    switchInfo.NoneBB->eraseInstructions();
-    switchInfo.NoneBB->eraseFromParent();
-    switchInfo.SomeBB->eraseInstructions();
-    switchInfo.SomeBB->eraseFromParent();
-    OldMergeBB->eraseInstructions();
-    OldMergeBB->eraseFromParent();
+    eraseBlock(OutlinedEntryBB);
+    eraseBlock(switchInfo.NoneBB);
+    eraseBlock(switchInfo.SomeBB);
+    eraseBlock(OldMergeBB);
     return std::make_pair(nullptr, std::prev(StartBB->end()));
   }
 
@@ -904,14 +907,10 @@ void BridgedReturn::outline(SILFunction *Fun, ApplyInst *NewOutlinedCall) {
   // Outlined function already existed. Just delete instructions and wire up
   // blocks.
   if (!Fun) {
-    OutlinedEntryBB->eraseInstructions();
-    OutlinedEntryBB->eraseFromParent();
-    switchInfo.NoneBB->eraseInstructions();
-    switchInfo.NoneBB->eraseFromParent();
-    switchInfo.SomeBB->eraseInstructions();
-    switchInfo.SomeBB->eraseFromParent();
-    OldMergeBB->eraseInstructions();
-    OldMergeBB->eraseFromParent();
+    eraseBlock(OutlinedEntryBB);
+    eraseBlock(switchInfo.NoneBB);
+    eraseBlock(switchInfo.SomeBB);
+    eraseBlock(OldMergeBB);
     return;
   }
 
@@ -1234,7 +1233,7 @@ public:
 /// functions.
 bool tryOutline(SILOptFunctionBuilder &FuncBuilder, SILFunction *Fun,
                 SmallVectorImpl<SILFunction *> &FunctionsAdded) {
-  BasicBlockWorklist<128> Worklist(Fun->getEntryBlock());
+  BasicBlockWorklist Worklist(Fun->getEntryBlock());
   OutlinePatterns patterns(FuncBuilder);
   bool changed = false;
 

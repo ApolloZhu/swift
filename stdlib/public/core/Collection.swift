@@ -130,8 +130,8 @@ extension IndexingIterator: IteratorProtocol, Sequence {
   }
 }
 
-extension IndexingIterator: ConcurrentValue
-  where Elements: ConcurrentValue, Elements.Index: ConcurrentValue { }
+extension IndexingIterator: Sendable
+  where Elements: Sendable, Elements.Index: Sendable { }
 
 /// A sequence whose elements can be traversed multiple times,
 /// nondestructively, and accessed by an indexed subscript.
@@ -1042,6 +1042,18 @@ extension Collection where SubSequence == Slice<Self> {
     _failEarlyRangeCheck(bounds, bounds: startIndex..<endIndex)
     return Slice(base: self, bounds: bounds)
   }
+}
+
+extension Collection {
+  // This unavailable default implementation of `subscript(bounds: Range<_>)`
+  // prevents incomplete Collection implementations from satisfying the
+  // protocol through the use of the generic convenience implementation
+  // `subscript<R: RangeExpression>(r: R)`. If that were the case, at
+  // runtime the generic implementation would call itself
+  // in an infinite recursion because of the absence of a better option.
+  @available(*, unavailable)
+  @_alwaysEmitIntoClient
+  public subscript(bounds: Range<Index>) -> SubSequence { fatalError() }
 }
 
 extension Collection where SubSequence == Self {

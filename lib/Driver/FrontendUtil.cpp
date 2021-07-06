@@ -75,6 +75,8 @@ bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
   // CompilerInvocation may wish to remap inputs to source buffers.
   TheDriver.setCheckInputFilesExist(false);
 
+  TheDriver.setIsDummyDriverForFrontendInvocation(true);
+
   std::unique_ptr<llvm::opt::InputArgList> ArgList =
     TheDriver.parseArgStrings(ArrayRef<const char *>(Args).slice(1));
   if (Diags.hadAnyError())
@@ -99,7 +101,7 @@ bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
     return true;
 
   std::unique_ptr<Compilation> C =
-      TheDriver.buildCompilation(*TC, std::move(ArgList));
+      TheDriver.buildCompilation(*TC, std::move(ArgList), /*AllowErrors=*/true);
   if (!C || C->getJobs().empty())
     return true; // Don't emit an error; one should already have been emitted
 
@@ -111,7 +113,6 @@ bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
   if (CompileCommands.size() != 1) {
     // TODO: include Jobs in the diagnostic.
     Diags.diagnose(SourceLoc(), diag::error_expected_one_frontend_job);
-    return true;
   }
 
   const Job *Cmd = *CompileCommands.begin();

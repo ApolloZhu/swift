@@ -282,11 +282,11 @@ StepResult DependentComponentSplitterStep::take(bool prevFailed) {
     for (auto index : swift::indices(indices)) {
       dependsOnSolutions.push_back(&(*dependsOnSets[index])[indices[index]]);
     }
+    ContextualSolutions.push_back(std::make_unique<SmallVector<Solution, 2>>());
 
-    followup.push_back(
-        std::make_unique<ComponentStep>(CS, Index, Constraints, Component,
-                                         std::move(dependsOnSolutions),
-                                         Solutions));
+    followup.push_back(std::make_unique<ComponentStep>(
+        CS, Index, Constraints, Component, std::move(dependsOnSolutions),
+        *ContextualSolutions.back()));
   } while (nextCombination(dependsOnSetsRef, indices));
 
   /// Wait until all of the component steps are done.
@@ -294,6 +294,10 @@ StepResult DependentComponentSplitterStep::take(bool prevFailed) {
 }
 
 StepResult DependentComponentSplitterStep::resume(bool prevFailed) {
+  for (auto &ComponentStepSolutions : ContextualSolutions) {
+    Solutions.append(std::make_move_iterator(ComponentStepSolutions->begin()),
+                     std::make_move_iterator(ComponentStepSolutions->end()));
+  }
   return done(/*isSuccess=*/!Solutions.empty());
 }
 
@@ -538,8 +542,8 @@ StepResult DisjunctionStep::resume(bool prevFailed) {
 }
 
 bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
-                                          ValueDecl *declA,
-                                          ValueDecl *declB) const {
+                                         ValueDecl *declA,
+                                         ValueDecl *declB) const {
   auto *typeA = declA->getInterfaceType()->getAs<GenericFunctionType>();
   auto *typeB = declB->getInterfaceType()->getAs<GenericFunctionType>();
 
@@ -565,7 +569,7 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
         origType->getInterfaceType()->getCanonicalType()->getAs<SubstitutableType>();
 
     // Make sure any duplicate bindings are equal to the one already recorded.
-    // Otherwise, the substition has conflicting generic arguments.
+    // Otherwise, the substitution has conflicting generic arguments.
     auto bound = substMap.find(interfaceTy);
     if (bound != substMap.end() && !bound->second->isEqual(substType))
       return CanType();
@@ -578,8 +582,7 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
     return false;
 
   auto result = TypeChecker::checkGenericArguments(
-      declA->getDeclContext(), SourceLoc(), SourceLoc(), typeB,
-      genericSignatureB->getGenericParams(),
+      declA->getDeclContext()->getParentModule(),
       genericSignatureB->getRequirements(),
       QueryTypeSubstitutionMap{ substMap });
 
@@ -612,7 +615,7 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
 
   // Skip disabled overloads in the diagnostic mode if they do not have a
   // fix attached to them e.g. overloads where labels didn't match up.
-  if (choice.isDisabled() && !(CS.shouldAttemptFixes() && choice.hasFix()))
+  if (choice.isDisabled())
     return skip("disabled");
 
   // Skip unavailable overloads (unless in dignostic mode).
@@ -681,7 +684,8 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
           continue;
 
         for (auto *protocol : signature->getRequiredProtocols(paramType)) {
-          if (!TypeChecker::conformsToProtocol(argType, protocol, useDC))
+          if (!TypeChecker::conformsToProtocol(argType, protocol,
+                                               useDC->getParentModule()))
             return skip("unsatisfied");
         }
       }
@@ -696,8 +700,18 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
   //        already have a solution involving non-generic operators,
   //        but continue looking for a better non-generic operator
   //        solution.
-  if (shouldSkipGenericOperators() && choice.isGenericOperator()) {
-    return skip("generic");
+  if (BestNonGenericScore && choice.isGenericOperator()) {
+    auto &score = BestNonGenericScore->Data;
+
+    // Not all of the unary operators have `CGFloat` overloads,
+    // so in order to preserve previous behavior (and overall
+    // best solution) with implicit Double<->CGFloat conversion
+    // we need to allow attempting generic operators for such cases.
+    if (score[SK_ImplicitValueConversion] > 0 && choice.isUnaryOperator())
+      return false;
+
+    if (shouldSkipGenericOperators())
+      return skip("generic");
   }
 
   return false;

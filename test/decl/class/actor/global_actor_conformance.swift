@@ -42,15 +42,3 @@ class C1 : P1, P2 {
   @GenericGlobalActor<String> func asyncMethod2() async { }
   @GlobalActor func asyncMethod3() async { }
 }
-
-
-class C2: P1 {
-  typealias Assoc = Int
-
-  // Okay: we can ignore the mismatch in global actor types for 'asyncHandler'
-  // methods.
-  @asyncHandler func method1() { }
-  @asyncHandler func method2() { }
-  @asyncHandler func method3() { }
-  @asyncHandler func method4() { }
-}

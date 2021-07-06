@@ -65,6 +65,9 @@ public:
   /// It is turned off by default.
   bool EnableSpeculativeDevirtualization = false;
 
+  /// Controls whether to emit actor data-race checks.
+  bool EnableActorDataRaceChecks = false;
+
   /// Should we run any SIL performance optimizations
   ///
   /// Useful when you want to enable -O LLVM opts but not -O SIL opts.
@@ -142,7 +145,11 @@ public:
   /// Don't generate code using partial_apply in SIL generation.
   bool DisableSILPartialApply = false;
 
-  /// The name of the SIL outputfile if compiled with SIL debugging (-gsil).
+  /// Print debug information into the SIL file
+  bool PrintDebugInfo = false;
+
+  /// The name of the SIL outputfile if compiled with SIL debugging
+  /// (-sil-based-debuginfo).
   std::string SILOutputFileNameForDebugging;
 
   /// If set to true, compile with the SIL Ownership Model enabled.

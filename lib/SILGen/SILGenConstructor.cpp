@@ -12,6 +12,7 @@
 
 #include "ArgumentSource.h"
 #include "Conversion.h"
+#include "ExecutorBreadcrumb.h"
 #include "Initialization.h"
 #include "LValue.h"
 #include "RValue.h"
@@ -116,8 +117,8 @@ static RValue maybeEmitPropertyWrapperInitFromValue(
       !originalProperty->isPropertyMemberwiseInitializedWithWrappedType())
     return std::move(arg);
 
-  auto wrapperInfo = originalProperty->getPropertyWrapperBackingPropertyInfo();
-  if (!wrapperInfo || !wrapperInfo.hasInitFromWrappedValue())
+  auto initInfo = originalProperty->getPropertyWrapperInitializerInfo();
+  if (!initInfo.hasInitFromWrappedValue())
     return std::move(arg);
 
   return SGF.emitApplyOfPropertyWrapperBackingInitializer(loc, originalProperty,
@@ -245,8 +246,8 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
         // memberwise initialized and has an original wrapped value, apply
         // the property wrapper backing initializer.
         if (auto *wrappedVar = field->getOriginalWrappedProperty()) {
-          auto wrappedInfo = wrappedVar->getPropertyWrapperBackingPropertyInfo();
-          auto *placeholder = wrappedInfo.getWrappedValuePlaceholder();
+          auto initInfo = wrappedVar->getPropertyWrapperInitializerInfo();
+          auto *placeholder = initInfo.getWrappedValuePlaceholder();
           if (placeholder && placeholder->getOriginalWrappedValue()) {
             auto arg = SGF.emitRValue(placeholder->getOriginalWrappedValue());
             maybeEmitPropertyWrapperInitFromValue(SGF, Loc, field, subs,
@@ -290,8 +291,8 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
       // If this is a property wrapper backing storage var that isn't
       // memberwise initialized, use the original wrapped value if it exists.
       if (auto *wrappedVar = field->getOriginalWrappedProperty()) {
-        auto wrappedInfo = wrappedVar->getPropertyWrapperBackingPropertyInfo();
-        auto *placeholder = wrappedInfo.getWrappedValuePlaceholder();
+        auto initInfo = wrappedVar->getPropertyWrapperInitializerInfo();
+        auto *placeholder = initInfo.getWrappedValuePlaceholder();
         if (placeholder && placeholder->getOriginalWrappedValue()) {
           init = placeholder->getOriginalWrappedValue();
         }
@@ -350,12 +351,19 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
   SILValue selfLV = VarLocs[selfDecl].value;
 
   // Emit the prolog.
-  emitProlog(ctor->getParameters(),
-             /*selfParam=*/nullptr,
-             ctor->getResultInterfaceType(), ctor,
-             ctor->hasThrows(),
-             ctor->getThrowsLoc());
+  emitBasicProlog(ctor->getParameters(),
+                  /*selfParam=*/nullptr,
+                  ctor->getResultInterfaceType(), ctor,
+                  ctor->hasThrows(),
+                  ctor->getThrowsLoc());
   emitConstructorMetatypeArg(*this, ctor);
+
+  // Make sure we've hopped to the right global actor, if any.
+  if (ctor->hasAsync()) {
+    SILLocation prologueLoc(selfDecl);
+    prologueLoc.markAsPrologue();
+    emitConstructorPrologActorHop(prologueLoc, getActorIsolation(ctor));
+  }
 
   // Create a basic block to jump to for the implicit 'self' return.
   // We won't emit this until after we've emitted the body.
@@ -649,9 +657,8 @@ void SILGenFunction::emitClassConstructorAllocator(ConstructorDecl *ctor) {
   B.createReturn(ImplicitReturnLocation(Loc), initedSelfValue);
 }
 
-static void emitDefaultActorInitialization(SILGenFunction &SGF,
-                                           SILLocation loc,
-                                           ManagedValue self) {
+static void emitDefaultActorInitialization(
+    SILGenFunction &SGF, SILLocation loc, ManagedValue self) {
   auto &ctx = SGF.getASTContext();
   auto builtinName = ctx.getIdentifier(
     getBuiltinName(BuiltinValueKind::InitializeDefaultActor));
@@ -660,6 +667,33 @@ static void emitDefaultActorInitialization(SILGenFunction &SGF,
   FullExpr scope(SGF.Cleanups, CleanupLocation(loc));
   SGF.B.createBuiltin(loc, builtinName, resultTy, /*subs*/{},
                       { self.borrow(SGF, loc).getValue() });
+}
+
+static void emitDistributedRemoteActorInitialization(
+    SILGenFunction &SGF, SILLocation loc,
+    ManagedValue self,
+    bool addressArg, bool transportArg // FIXME: make those real arguments
+    ) {
+  auto &ctx = SGF.getASTContext();
+  auto builtinName = ctx.getIdentifier(
+    getBuiltinName(BuiltinValueKind::InitializeDistributedRemoteActor));
+  auto resultTy = SGF.SGM.Types.getEmptyTupleType();
+
+  FullExpr scope(SGF.Cleanups, CleanupLocation(loc));
+  SGF.B.createBuiltin(loc, builtinName, resultTy, /*subs*/{},
+                      { self.borrow(SGF, loc).getValue() });
+}
+
+void SILGenFunction::emitConstructorPrologActorHop(
+                                           SILLocation loc,
+                                           Optional<ActorIsolation> maybeIso) {
+  if (!maybeIso)
+    return;
+
+  if (auto executor = emitExecutor(loc, *maybeIso, None)) {
+    ExpectedExecutor = *executor;
+    B.createHopToExecutor(loc, *executor, /*mandatory*/ false);
+  }
 }
 
 void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
@@ -717,12 +751,19 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
 
   // Emit the prolog for the non-self arguments.
   // FIXME: Handle self along with the other body patterns.
-  uint16_t ArgNo = emitProlog(ctor->getParameters(), /*selfParam=*/nullptr,
-                              TupleType::getEmpty(F.getASTContext()), ctor,
-                              ctor->hasThrows(), ctor->getThrowsLoc());
+  uint16_t ArgNo = emitBasicProlog(ctor->getParameters(), /*selfParam=*/nullptr,
+                                   TupleType::getEmpty(F.getASTContext()), ctor,
+                                   ctor->hasThrows(), ctor->getThrowsLoc());
 
   SILType selfTy = getLoweredLoadableType(selfDecl->getType());
   ManagedValue selfArg = B.createInputFunctionArgument(selfTy, selfDecl);
+
+  // Make sure we've hopped to the right global actor, if any.
+  if (ctor->hasAsync() && !selfClassDecl->isActor()) {
+    SILLocation prologueLoc(selfDecl);
+    prologueLoc.markAsPrologue();
+    emitConstructorPrologActorHop(prologueLoc, getActorIsolation(ctor));
+  }
 
   if (!NeedsBoxForSelf) {
     SILLocation PrologueLoc(selfDecl);
@@ -735,7 +776,17 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
   if (selfClassDecl->isRootDefaultActor() && !isDelegating) {
     SILLocation PrologueLoc(selfDecl);
     PrologueLoc.markAsPrologue();
-    emitDefaultActorInitialization(*this, PrologueLoc, selfArg);
+
+    if (selfClassDecl->isDistributedActor() &&
+        ctor->isDistributedActorResolveInit()) {
+      auto addressArg  = false; // TODO: get the address argument
+      auto transportArg  = false; // TODO: get the transport argument
+      emitDistributedRemoteActorInitialization(*this, PrologueLoc,
+          selfArg, addressArg, transportArg);
+    } else {
+      // is normal (default) actor
+      emitDefaultActorInitialization(*this, PrologueLoc, selfArg);
+    }
   }
 
   if (!ctor->hasStubImplementation()) {
@@ -985,6 +1036,7 @@ emitMemberInit(SILGenFunction &SGF, VarDecl *selfDecl, Pattern *pattern) {
 #include "swift/AST/PatternNodes.def"
     llvm_unreachable("Refutable pattern in stored property pattern binding");
   }
+  llvm_unreachable("covered switch");
 }
 
 static std::pair<AbstractionPattern, CanType>
@@ -1090,10 +1142,22 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
         // abstraction level. To undo this, we use a converting
         // initialization and rely on the peephole that optimizes
         // out the redundant conversion.
-        auto loweredResultTy = getLoweredType(origType, substType);
-        auto loweredSubstTy = getLoweredType(substType);
+        SILType loweredResultTy;
+        SILType loweredSubstTy;
 
-        if (loweredResultTy != loweredSubstTy) {
+        // A converting initialization isn't necessary if the member is
+        // a property wrapper. Though the initial value can have a
+        // reabstractable type, the result of the initialization is
+        // always the property wrapper type, which is never reabstractable.
+        bool needsConvertingInit = false;
+        auto *singleVar = varPattern->getSingleVar();
+        if (!(singleVar && singleVar->getOriginalWrappedProperty())) {
+          loweredResultTy = getLoweredType(origType, substType);
+          loweredSubstTy = getLoweredType(substType);
+          needsConvertingInit = loweredResultTy != loweredSubstTy;
+        }
+
+        if (needsConvertingInit) {
           Conversion conversion = Conversion::getSubstToOrig(
               origType, substType,
               loweredResultTy);

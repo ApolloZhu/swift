@@ -90,7 +90,7 @@ cake: Var fixedLayoutStruct2.NoLongerWithFixedBinaryOrder is no longer a stored 
 /* Protocol Conformance Change */
 cake: Class C7 has added a conformance to an existing protocol P1
 cake: Class SuperClassChange has added a conformance to an existing protocol P1
-cake: Enum IceKind has removed conformance to ConcurrentValue
+cake: Enum IceKind has removed conformance to Sendable
 cake: Protocol P3 has added inherited protocol P4
 cake: Protocol P3 has removed inherited protocol P2
 cake: Struct fixedLayoutStruct has added a conformance to an existing protocol P2
@@ -107,6 +107,5 @@ cake: Var RequiementChanges.addedVar has been added as a protocol requirement
 /* Class Inheritance Change */
 cake: Class SubGenericClass has changed its super class from cake.GenericClass<cake.P1> to cake.GenericClass<cake.P2>
 cake: Class SuperClassRemoval has removed its super class cake.C3
-cake: Class SuperClassRemoval no longer inherits convenience inits from its superclass
 cake: Constructor AddingNewDesignatedInit.init(_:) has been added as a designated initializer to an open class
 cake: Constructor ClassWithMissingDesignatedInits.init() has been added as a designated initializer to an open class

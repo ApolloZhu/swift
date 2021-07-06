@@ -18,17 +18,22 @@
 #define SWIFT_SEMA_TYPECHECKCONCURRENCY_H
 
 #include "swift/AST/ConcreteDeclRef.h"
+#include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/Type.h"
 #include <cassert>
 
 namespace swift {
 
 class AbstractFunctionDecl;
+class ConstructorDecl;
 class ActorIsolation;
 class AnyFunctionType;
 class ASTContext;
 class ClassDecl;
+class ClosureActorIsolation;
+class ClosureExpr;
 class ConcreteDeclRef;
+class CustomAttr;
 class Decl;
 class DeclContext;
 class EnumElementDecl;
@@ -41,17 +46,29 @@ class TopLevelCodeDecl;
 class TypeBase;
 class ValueDecl;
 
-/// Add notes suggesting the addition of 'async' or '@asyncHandler', as
-/// appropriate, to a diagnostic for a function that isn't an async context.
+/// Add notes suggesting the addition of 'async', as appropriate,
+/// to a diagnostic for a function that isn't an async context.
 void addAsyncNotes(AbstractFunctionDecl const* func);
 
 /// Check actor isolation rules.
 void checkTopLevelActorIsolation(TopLevelCodeDecl *decl);
 void checkFunctionActorIsolation(AbstractFunctionDecl *decl);
+void checkActorConstructor(ClassDecl *decl, ConstructorDecl *ctor);
+void checkActorConstructorBody(ClassDecl *decl, ConstructorDecl *ctor, BraceStmt *body);
 void checkInitializerActorIsolation(Initializer *init, Expr *expr);
 void checkEnumElementActorIsolation(EnumElementDecl *element, Expr *expr);
 void checkPropertyWrapperActorIsolation(
     PatternBindingDecl *binding, Expr *expr);
+
+/// Determine the isolation of a particular closure.
+///
+/// This forwards to \c ActorIsolationChecker::determineClosureActorIsolation
+/// and thus assumes that enclosing closures have already had their isolation
+/// checked.
+///
+/// This does not set the closure's actor isolation
+ClosureActorIsolation
+determineClosureActorIsolation(AbstractClosureExpr *closure);
 
 /// Describes the kind of operation that introduced the concurrent refernece.
 enum class ConcurrentReferenceKind {
@@ -64,6 +81,8 @@ enum class ConcurrentReferenceKind {
   LocalCapture,
   /// Concurrent function
   ConcurrentFunction,
+  /// Nonisolated declaration.
+  Nonisolated,
 };
 
 /// The isolation restriction in effect for a given declaration that is
@@ -96,6 +115,10 @@ public:
     /// are permitted from elsewhere as a cross-actor reference, but
     /// contexts with unspecified isolation won't diagnose anything.
     GlobalActorUnsafe,
+
+    /// References to declarations that are part of a distributed actor are
+    /// only permitted if they are async.
+    DistributedActorSelf,
   };
 
 private:
@@ -125,11 +148,13 @@ public:
 
   /// Retrieve the actor type that the declaration is within.
   NominalTypeDecl *getActorType() const {
-    assert(kind == ActorSelf || kind == CrossActorSelf);
+    assert(kind == ActorSelf || 
+           kind == CrossActorSelf || 
+           kind == DistributedActorSelf);
     return data.actorType;
   }
 
-  /// Retrieve the actor class that the declaration is within.
+  /// Retrieve the actor that the declaration is within.
   Type getGlobalActor() const {
     assert(kind == GlobalActor || kind == GlobalActorUnsafe);
     return Type(data.globalActor);
@@ -155,6 +180,15 @@ public:
     return result;
   }
 
+  /// Accesses to the given declaration can only be made via the 'self' of
+  /// the current actor.
+  static ActorIsolationRestriction forDistributedActorSelf(
+      NominalTypeDecl *actor, bool isCrossActor) {
+    ActorIsolationRestriction result(DistributedActorSelf, isCrossActor);
+    result.data.actorType = actor;
+    return result;
+  }
+
   /// Accesses to the given declaration can only be made via this particular
   /// global actor or is a cross-actor access.
   static ActorIsolationRestriction forGlobalActor(
@@ -166,7 +200,12 @@ public:
   }
 
   /// Determine the isolation rules for a given declaration.
-  static ActorIsolationRestriction forDeclaration(ConcreteDeclRef declRef);
+  ///
+  /// \param fromExpression Indicates that the reference is coming from an
+  /// expression.
+  static ActorIsolationRestriction forDeclaration(
+      ConcreteDeclRef declRef, const DeclContext *fromDC,
+      bool fromExpression = true);
 
   operator Kind() const { return kind; };
 };
@@ -174,6 +213,10 @@ public:
 /// Check that the actor isolation of an override matches that of its
 /// overridden declaration.
 void checkOverrideActorIsolation(ValueDecl *value);
+
+/// Determine whether the given context uses concurrency features, such
+/// as async functions or actors.
+bool contextUsesConcurrencyFeatures(const DeclContext *dc);
 
 /// Diagnose the presence of any non-concurrent types when referencing a
 /// given declaration from a particular declaration context.
@@ -187,8 +230,8 @@ void checkOverrideActorIsolation(ValueDecl *value);
 /// domain, including the substitutions so that (e.g.) we can consider the
 /// specific types at the use site.
 ///
-/// \param dc The declaration context from which the reference occurs. This is
-/// used to perform lookup of conformances to the \c ConcurrentValue protocol.
+/// \param module The module from which the reference occurs. This is
+/// used to perform lookup of conformances to the \c Sendable protocol.
 ///
 /// \param loc The location at which the reference occurs, which will be
 /// used when emitting diagnostics.
@@ -198,29 +241,39 @@ void checkOverrideActorIsolation(ValueDecl *value);
 ///
 /// \returns true if an problem was detected, false otherwise.
 bool diagnoseNonConcurrentTypesInReference(
-    ConcreteDeclRef declRef, const DeclContext *dc, SourceLoc loc,
-    ConcurrentReferenceKind refKind);
+    ConcreteDeclRef declRef, ModuleDecl *module, SourceLoc loc,
+    ConcurrentReferenceKind refKind,
+    DiagnosticBehavior behavior = DiagnosticBehavior::Unspecified);
 
 /// How the concurrent value check should be performed.
-enum class ConcurrentValueCheck {
-  /// ConcurrentValue conformance was explicitly stated and should be
+enum class SendableCheck {
+  /// Sendable conformance was explicitly stated and should be
   /// fully checked.
   Explicit,
 
-  /// ConcurrentValue conformance was implied by one of the standard library
-  /// protocols that added ConcurrentValue after-the-fact.
+  /// Sendable conformance was implied by one of the standard library
+  /// protocols that added Sendable after-the-fact.
   ImpliedByStandardProtocol,
 
-  /// Implicit conformance to ConcurrentValue for structs and enums.
+  /// Implicit conformance to Sendable for structs and enums.
   Implicit,
 };
 
-/// Check the correctness of the given ConcurrentValue conformance.
+/// Given a set of custom attributes, pick out the global actor attributes
+/// and perform any necessary resolution and diagnostics, returning the
+/// global actor attribute and type it refers to (or \c None).
+Optional<std::pair<CustomAttr *, NominalTypeDecl *>>
+checkGlobalActorAttributes(
+    SourceLoc loc, DeclContext *dc, ArrayRef<CustomAttr *> attrs);
+/// Get the explicit global actor specified for a closure.
+
+Type getExplicitGlobalActor(ClosureExpr *closure);
+
+/// Check the correctness of the given Sendable conformance.
 ///
 /// \returns true if an error occurred.
-bool checkConcurrentValueConformance(
-    ProtocolConformance *conformance, ConcurrentValueCheck check);
-
+bool checkSendableConformance(
+    ProtocolConformance *conformance, SendableCheck check);
 } // end namespace swift
 
 #endif /* SWIFT_SEMA_TYPECHECKCONCURRENCY_H */

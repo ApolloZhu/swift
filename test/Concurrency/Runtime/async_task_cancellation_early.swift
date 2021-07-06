@@ -4,11 +4,16 @@
 // REQUIRES: concurrency
 // REQUIRES: libdispatch
 
+// rdar://76038845
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: back_deployment_runtime
+
 import Dispatch
 
-func test_runDetached_cancel_child_early() async {
-  print(#function) // CHECK: test_runDetached_cancel_child_early
-  let h: Task.Handle<Bool, Error> = Task.runDetached {
+@available(SwiftStdlib 5.5, *)
+func test_detach_cancel_child_early() async {
+  print(#function) // CHECK: test_detach_cancel_child_early
+  let h: Task<Bool, Error> = Task.detached {
     async let childCancelled: Bool = { () -> Bool in
       await Task.sleep(2_000_000_000)
       return Task.isCancelled
@@ -26,12 +31,13 @@ func test_runDetached_cancel_child_early() async {
 
   h.cancel()
   print("handle cancel")
-  let got = try! await h.get()
+  let got = try! await h.value
   print("was cancelled: \(got)") // CHECK: was cancelled: true
 }
 
+@available(SwiftStdlib 5.5, *)
 @main struct Main {
   static func main() async {
-    await test_runDetached_cancel_child_early()
+    await test_detach_cancel_child_early()
   }
 }

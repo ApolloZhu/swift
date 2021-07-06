@@ -423,6 +423,7 @@ module WinSDK [system] {
   module User {
     header "WinUser.h"
     export *
+    link "User32.Lib"
   }
 
   module WIC {
@@ -483,6 +484,13 @@ module WinSDK [system] {
     export *
 
     link "AdvAPI32.Lib"
+  }
+  
+  module WinUSB {
+    header "winusb.h"
+    export *
+    
+    link "winusb.lib"
   }
 
   // TODO(compnerd) does it make sense to implicitly export this API surface?

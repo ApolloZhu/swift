@@ -17,11 +17,17 @@
 #ifndef SWIFT_RUNTIME_CONCURRENCY_H
 #define SWIFT_RUNTIME_CONCURRENCY_H
 
+#include "swift/ABI/Task.h"
 #include "swift/ABI/TaskGroup.h"
+#include "swift/ABI/AsyncLet.h"
 #include "swift/ABI/TaskStatus.h"
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
 
 namespace swift {
 class DefaultActor;
+class TaskOptionRecord;
 
 struct SwiftError;
 
@@ -30,53 +36,26 @@ struct AsyncTaskAndContext {
   AsyncContext *InitialContext;
 };
 
-/// Create a task object with no future which will run the given
-/// function.
+/// Create a task object.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-AsyncTaskAndContext swift_task_create_f(JobFlags flags,
-                                        AsyncTask *parent,
-                             ThinNullaryAsyncSignature::FunctionType *function,
-                                        size_t initialContextSize);
+AsyncTaskAndContext swift_task_create(
+    size_t taskCreateFlags,
+    TaskOptionRecord *options,
+    const Metadata *futureResultType,
+    void *closureEntry, HeapObject *closureContext);
 
 /// Caution: not all future-initializing functions actually throw, so
 /// this signature may be incorrect.
 using FutureAsyncSignature =
   AsyncSignature<void(void*), /*throws*/ true>;
 
-/// Create a task object with a future which will run the given
-/// closure.
+/// Create a task object.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-AsyncTaskAndContext swift_task_create_future(
-    JobFlags flags, AsyncTask *parent, const Metadata *futureResultType,
-    void *closureEntryPoint,
-    HeapObject * /* +1 */ closureContext);
-
-/// Create a task object with a future which will run the given
-/// function.
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-AsyncTaskAndContext swift_task_create_future_f(
-    JobFlags flags, AsyncTask *parent, const Metadata *futureResultType,
-    FutureAsyncSignature::FunctionType *function,
-    size_t initialContextSize);
-
-/// Create a task object with a future which will run the given
-/// closure, and offer its result to the task group
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-AsyncTaskAndContext swift_task_create_group_future(
-    JobFlags flags,
-    AsyncTask *parent, TaskGroup *group,
+AsyncTaskAndContext swift_task_create_common(
+    size_t taskCreateFlags,
+    TaskOptionRecord *options,
     const Metadata *futureResultType,
-    void *closureEntryPoint,
-    HeapObject * /* +1 */ closureContext);
-
-/// Create a task object with a future which will run the given
-/// function, and offer its result to the task group
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-AsyncTaskAndContext swift_task_create_group_future_f(
-    JobFlags flags,
-    AsyncTask *parent, TaskGroup *group,
-    const Metadata *futureResultType,
-    FutureAsyncSignature::FunctionType *function,
+    FutureAsyncSignature::FunctionType *function, void *closureContext,
     size_t initialContextSize);
 
 /// Allocate memory in a task.
@@ -85,7 +64,7 @@ AsyncTaskAndContext swift_task_create_group_future_f(
 ///
 /// All allocations will be rounded to a multiple of MAX_ALIGNMENT.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void *swift_task_alloc(AsyncTask *task, size_t size);
+void *swift_task_alloc(size_t size);
 
 /// Deallocate memory in a task.
 ///
@@ -93,7 +72,7 @@ void *swift_task_alloc(AsyncTask *task, size_t size);
 /// this task that has not yet been deallocated; that is, memory
 /// must be allocated and deallocated in a strict stack discipline.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_dealloc(AsyncTask *task, void *ptr);
+void swift_task_dealloc(void *ptr);
 
 /// Cancel a task and all of its child tasks.
 ///
@@ -103,9 +82,9 @@ void swift_task_dealloc(AsyncTask *task, void *ptr);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_cancel(AsyncTask *task);
 
-/// Cancel all child tasks of `parent` that belong to the `group`.
+/// Cancel all the child tasks that belong to the `group`.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_cancel_group_child_tasks(AsyncTask *task, TaskGroup *group);
+void swift_task_cancel_group_child_tasks(TaskGroup *group);
 
 /// Escalate the priority of a task and all of its child tasks.
 ///
@@ -117,8 +96,8 @@ SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 JobPriority
 swift_task_escalate(AsyncTask *task, JobPriority newPriority);
 
-using TaskFutureWaitSignature =
-  AsyncSignature<void(AsyncTask *, OpaqueValue *), /*throws*/ false>;
+// TODO: "async let wait" and "async let destroy" would be expressed
+//       similar to like TaskFutureWait;
 
 /// Wait for a non-throwing future task to complete.
 ///
@@ -129,11 +108,10 @@ using TaskFutureWaitSignature =
 ///     -> Success
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swiftasync)
-TaskFutureWaitSignature::FunctionType
-swift_task_future_wait;
-
-using TaskFutureWaitThrowingSignature =
-  AsyncSignature<void(AsyncTask *, OpaqueValue *), /*throws*/ true>;
+void swift_task_future_wait(OpaqueValue *,
+         SWIFT_ASYNC_CONTEXT AsyncContext *, AsyncTask *,
+         TaskContinuationFunction *,
+         AsyncContext *);
 
 /// Wait for a potentially-throwing future task to complete.
 ///
@@ -144,11 +122,12 @@ using TaskFutureWaitThrowingSignature =
 ///    async throws -> Success
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swiftasync)
-TaskFutureWaitThrowingSignature::FunctionType
-swift_task_future_wait_throwing;
-
-using TaskGroupFutureWaitThrowingSignature =
-  AsyncSignature<void(AsyncTask *, TaskGroup *, Metadata *), /*throws*/ true>;
+void swift_task_future_wait_throwing(
+  OpaqueValue *,
+  SWIFT_ASYNC_CONTEXT AsyncContext *,
+  AsyncTask *,
+  ThrowingTaskFutureWaitContinuationFunction *,
+  AsyncContext *);
 
 /// Wait for a readyQueue of a Channel to become non empty.
 ///
@@ -157,25 +136,15 @@ using TaskGroupFutureWaitThrowingSignature =
 /// \code
 /// func swift_taskGroup_wait_next_throwing(
 ///     waitingTask: Builtin.NativeObject, // current task
-///     group: UnsafeRawPointer
+///     group: Builtin.RawPointer
 /// ) async -> T
 /// \endcode
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swiftasync)
-TaskGroupFutureWaitThrowingSignature::FunctionType
-swift_taskGroup_wait_next_throwing;
-
-/// Create a new `TaskGroup`.
-/// The caller is responsible for retaining and managing the group's lifecycle.
-///
-/// Its Swift signature is
-///
-/// \code
-/// func swift_taskGroup_create(
-///     _ task: Builtin.NativeObject
-/// ) -> Builtin.RawPointer
-/// \endcode
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-TaskGroup* swift_taskGroup_create(AsyncTask *task); // TODO: probably remove this call, and just use the initialize always
+SWIFT_EXPORT_FROM(swift_Concurrency)
+SWIFT_CC(swiftasync)
+void swift_taskGroup_wait_next_throwing(
+    OpaqueValue *resultPointer, SWIFT_ASYNC_CONTEXT AsyncContext *callerContext,
+    TaskGroup *group, ThrowingTaskFutureWaitContinuationFunction *resumeFn,
+    AsyncContext *callContext);
 
 /// Initialize a `TaskGroup` in the passed `group` memory location.
 /// The caller is responsible for retaining and managing the group's lifecycle.
@@ -183,13 +152,10 @@ TaskGroup* swift_taskGroup_create(AsyncTask *task); // TODO: probably remove thi
 /// Its Swift signature is
 ///
 /// \code
-/// func swift_taskGroup_initialize(
-///     _ task: Builtin.NativeObject,
-///     group: Builtin.RawPointer,
-/// )
+/// func swift_taskGroup_initialize(group: Builtin.RawPointer)
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_taskGroup_initialize(AsyncTask *task, TaskGroup *group);
+void swift_taskGroup_initialize(TaskGroup *group, const Metadata *T);
 
 /// Attach a child task to the parent task's task group record.
 ///
@@ -203,7 +169,6 @@ void swift_taskGroup_initialize(AsyncTask *task, TaskGroup *group);
 /// \code
 /// func swift_taskGroup_attachChild(
 ///     group: Builtin.RawPointer,
-///     parent: Builtin.NativeObject,
 ///     child: Builtin.NativeObject
 /// )
 /// \endcode
@@ -215,13 +180,10 @@ void swift_taskGroup_attachChild(TaskGroup *group, AsyncTask *child);
 /// This function MUST be called from the AsyncTask running the task group.
 ///
 /// \code
-/// func swift_taskGroup_destroy(
-///     _ task: Builtin.NativeObject,
-///     _ group: UnsafeRawPointer
-/// )
+/// func swift_taskGroup_destroy(_ group: Builtin.RawPointer)
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_taskGroup_destroy(AsyncTask *task, TaskGroup *group);
+void swift_taskGroup_destroy(TaskGroup *group);
 
 /// Before starting a task group child task, inform the group that there is one
 /// more 'pending' child to account for.
@@ -233,11 +195,12 @@ void swift_taskGroup_destroy(AsyncTask *task, TaskGroup *group);
 ///
 /// \code
 /// func swift_taskGroup_addPending(
-///     group: Builtin.RawPointer
+///     group: Builtin.RawPointer,
+///     unconditionally: Bool
 /// ) -> Bool
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-bool swift_taskGroup_addPending(TaskGroup *group);
+bool swift_taskGroup_addPending(TaskGroup *group, bool unconditionally);
 
 /// Cancel all tasks in the group.
 /// This also prevents new tasks from being added.
@@ -247,13 +210,10 @@ bool swift_taskGroup_addPending(TaskGroup *group);
 /// Its Swift signature is
 ///
 /// \code
-/// func swift_taskGroup_cancelAll(
-///     task: Builtin.NativeObject,
-///     group: UnsafeRawPointer
-/// )
+/// func swift_taskGroup_cancelAll(group: Builtin.RawPointer)
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_taskGroup_cancelAll(AsyncTask *task, TaskGroup *group);
+void swift_taskGroup_cancelAll(TaskGroup *group);
 
 /// Check ONLY if the group was explicitly cancelled, e.g. by `cancelAll`.
 ///
@@ -263,13 +223,10 @@ void swift_taskGroup_cancelAll(AsyncTask *task, TaskGroup *group);
 /// This can be called from any thread. Its Swift signature is
 ///
 /// \code
-/// func swift_taskGroup_isCancelled(
-///     task: Builtin.NativeObject,
-///     group: UnsafeRawPointer
-/// )
+/// func swift_taskGroup_isCancelled(group: Builtin.RawPointer)
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-bool swift_taskGroup_isCancelled(AsyncTask *task, TaskGroup *group);
+bool swift_taskGroup_isCancelled(TaskGroup *group);
 
 /// Check the readyQueue of a task group, return true if it has no pending tasks.
 ///
@@ -283,6 +240,79 @@ bool swift_taskGroup_isCancelled(AsyncTask *task, TaskGroup *group);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 bool swift_taskGroup_isEmpty(TaskGroup *group);
 
+/// Its Swift signature is
+///
+/// \code
+/// func swift_asyncLet_start<T>(
+///     asyncLet: Builtin.RawPointer,
+///     options: Builtin.RawPointer?,
+///     operation: __owned @Sendable () async throws -> T
+/// )
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_asyncLet_start(AsyncLet *alet,
+                          TaskOptionRecord *options,
+                          const Metadata *futureResultType,
+                          void *closureEntryPoint, HeapObject *closureContext);
+
+/// This matches the ABI of a closure `<T>(Builtin.RawPointer) async -> T`
+using AsyncLetWaitSignature =
+    SWIFT_CC(swiftasync)
+    void(OpaqueValue *,
+         SWIFT_ASYNC_CONTEXT AsyncContext *, AsyncTask *, Metadata *);
+
+/// Wait for a non-throwing async-let to complete.
+///
+/// This can be called from any thread. Its Swift signature is
+///
+/// \code
+/// func swift_asyncLet_wait(
+///     _ asyncLet: _owned Builtin.RawPointer
+/// ) async -> Success
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swiftasync)
+void swift_asyncLet_wait(OpaqueValue *,
+                         SWIFT_ASYNC_CONTEXT AsyncContext *,
+                         AsyncLet *, TaskContinuationFunction *,
+                         AsyncContext *);
+
+/// Wait for a potentially-throwing async-let to complete.
+///
+/// This can be called from any thread. Its Swift signature is
+///
+/// \code
+/// func swift_asyncLet_wait_throwing(
+///     _ asyncLet: _owned Builtin.RawPointer
+/// ) async throws -> Success
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swiftasync)
+void swift_asyncLet_wait_throwing(OpaqueValue *,
+                                  SWIFT_ASYNC_CONTEXT AsyncContext *,
+                                  AsyncLet *,
+                                  ThrowingTaskFutureWaitContinuationFunction *,
+                                  AsyncContext *);
+
+/// Its Swift signature is
+///
+/// \code
+/// func swift_asyncLet_end(_ alet: Builtin.RawPointer)
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_asyncLet_end(AsyncLet *alet);
+
+/// Returns true if the currently executing AsyncTask has a
+/// 'TaskGroupTaskStatusRecord' present.
+///
+/// This can be called from any thread.
+///
+/// Its Swift signature is
+///
+/// \code
+/// func swift_taskGroup_hasTaskGroupRecord()
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+bool swift_taskGroup_hasTaskGroupRecord();
+
 /// Add a status record to a task.  The record should not be
 /// modified while it is registered with a task.
 ///
@@ -291,8 +321,7 @@ bool swift_taskGroup_isEmpty(TaskGroup *group);
 /// If the task is already cancelled, returns `false` but still adds
 /// the status record.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-bool swift_task_addStatusRecord(AsyncTask *task,
-                                TaskStatusRecord *record);
+bool swift_task_addStatusRecord(TaskStatusRecord *record);
 
 /// Add a status record to a task if the task has not already
 /// been cancelled.   The record should not be modified while it is
@@ -303,8 +332,7 @@ bool swift_task_addStatusRecord(AsyncTask *task,
 /// If the task is already cancelled, returns `false` and does not
 /// add the status record.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-bool swift_task_tryAddStatusRecord(AsyncTask *task,
-                                   TaskStatusRecord *record);
+bool swift_task_tryAddStatusRecord(TaskStatusRecord *record);
 
 /// Remove a status record from a task.  After this call returns,
 /// the record's memory can be freely modified or deallocated.
@@ -314,10 +342,19 @@ bool swift_task_tryAddStatusRecord(AsyncTask *task,
 ///
 /// The given record need not be the last record added to
 /// the task, but the operation may be less efficient if not.
-///s
+///
 /// Returns false if the task has been cancelled.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-bool swift_task_removeStatusRecord(AsyncTask *task, TaskStatusRecord *record);
+bool swift_task_removeStatusRecord(TaskStatusRecord *record);
+
+/// Signifies whether the current task is in the middle of executing the
+/// operation block of a `with(Throwing)TaskGroup(...) { <operation> }`.
+///
+/// Task local values must use un-structured allocation for values bound in this
+/// scope, as they may be referred to by `group.spawn`-ed tasks and therefore
+/// out-life the scope of a task-local value binding.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+bool swift_task_hasTaskGroupStatusRecord();
 
 /// Attach a child task to its parent task and return the newly created
 /// `ChildTaskStatusRecord`.
@@ -325,12 +362,11 @@ bool swift_task_removeStatusRecord(AsyncTask *task, TaskStatusRecord *record);
 /// The record must be removed with by the parent invoking
 /// `swift_task_detachChild` when the child has completed.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-ChildTaskStatusRecord*
-swift_task_attachChild(AsyncTask *parent, AsyncTask *child);
+ChildTaskStatusRecord* swift_task_attachChild(AsyncTask *child);
 
 /// Remove a child task from the parent tracking it.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_detachChild(AsyncTask *parent, ChildTaskStatusRecord *record);
+void swift_task_detachChild(ChildTaskStatusRecord *record);
 
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 size_t swift_task_getJobFlags(AsyncTask* task);
@@ -342,60 +378,83 @@ bool swift_task_isCancelled(AsyncTask* task);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 CancellationNotificationStatusRecord*
 swift_task_addCancellationHandler(
-    AsyncTask *task, CancellationNotificationStatusRecord::FunctionType handler);
+    CancellationNotificationStatusRecord::FunctionType handler,
+    void *handlerContext);
 
 /// Remove the passed cancellation record from the task.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_removeCancellationHandler(
-    AsyncTask *task, CancellationNotificationStatusRecord *record);
+    CancellationNotificationStatusRecord *record);
 
-/// Get a task local value from the passed in task. Its Swift signature is
+/// Create a NullaryContinuationJob from a continuation.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+NullaryContinuationJob*
+swift_task_createNullaryContinuationJob(
+    size_t priority,
+    AsyncTask *continuation);
+
+/// Report error about attempting to bind a task-local value from an illegal context.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_task_reportIllegalTaskLocalBindingWithinWithTaskGroup(
+    const unsigned char *file, uintptr_t fileLength,
+    bool fileIsASCII, uintptr_t line);
+
+/// Get a task local value from either the current task, or fallback task-local
+/// storage.
+///
+/// Its Swift signature is
 ///
 /// \code
 /// func _taskLocalValueGet<Key>(
-///   _ task: Builtin.NativeObject,
-///   keyType: Any.Type /*Key.Type*/,
-///   inheritance: UInt8/*TaskLocalInheritance*/
+///   keyType: Any.Type /*Key.Type*/
 /// ) -> UnsafeMutableRawPointer? where Key: TaskLocalKey
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 OpaqueValue*
-swift_task_localValueGet(AsyncTask* task,
-                         const Metadata *keyType,
-                         TaskLocal::TaskLocalInheritance inheritance);
+swift_task_localValueGet(const HeapObject *key);
 
-/// Add a task local value to the passed in task.
-///
-/// This must be only invoked by the task itself to avoid concurrent writes.
+/// Bind a task local key to a value in the context of either the current
+/// AsyncTask if present, or in the thread-local fallback context if no task
+/// available.
 ///
 /// Its Swift signature is
 ///
 /// \code
 ///  public func _taskLocalValuePush<Value>(
-///    _ task: Builtin.NativeObject,
 ///    keyType: Any.Type/*Key.Type*/,
 ///    value: __owned Value
 ///  )
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_localValuePush(AsyncTask* task,
-                         const Metadata *keyType,
-                         /* +1 */ OpaqueValue *value,
-                         const Metadata *valueType);
+void swift_task_localValuePush(const HeapObject *key,
+                                   /* +1 */ OpaqueValue *value,
+                                   const Metadata *valueType);
 
-/// Remove task a local binding from the task local values stack.
+/// Pop a single task local binding from the binding stack of the current task,
+/// or the fallback thread-local storage if no task is available.
 ///
-/// This must be only invoked by the task itself to avoid concurrent writes.
+/// This operation must be paired up with a preceding "push" operation, as otherwise
+/// it may attempt to "pop" off an empty value stuck which will lead to a crash.
+///
+/// The Swift surface API ensures proper pairing of push and pop operations.
 ///
 /// Its Swift signature is
 ///
 /// \code
-///  public func _taskLocalValuePop(
-///    _ task: Builtin.NativeObject
-///  )
+///  public func _taskLocalValuePop()
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_localValuePop(AsyncTask* task);
+void swift_task_localValuePop();
+
+/// Copy all task locals from the current context to the target task.
+///
+/// Its Swift signature is
+///
+/// \code
+/// func _taskLocalValueGet<Key>(AsyncTask* task)
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_task_localsCopyTo(AsyncTask* target);
 
 /// This should have the same representation as an enum like this:
 ///    enum NearestTaskDeadline {
@@ -446,8 +505,8 @@ void swift_task_runAndBlockThread(const void *function,
 /// generally be tail-called, as it may continue executing the task
 /// synchronously if possible.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swiftasync)
-void swift_task_switch(AsyncTask *task,
-                       ExecutorRef currentExecutor,
+void swift_task_switch(SWIFT_ASYNC_CONTEXT AsyncContext *resumeToContext,
+                       TaskContinuationFunction *resumeFunction,
                        ExecutorRef newExecutor);
 
 /// Enqueue the given job to run asynchronously on the given executor.
@@ -474,23 +533,34 @@ void swift_task_enqueueGlobal(Job *job);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_enqueueGlobalWithDelay(unsigned long long delay, Job *job);
 
-/// FIXME: only exists for the quick-and-dirty MainActor implementation.
+/// Enqueue the given job on the main executor.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_enqueueMainExecutor(Job *job);
 
-/// FIXME: only exists for the quick-and-dirty MainActor implementation.
+/// Enqueue the given job on the main executor.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_MainActor_register(HeapObject *actor);
+void swift_task_enqueueOnDispatchQueue(Job *job, HeapObject *queue);
 
 /// A hook to take over global enqueuing.
-/// TODO: figure out a better abstraction plan than this.
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void (*swift_task_enqueueGlobal_hook)(Job *job);
+typedef SWIFT_CC(swift) void (*swift_task_enqueueGlobal_original)(Job *job);
+SWIFT_EXPORT_FROM(swift_Concurrency)
+SWIFT_CC(swift) void (*swift_task_enqueueGlobal_hook)(
+    Job *job, swift_task_enqueueGlobal_original original);
 
 /// A hook to take over global enqueuing with delay.
-/// TODO: figure out a better abstraction plan than this.
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void (*swift_task_enqueueGlobalWithDelay_hook)(unsigned long long delay, Job *job);
+typedef SWIFT_CC(swift) void (*swift_task_enqueueGlobalWithDelay_original)(
+    unsigned long long delay, Job *job);
+SWIFT_EXPORT_FROM(swift_Concurrency)
+SWIFT_CC(swift) void (*swift_task_enqueueGlobalWithDelay_hook)(
+    unsigned long long delay, Job *job,
+    swift_task_enqueueGlobalWithDelay_original original);
+
+/// A hook to take over main executor enqueueing.
+typedef SWIFT_CC(swift) void (*swift_task_enqueueMainExecutor_original)(
+    Job *job);
+SWIFT_EXPORT_FROM(swift_Concurrency)
+SWIFT_CC(swift) void (*swift_task_enqueueMainExecutor_hook)(
+    Job *job, swift_task_enqueueMainExecutor_original original);
 
 /// Initialize the runtime storage for a default actor.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
@@ -499,6 +569,22 @@ void swift_defaultActor_initialize(DefaultActor *actor);
 /// Destroy the runtime storage for a default actor.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_defaultActor_destroy(DefaultActor *actor);
+
+/// Deallocate an instance of a default actor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_defaultActor_deallocate(DefaultActor *actor);
+
+/// Deallocate an instance of what might be a default actor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_defaultActor_deallocateResilient(HeapObject *actor);
+
+/// Initialize the runtime storage for a distributed remote actor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_distributedActor_remote_initialize(DefaultActor *actor);
+
+/// Destroy the runtime storage for a default actor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_distributedActor_destroy(DefaultActor *actor);
 
 /// Enqueue a job on the default actor implementation.
 ///
@@ -515,23 +601,39 @@ void swift_defaultActor_destroy(DefaultActor *actor);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_defaultActor_enqueue(Job *job, DefaultActor *actor);
 
-/// Resume a task from its continuation, given a normal result value.
+/// Check if the actor is a distributed 'remote' actor instance.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_continuation_resume(/* +1 */ OpaqueValue *result,
-                               void *continuation,
-                               const Metadata *resumeType);
+bool swift_distributed_actor_is_remote(DefaultActor *actor);
 
-/// Resume a task from its throwing continuation, given a normal result value.
+/// Prepare a continuation in the current task.
+///
+/// The caller should initialize the Parent, ResumeParent,
+/// and NormalResult fields.  This function will initialize the other
+/// fields with appropriate defaaults; the caller may then overwrite
+/// them if desired.
+///
+/// This function is provided as a code-size and runtime-usage
+/// optimization; calling it is not required if code is willing to
+/// do all its work inline.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_continuation_throwingResume(/* +1 */ OpaqueValue *result,
-                                       void *continuation,
-                                       const Metadata *resumeType);
+AsyncTask *swift_continuation_init(ContinuationAsyncContext *context,
+                                   AsyncContinuationFlags flags);
 
-/// Resume a task from its throwing continuation by throwing an error.
+/// Resume a task from a non-throwing continuation, given a normal
+/// result which has already been stored into the continuation.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_continuation_throwingResumeWithError(/* +1 */ SwiftError *error,
-                                                void *continuation,
-                                                const Metadata *resumeType);
+void swift_continuation_resume(AsyncTask *continuation);
+
+/// Resume a task from a potentially-throwing continuation, given a
+/// normal result which has already been stored into the continuation.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_continuation_throwingResume(AsyncTask *continuation);
+
+/// Resume a task from a potentially-throwing continuation by throwing
+/// an error.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_continuation_throwingResumeWithError(AsyncTask *continuation,
+                                                /* +1 */ SwiftError *error);
 
 /// SPI helper to log a misuse of a `CheckedContinuation` to the appropriate places in the OS.
 extern "C" SWIFT_CC(swift)
@@ -541,7 +643,7 @@ void swift_continuation_logFailedCheck(const char *message);
 /// If the binary links CoreFoundation, uses CFRunLoopRun
 /// Otherwise it uses dispatchMain.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_asyncMainDrainQueue();
+void swift_task_asyncMainDrainQueue [[noreturn]]();
 
 /// Establish that the current thread is running as the given
 /// executor, then run a job.
@@ -552,6 +654,27 @@ void swift_job_run(Job *job, ExecutorRef executor);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 AsyncTask *swift_task_getCurrent(void);
 
+/// Return the current thread's active executor reference.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+ExecutorRef swift_task_getCurrentExecutor(void);
+
+/// Return the main-actor executor reference.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+ExecutorRef swift_task_getMainExecutor(void);
+
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+bool swift_task_isCurrentExecutor(ExecutorRef executor);
+
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_task_reportUnexpectedExecutor(
+    const unsigned char *file, uintptr_t fileLength, bool fileIsASCII,
+    uintptr_t line, ExecutorRef executor);
+
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+JobPriority swift_task_getCurrentThreadPriority(void);
+
 }
+
+#pragma clang diagnostic pop
 
 #endif

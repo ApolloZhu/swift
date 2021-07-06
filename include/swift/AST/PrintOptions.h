@@ -195,6 +195,9 @@ struct PrintOptions {
   /// type might be ambiguous.
   bool FullyQualifiedTypesIfAmbiguous = false;
 
+  /// Print fully qualified extended types if ambiguous.
+  bool FullyQualifiedExtendedTypesIfAmbiguous = false;
+
   /// If true, printed module names will use the "exported" name, which may be
   /// different from the regular name.
   ///
@@ -371,6 +374,12 @@ struct PrintOptions {
   /// Whether to print the extensions from conforming protocols.
   bool PrintExtensionFromConformingProtocols = false;
 
+  /// Whether to always try and print parameter labels. If present, print the
+  /// external parameter name. Otherwise try printing the internal name as
+  /// `_ <internalName>`, if an internal name exists. If neither an external nor
+  /// an internal name exists, only print the parameter's type.
+  bool AlwaysTryPrintParameterLabels = false;
+
   std::shared_ptr<ShouldPrintChecker> CurrentPrintabilityChecker =
     std::make_shared<ShouldPrintChecker>();
 
@@ -504,6 +513,7 @@ struct PrintOptions {
     result.PrintDocumentationComments = true;
     result.PrintRegularClangComments = true;
     result.PrintLongAttrsOnSeparateLines = true;
+    result.AlwaysTryPrintParameterLabels = true;
     return result;
   }
 
@@ -649,6 +659,7 @@ struct PrintOptions {
     PO.ShouldQualifyNestedDeclarations = QualifyNestedDeclarations::TypesOnly;
     PO.PrintParameterSpecifiers = true;
     PO.SkipImplicit = true;
+    PO.AlwaysTryPrintParameterLabels = true;
     return PO;
   }
 };

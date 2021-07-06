@@ -238,6 +238,30 @@ static bool diagnoseRangeOperatorMisspell(DiagnosticEngine &Diags,
   return false;
 }
 
+static bool diagnoseNonexistentPowerOperator(DiagnosticEngine &Diags,
+                                             UnresolvedDeclRefExpr *UDRE,
+                                             DeclContext *DC) {
+  auto name = UDRE->getName().getBaseIdentifier();
+  if (!(name.isOperator() && name.is("**")))
+    return false;
+
+  DC = DC->getModuleScopeContext();
+
+  auto &ctx = DC->getASTContext();
+  DeclNameRef powerName(ctx.getIdentifier("pow"));
+
+  // Look if 'pow(_:_:)' exists within current context.
+  auto lookUp = TypeChecker::lookupUnqualified(
+      DC, powerName, UDRE->getLoc(), defaultUnqualifiedLookupOptions);
+  if (lookUp) {
+    Diags.diagnose(UDRE->getLoc(), diag::nonexistent_power_operator)
+        .highlight(UDRE->getSourceRange());
+    return true;
+  }
+
+  return false;
+}
+
 static bool diagnoseIncDecOperator(DiagnosticEngine &Diags,
                                    UnresolvedDeclRefExpr *UDRE) {
   auto name = UDRE->getName().getBaseIdentifier();
@@ -328,6 +352,34 @@ static bool isMemberChainTail(Expr *expr, Expr *parent) {
   return parent == nullptr || !isMemberChainMember(parent);
 }
 
+static bool isValidForwardReference(ValueDecl *D, DeclContext *DC,
+                                    ValueDecl **localDeclAfterUse) {
+  *localDeclAfterUse = nullptr;
+
+  // References to variables injected by lldb are always valid.
+  if (isa<VarDecl>(D) && cast<VarDecl>(D)->isDebuggerVar())
+    return true;
+
+  // If we find something in the current context, it must be a forward
+  // reference, because otherwise if it was in scope, it would have
+  // been returned by the call to ASTScope::lookupLocalDecls() above.
+  if (D->getDeclContext()->isLocalContext()) {
+    do {
+      if (D->getDeclContext() == DC) {
+        *localDeclAfterUse = D;
+        return false;
+      }
+
+      // If we're inside of a 'defer' context, walk up to the parent
+      // and check again. We don't want 'defer' bodies to forward
+      // reference bindings in the immediate outer scope.
+    } while (isa<FuncDecl>(DC) &&
+             cast<FuncDecl>(DC)->isDeferBody() &&
+             (DC = DC->getParent()));
+  }
+  return true;
+}
+
 /// Bind an UnresolvedDeclRefExpr by performing name lookup and
 /// returning the resultant expression. Context is the DeclContext used
 /// for the lookup.
@@ -398,24 +450,12 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     Lookup = TypeChecker::lookupUnqualified(DC, LookupName, Loc, lookupOptions);
 
     ValueDecl *localDeclAfterUse = nullptr;
-    auto isValid = [&](ValueDecl *D) {
-      // References to variables injected by lldb are always valid.
-      if (isa<VarDecl>(D) && cast<VarDecl>(D)->isDebuggerVar())
-        return true;
-
-      // If we find something in the current context, it must be a forward
-      // reference, because otherwise if it was in scope, it would have
-      // been returned by the call to ASTScope::lookupLocalDecls() above.
-      if (D->getDeclContext()->isLocalContext() &&
-          D->getDeclContext() == DC) {
-        localDeclAfterUse = D;
-        return false;
-      }
-      return true;
-    };
     AllDeclRefs =
         findNonMembers(Lookup.innerResults(), UDRE->getRefKind(),
-                       /*breakOnMember=*/true, ResultValues, isValid);
+                       /*breakOnMember=*/true, ResultValues,
+                       [&](ValueDecl *D) {
+                         return isValidForwardReference(D, DC, &localDeclAfterUse);
+                       });
 
     // If local declaration after use is found, check outer results for
     // better matching candidates.
@@ -435,7 +475,10 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
         localDeclAfterUse = nullptr;
         AllDeclRefs =
             findNonMembers(Lookup.innerResults(), UDRE->getRefKind(),
-                           /*breakOnMember=*/true, ResultValues, isValid);
+                           /*breakOnMember=*/true, ResultValues,
+                           [&](ValueDecl *D) {
+                             return isValidForwardReference(D, DC, &localDeclAfterUse);
+                           });
       }
     }
   }
@@ -446,7 +489,8 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     // e.g. (x*-4) that needs whitespace.
     if (diagnoseRangeOperatorMisspell(Context.Diags, UDRE) ||
         diagnoseIncDecOperator(Context.Diags, UDRE) ||
-        diagnoseOperatorJuxtaposition(UDRE, DC)) {
+        diagnoseOperatorJuxtaposition(UDRE, DC) ||
+        diagnoseNonexistentPowerOperator(Context.Diags, UDRE, DC)) {
       return errorResult();
     }
 
@@ -1017,10 +1061,24 @@ namespace {
     }
 
     std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
-      // If this is a call, record the argument expression.
-      if (auto call = dyn_cast<ApplyExpr>(expr)) {
-        if (!isa<SelfApplyExpr>(expr)) {
-          CallArgs.insert(call->getArg());
+      // If this is a call or subscript, record the argument expression.
+      {
+        if (auto call = dyn_cast<ApplyExpr>(expr)) {
+          if (!isa<SelfApplyExpr>(expr)) {
+            CallArgs.insert(call->getArg());
+          }
+        }
+
+        if (auto *subscript = dyn_cast<SubscriptExpr>(expr)) {
+          CallArgs.insert(subscript->getIndex());
+        }
+
+        if (auto *dynamicSubscript = dyn_cast<DynamicSubscriptExpr>(expr)) {
+          CallArgs.insert(dynamicSubscript->getIndex());
+        }
+
+        if (auto *OLE = dyn_cast<ObjectLiteralExpr>(expr)) {
+          CallArgs.insert(OLE->getArg());
         }
       }
 
@@ -1347,22 +1405,6 @@ namespace {
 /// Perform prechecking of a ClosureExpr before we dive into it.  This returns
 /// true when we want the body to be considered part of this larger expression.
 bool PreCheckExpression::walkToClosureExprPre(ClosureExpr *closure) {
-  auto *PL = closure->getParameters();
-
-  // Validate the parameters.
-  bool hadParameterError = false;
-
-  // If we encounter an error validating the parameter list, don't bail.
-  // Instead, go on to validate any potential result type, and bail
-  // afterwards.  This allows for better diagnostics, and keeps the
-  // closure expression type well-formed.
-  for (auto param : *PL) {
-    hadParameterError |= param->isInvalid();
-  }
-
-  if (hadParameterError)
-    return false;
-
   // If we won't be checking the body of the closure, don't walk into it here.
   if (!shouldTypeCheckInEnclosingExpression(closure))
     return false;
@@ -1439,12 +1481,9 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
           // For now, just return the unbound generic type.
           return unboundTy;
         },
-        /*placeholderHandler*/
-        [&](auto placeholderRepr) {
-          // FIXME: Don't let placeholder types escape type resolution.
-          // For now, just return the placeholder type.
-          return PlaceholderType::get(getASTContext(), placeholderRepr);
-        });
+        // FIXME: Don't let placeholder types escape type resolution.
+        // For now, just return the placeholder type.
+        PlaceholderType::get);
     const auto BaseTy = resolution.resolveType(InnerTypeRepr);
 
     if (BaseTy->mayHaveMembers()) {
@@ -1760,7 +1799,7 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
       // The protocols we are composing
       SmallVector<TypeRepr *, 4> Types;
 
-      auto lhsExpr = binaryExpr->getArg()->getElement(0);
+      auto *lhsExpr = binaryExpr->getLHS();
       if (auto *lhs = dyn_cast<TypeExpr>(lhsExpr)) {
         Types.push_back(lhs->getTypeRepr());
       } else if (isa<BinaryExpr>(lhsExpr)) {
@@ -1780,7 +1819,7 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
         return nullptr;
 
       // Add the rhs which is just a TypeExpr
-      auto *rhs = dyn_cast<TypeExpr>(binaryExpr->getArg()->getElement(1));
+      auto *rhs = dyn_cast<TypeExpr>(binaryExpr->getRHS());
       if (!rhs) return nullptr;
       Types.push_back(rhs->getTypeRepr());
 
@@ -1849,6 +1888,15 @@ void PreCheckExpression::resolveKeyPathExpr(KeyPathExpr *KPE) {
             UDE->getName(), UDE->getLoc()));
 
         expr = UDE->getBase();
+      } else if (auto CCE = dyn_cast<CodeCompletionExpr>(expr)) {
+        components.push_back(
+            KeyPathExpr::Component::forCodeCompletion(CCE->getLoc()));
+
+        expr = CCE->getBase();
+        if (!expr) {
+          // We are completing on the key path's base. Stop iterating.
+          return;
+        }
       } else if (auto SE = dyn_cast<SubscriptExpr>(expr)) {
         // .[0] or just plain [0]
         components.push_back(
@@ -1976,12 +2024,9 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
           // For now, just return the unbound generic type.
           return unboundTy;
         },
-        /*placeholderHandler*/
-        [&](auto placeholderRepr) {
-          // FIXME: Don't let placeholder types escape type resolution.
-          // For now, just return the placeholder type.
-          return PlaceholderType::get(getASTContext(), placeholderRepr);
-        });
+        // FIXME: Don't let placeholder types escape type resolution.
+        // For now, just return the placeholder type.
+        PlaceholderType::get);
     const auto result = resolution.resolveType(typeExpr->getTypeRepr());
     if (result->hasError())
       return nullptr;

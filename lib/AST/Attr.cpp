@@ -530,17 +530,9 @@ static std::string getDifferentiationParametersClauseString(
 static void printDifferentiableAttrArguments(
     const DifferentiableAttr *attr, ASTPrinter &printer,
     const PrintOptions &Options, const Decl *D, bool omitWrtClause = false) {
-  assert(D);
   // Create a temporary string for the attribute argument text.
   std::string attrArgText;
   llvm::raw_string_ostream stream(attrArgText);
-
-  // Get original function.
-  auto *original = dyn_cast<AbstractFunctionDecl>(D);
-  // Handle stored/computed properties and subscript methods.
-  if (auto *asd = dyn_cast<AbstractStorageDecl>(D))
-    original = asd->getAccessor(AccessorKind::Get);
-  assert(original && "Must resolve original declaration");
 
   // Print comma if not leading clause.
   bool isLeadingClause = false;
@@ -569,6 +561,23 @@ static void printDifferentiableAttrArguments(
   case DifferentiabilityKind::NonDifferentiable:
     llvm_unreachable("Impossible case `NonDifferentiable`");
   }
+
+  // If the declaration is not available, there is not enough context to print
+  // the differentiability parameters or the 'where' clause, so just print the
+  // differentiability kind if applicable (when not `Normal`).
+  if (!D) {
+    if (attr->getDifferentiabilityKind() != DifferentiabilityKind::Normal) {
+      printer << '(' << stream.str() << ')';
+    }
+    return;
+  }
+
+  // Get original function.
+  auto *original = dyn_cast<AbstractFunctionDecl>(D);
+  // Handle stored/computed properties and subscript methods.
+  if (auto *asd = dyn_cast<AbstractStorageDecl>(D))
+    original = asd->getAccessor(AccessorKind::Get);
+  assert(original && "Must resolve original declaration");
 
   // Print differentiation parameters clause, unless it is to be omitted.
   if (!omitWrtClause) {
@@ -616,9 +625,7 @@ static void printDifferentiableAttrArguments(
     return;
 
   // Otherwise, print the attribute argument text enclosed in parentheses.
-  printer << '(';
-  printer << stream.str();
-  printer << ')';
+  printer << '(' << stream.str() << ')';
 }
 
 void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
@@ -783,7 +790,6 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DAK_ReferenceOwnership:
   case DAK_Effects:
   case DAK_Optimize:
-  case DAK_ActorIndependent:
     if (DeclAttribute::isDeclModifier(getKind())) {
       Printer.printKeyword(getAttrName(), Options);
     } else if (Options.IsForSwiftInterface && getKind() == DAK_ResultBuilder) {
@@ -1020,7 +1026,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
       type.print(Printer, Options);
     else
       attr->getTypeRepr()->print(Printer, Options);
-    if (attr->isArgUnsafe())
+    if (attr->isArgUnsafe() && Options.IsForSwiftInterface)
       Printer << "(unsafe)";
     Printer.printNamePost(PrintNameContext::Attribute);
     break;
@@ -1080,6 +1086,20 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
 #define SIMPLE_DECL_ATTR(X, CLASS, ...) case DAK_##CLASS:
 #include "swift/AST/Attr.def"
     llvm_unreachable("handled above");
+
+  case DAK_CompletionHandlerAsync: {
+    auto *attr = cast<CompletionHandlerAsyncAttr>(this);
+    Printer.printAttrName("@completionHandlerAsync");
+    Printer << "(\"";
+    if (attr->AsyncFunctionDecl) {
+      Printer << attr->AsyncFunctionDecl->getName();
+    } else {
+      Printer << attr->AsyncFunctionName;
+    }
+    Printer << "\", completionHandlerIndex: " <<
+        attr->CompletionHandlerIndex << ')';
+    break;
+  }
 
   default:
     assert(DeclAttribute::isDeclModifier(getKind()) &&
@@ -1157,15 +1177,6 @@ StringRef DeclAttribute::getAttrName() const {
     }
     llvm_unreachable("Invalid inline kind");
   }
-  case DAK_ActorIndependent: {
-    switch (cast<ActorIndependentAttr>(this)->getKind()) {
-    case ActorIndependentKind::Safe:
-      return "actorIndependent";
-    case ActorIndependentKind::Unsafe:
-      return "actorIndependent(unsafe)";
-    }
-    llvm_unreachable("Invalid actorIndependent kind");
-  }
   case DAK_Optimize: {
     switch (cast<OptimizeAttr>(this)->getMode()) {
     case OptimizationMode::NoOptimization:
@@ -1225,8 +1236,8 @@ StringRef DeclAttribute::getAttrName() const {
     return "derivative";
   case DAK_Transpose:
     return "transpose";
-  case DAK_HasAsyncAlternative:
-    return "hasAsyncAlternative";
+  case DAK_CompletionHandlerAsync:
+    return "completionHandlerAsync";
   }
   llvm_unreachable("bad DeclAttrKind");
 }
@@ -1332,6 +1343,7 @@ SourceLoc ObjCAttr::getRParenLoc() const {
 ObjCAttr *ObjCAttr::clone(ASTContext &context) const {
   auto attr = new (context) ObjCAttr(getName(), isNameImplicit());
   attr->setSwift3Inferred(isSwift3Inferred());
+  attr->setAddedByAccessNote(getAddedByAccessNote());
   return attr;
 }
 
@@ -1456,6 +1468,20 @@ AvailableAttr::createPlatformAgnostic(ASTContext &C,
 
 bool AvailableAttr::isActivePlatform(const ASTContext &ctx) const {
   return isPlatformActive(Platform, ctx.LangOpts);
+}
+
+AvailableAttr *AvailableAttr::clone(ASTContext &C, bool implicit) const {
+  return new (C) AvailableAttr(implicit ? SourceLoc() : AtLoc,
+                               implicit ? SourceRange() : getRange(),
+                               Platform, Message, Rename,
+                               Introduced ? *Introduced : llvm::VersionTuple(),
+                               implicit ? SourceRange() : IntroducedRange,
+                               Deprecated ? *Deprecated : llvm::VersionTuple(),
+                               implicit ? SourceRange() : DeprecatedRange,
+                               Obsoleted ? *Obsoleted : llvm::VersionTuple(),
+                               implicit ? SourceRange() : ObsoletedRange,
+                               PlatformAgnostic,
+                               implicit);
 }
 
 Optional<OriginallyDefinedInAttr::ActiveVersion>

@@ -40,7 +40,10 @@ enum class IRGenOutputKind : unsigned {
   Module,
 
   /// Generate an LLVM module and write it out as LLVM assembly.
-  LLVMAssembly,
+  LLVMAssemblyBeforeOptimization,
+
+  /// Generate an LLVM module and write it out as LLVM assembly.
+  LLVMAssemblyAfterOptimization,
 
   /// Generate an LLVM module and write it out as LLVM bitcode.
   LLVMBitcode,
@@ -139,6 +142,26 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
   /// Resilient class stub initializer callbacks.
   PointerAuthSchema ResilientClassStubInitCallbacks;
 
+  /// Like SwiftFunctionPointers but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncSwiftFunctionPointers;
+
+  /// Like SwiftClassMethods but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncSwiftClassMethods;
+
+  /// Like ProtocolWitnesses but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncProtocolWitnesses;
+
+  /// Like SwiftClassMethodPointers but for use with AsyncFunctionPointer
+  /// values.
+  PointerAuthSchema AsyncSwiftClassMethodPointers;
+
+  /// Like SwiftDynamicReplacements but for use with AsyncFunctionPointer
+  /// values.
+  PointerAuthSchema AsyncSwiftDynamicReplacements;
+
+  /// Like PartialApplyCapture but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncPartialApplyCapture;
+
   /// The parent async context stored within a child async context.
   PointerAuthSchema AsyncContextParent;
 
@@ -180,6 +203,9 @@ public:
 
   /// The libraries and frameworks specified on the command line.
   SmallVector<LinkLibrary, 4> LinkLibraries;
+
+  /// The public dependent libraries specified on the command line.
+  std::vector<std::string> PublicLinkLibraries;
 
   /// If non-empty, the (unmangled) name of a dummy symbol to emit that can be
   /// used to force-load this module.
@@ -226,9 +252,6 @@ public:
 
   /// Whether we should run swift specific LLVM optimizations after IRGen.
   unsigned DisableSwiftSpecificLLVMOptzns : 1;
-
-  /// Whether we should run LLVM SLP vectorizer.
-  unsigned DisableLLVMSLPVectorizer : 1;
 
   /// Special codegen for playgrounds.
   unsigned Playground : 1;
@@ -300,9 +323,6 @@ public:
   /// measurements on a non-clean build directory.
   unsigned UseIncrementalLLVMCodeGen : 1;
 
-  /// Enable use of the swiftcall calling convention.
-  unsigned UseSwiftCall : 1;
-
   /// Enable the use of type layouts for value witness functions and use
   /// vw functions instead of outlined copy/destroy functions.
   unsigned UseTypeLayoutValueHandling : 1;
@@ -338,10 +358,6 @@ public:
   /// Pointer authentication.
   PointerAuthOptions PointerAuth;
 
-  /// Use async-specific lowering for async functions if it is supported for
-  /// the target.
-  bool UseAsyncLowering = USE_SWIFT_ASYNC_LOWERING;
-
   /// The different modes for dumping IRGen type info.
   enum class TypeInfoDumpFilter {
     All,
@@ -358,7 +374,8 @@ public:
   JITDebugArtifact DumpJIT = JITDebugArtifact::None;
 
   IRGenOptions()
-      : DWARFVersion(2), OutputKind(IRGenOutputKind::LLVMAssembly),
+      : DWARFVersion(2),
+        OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
         Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
@@ -367,7 +384,7 @@ public:
         DebugInfoFormat(IRGenDebugInfoFormat::None),
         DisableClangModuleSkeletonCUs(false), UseJIT(false),
         DisableLLVMOptzns(false), DisableSwiftSpecificLLVMOptzns(false),
-        DisableLLVMSLPVectorizer(false), Playground(false),
+        Playground(false),
         EmitStackPromotionChecks(false), FunctionSections(false),
         PrintInlineTree(false), EmbedMode(IRGenEmbedMode::None),
         LLVMLTOKind(IRGenLLVMLTOKind::None), HasValueNamesSetting(false),
@@ -376,7 +393,7 @@ public:
         ForcePublicLinkage(false), LazyInitializeClassMetadata(false),
         LazyInitializeProtocolConformances(false), DisableLegacyTypeInfo(false),
         PrespecializeGenericMetadata(false), UseIncrementalLLVMCodeGen(true),
-        UseSwiftCall(false), UseTypeLayoutValueHandling(true),
+        UseTypeLayoutValueHandling(true),
         GenerateProfile(false), EnableDynamicReplacementChaining(false),
         DisableRoundTripDebugTypes(false), DisableDebuggerShadowCopies(false),
         DisableConcreteTypeMetadataMangledNameAccessors(false), CmdArgs(),
@@ -405,7 +422,8 @@ public:
     if (HasValueNamesSetting) {
       return ValueNames;
     } else {
-      return OutputKind == IRGenOutputKind::LLVMAssembly;
+      return OutputKind == IRGenOutputKind::LLVMAssemblyBeforeOptimization ||
+             OutputKind == IRGenOutputKind::LLVMAssemblyAfterOptimization;
     }
   }
 

@@ -445,6 +445,14 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
       }
     }
 
+    // the init(transport:) initializer of a distributed actor is special, as
+    // it ties the actors lifecycle with the transport. As such, it must always
+    // be invoked by any other initializer, just like a designated initializer.
+    if (auto clazz = dyn_cast<ClassDecl>(decl->getDeclContext())) {
+      if (clazz->isDistributedActor() && decl->isDistributedActorLocalInit())
+        return CtorInitializerKind::Designated;
+    }
+
     if (decl->getDeclContext()->getExtendedProtocolDecl()) {
       return CtorInitializerKind::Convenience;
     }
@@ -863,7 +871,7 @@ IsDynamicRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     return true;
 
   // The presence of 'final' blocks the inference of 'dynamic'.
-  if (decl->isFinal())
+  if (decl->isSemanticallyFinal())
     return false;
 
   // Types are never 'dynamic'.
@@ -929,7 +937,7 @@ RequirementSignatureRequest::evaluate(Evaluator &evaluator,
     proto->getSelfInterfaceType()->castTo<GenericTypeParamType>();
   auto requirement =
     Requirement(RequirementKind::Conformance, selfType,
-              proto->getDeclaredInterfaceType());
+                proto->getDeclaredInterfaceType());
 
   builder.addRequirement(
           requirement,
@@ -939,7 +947,7 @@ RequirementSignatureRequest::evaluate(Evaluator &evaluator,
 
   auto reqSignature = std::move(builder).computeGenericSignature(
                         /*allowConcreteGenericParams=*/false,
-                        /*allowBuilderToMove=*/false);
+                        /*requirementSignatureSelfProto=*/proto);
   return reqSignature->getRequirements();
 }
 
@@ -1102,13 +1110,13 @@ swift::computeAutomaticEnumValueKind(EnumDecl *ED) {
   
   if (ED->getGenericEnvironmentOfContext() != nullptr)
     rawTy = ED->mapTypeIntoContext(rawTy);
-  
+
+  auto *module = ED->getParentModule();
+
   // Swift enums require that the raw type is convertible from one of the
   // primitive literal protocols.
   auto conformsToProtocol = [&](KnownProtocolKind protoKind) {
-    ProtocolDecl *proto = ED->getASTContext().getProtocol(protoKind);
-    return proto &&
-        TypeChecker::conformsToProtocol(rawTy, proto, ED->getDeclContext());
+    return TypeChecker::conformsToKnownProtocol(rawTy, protoKind, module);
   };
 
   static auto otherLiteralProtocolKinds = {
@@ -1860,7 +1868,7 @@ FunctionOperatorRequest::evaluate(Evaluator &evaluator, FuncDecl *FD) const {
   if (dc->isTypeContext()) {
     if (auto classDecl = dc->getSelfClassDecl()) {
       // For a class, we also need the function or class to be 'final'.
-      if (!classDecl->isFinal() && !FD->isFinal() &&
+      if (!classDecl->isSemanticallyFinal() && !FD->isFinal() &&
           FD->getStaticLoc().isValid() &&
           FD->getStaticSpelling() != StaticSpellingKind::KeywordStatic) {
         FD->diagnose(diag::nonfinal_operator_in_class,
@@ -2149,6 +2157,9 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
     nestedRepr = tupleRepr->getElementType(0);
   }
 
+  if (auto isolated = dyn_cast<IsolatedTypeRepr>(nestedRepr))
+    nestedRepr = isolated->getBase();
+  
   if (isa<InOutTypeRepr>(nestedRepr) &&
       param->isDefaultArgument()) {
     auto &ctx = param->getASTContext();
@@ -2184,11 +2195,9 @@ static Type validateParameterType(ParamDecl *decl) {
       // For now, just return the unbound generic type.
       return unboundTy;
     };
-    placeholderHandler = [&](auto placeholderRepr) {
-      // FIXME: Don't let placeholder types escape type resolution.
-      // For now, just return the placeholder type.
-      return PlaceholderType::get(ctx, placeholderRepr);
-    };
+    // FIXME: Don't let placeholder types escape type resolution.
+    // For now, just return the placeholder type.
+    placeholderHandler = PlaceholderType::get;
   } else if (isa<AbstractFunctionDecl>(dc)) {
     options = TypeResolutionOptions(TypeResolverContext::AbstractFunctionDecl);
   } else if (isa<SubscriptDecl>(dc)) {
@@ -2301,6 +2310,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       auto selfParam = computeSelfParam(AFD,
                                         /*isInitializingCtor*/true,
                                         /*wantDynamicSelf*/true);
+      PD->setIsolated(selfParam.isIsolated());
       return selfParam.getPlainType();
     }
 
@@ -2381,7 +2391,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       AFD->getParameters()->getParams(argTy);
 
       infoBuilder = infoBuilder.withAsync(AFD->hasAsync());
-      infoBuilder = infoBuilder.withConcurrent(AFD->isConcurrent());
+      infoBuilder = infoBuilder.withConcurrent(AFD->isSendable());
       // 'throws' only applies to the innermost function.
       infoBuilder = infoBuilder.withThrows(AFD->hasThrows());
       // Defer bodies must not escape.
@@ -2400,10 +2410,14 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
     if (hasSelf) {
       // Substitute in our own 'self' parameter.
       auto selfParam = computeSelfParam(AFD);
-      if (sig)
-        funcTy = GenericFunctionType::get(sig, {selfParam}, funcTy);
-      else
-        funcTy = FunctionType::get({selfParam}, funcTy);
+      // FIXME: Verify ExtInfo state is correct, not working by accident.
+      if (sig) {
+        GenericFunctionType::ExtInfo info;
+        funcTy = GenericFunctionType::get(sig, {selfParam}, funcTy, info);
+      } else {
+        FunctionType::ExtInfo info;
+        funcTy = FunctionType::get({selfParam}, funcTy, info);
+      }
     }
 
     return funcTy;
@@ -2418,10 +2432,14 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
     SD->getIndices()->getParams(argTy);
 
     Type funcTy;
-    if (auto sig = SD->getGenericSignature())
-      funcTy = GenericFunctionType::get(sig, argTy, elementTy);
-    else
-      funcTy = FunctionType::get(argTy, elementTy);
+    // FIXME: Verify ExtInfo state is correct, not working by accident.
+    if (auto sig = SD->getGenericSignature()) {
+      GenericFunctionType::ExtInfo info;
+      funcTy = GenericFunctionType::get(sig, argTy, elementTy, info);
+    } else {
+      FunctionType::ExtInfo info;
+      funcTy = FunctionType::get(argTy, elementTy, info);
+    }
 
     return funcTy;
   }
@@ -2441,13 +2459,19 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       SmallVector<AnyFunctionType::Param, 4> argTy;
       PL->getParams(argTy);
 
-      resultTy = FunctionType::get(argTy, resultTy);
+      // FIXME: Verify ExtInfo state is correct, not working by accident.
+      FunctionType::ExtInfo info;
+      resultTy = FunctionType::get(argTy, resultTy, info);
     }
 
-    if (auto genericSig = ED->getGenericSignature())
-      resultTy = GenericFunctionType::get(genericSig, {selfTy}, resultTy);
-    else
-      resultTy = FunctionType::get({selfTy}, resultTy);
+    // FIXME: Verify ExtInfo state is correct, not working by accident.
+    if (auto genericSig = ED->getGenericSignature()) {
+      GenericFunctionType::ExtInfo info;
+      resultTy = GenericFunctionType::get(genericSig, {selfTy}, resultTy, info);
+    } else {
+      FunctionType::ExtInfo info;
+      resultTy = FunctionType::get({selfTy}, resultTy, info);
+    }
 
     return resultTy;
   }
@@ -2489,13 +2513,38 @@ NamingPatternRequest::evaluate(Evaluator &evaluator, VarDecl *VD) const {
   }
 
   if (!namingPattern) {
-    // Try type checking parent control statement.
     if (auto parentStmt = VD->getParentPatternStmt()) {
-      if (auto CS = dyn_cast<CaseStmt>(parentStmt))
-        parentStmt = CS->getParentStmt();
-      ASTNode node(parentStmt);
-      TypeChecker::typeCheckASTNode(node, VD->getDeclContext(),
-                                    /*LeaveBodyUnchecked=*/true);
+      // Try type checking parent control statement.
+      if (auto condStmt = dyn_cast<LabeledConditionalStmt>(parentStmt)) {
+        // The VarDecl is defined inside a condition of a `if` or `while` stmt.
+        // Only type check the condition we care about: the one with the VarDecl
+        bool foundVarDecl = false;
+        for (auto &condElt : condStmt->getCond()) {
+          if (auto pat = condElt.getPatternOrNull()) {
+            if (!pat->containsVarDecl(VD)) {
+              continue;
+            }
+            // We found the condition that declares the variable. Type check it
+            // and stop the loop. The variable can only be declared once.
+
+            // We don't care about isFalsable
+            bool isFalsable = false;
+            TypeChecker::typeCheckStmtConditionElement(condElt, isFalsable,
+                                                       VD->getDeclContext());
+
+            foundVarDecl = true;
+            break;
+          }
+        }
+        assert(foundVarDecl && "VarDecl not declared in its parent?");
+      } else {
+        // We have some other parent stmt. Type check it completely.
+        if (auto CS = dyn_cast<CaseStmt>(parentStmt))
+          parentStmt = CS->getParentStmt();
+        ASTNode node(parentStmt);
+        TypeChecker::typeCheckASTNode(node, VD->getDeclContext(),
+                                      /*LeaveBodyUnchecked=*/true);
+      }
       namingPattern = VD->getCanonicalVarDecl()->NamingPattern;
     }
   }
@@ -2652,8 +2701,10 @@ static ArrayRef<Decl *> evaluateMembersRequest(
     if (auto *var = dyn_cast<VarDecl>(member)) {
       // The projected storage wrapper ($foo) might have
       // dynamically-dispatched accessors, so force them to be synthesized.
-      if (var->hasAttachedPropertyWrapper())
-        (void) var->getPropertyWrapperBackingProperty();
+      if (var->hasAttachedPropertyWrapper()) {
+        (void) var->getPropertyWrapperAuxiliaryVariables();
+        (void) var->getPropertyWrapperInitializerInfo();
+      }
     }
   }
 
@@ -2777,12 +2828,9 @@ ExtendedTypeRequest::evaluate(Evaluator &eval, ExtensionDecl *ext) const {
         // For now, just return the unbound generic type.
         return unboundTy;
       },
-      /*placeholderHandler*/
-      [&](auto placeholderRepr) {
-        // FIXME: Don't let placeholder types escape type resolution.
-        // For now, just return the placeholder type.
-        return PlaceholderType::get(ext->getASTContext(), placeholderRepr);
-      });
+      // FIXME: Don't let placeholder types escape type resolution.
+      // For now, just return the placeholder type.
+      PlaceholderType::get);
 
   const auto extendedType = resolution.resolveType(extendedRepr);
 

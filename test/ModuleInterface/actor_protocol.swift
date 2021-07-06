@@ -12,39 +12,47 @@
 // CHECK-EXTENSION-NOT: extension {{.+}} : _Concurrency.Actor
 
 // CHECK: public actor PlainActorClass {
+@available(SwiftStdlib 5.5, *)
 public actor PlainActorClass {
-  @actorIndependent public func enqueue(partialTask: PartialAsyncTask) { }
+  nonisolated public func enqueue(_ job: UnownedJob) { }
 }
 
 // CHECK: public actor ExplicitActorClass : _Concurrency.Actor {
+@available(SwiftStdlib 5.5, *)
 public actor ExplicitActorClass : Actor {
-  @actorIndependent public func enqueue(partialTask: PartialAsyncTask) { }
+  nonisolated public func enqueue(_ job: UnownedJob) { }
 }
 
 // CHECK: public actor EmptyActor {
+@available(SwiftStdlib 5.5, *)
 public actor EmptyActor {}
 
-// CHECK: actor public class EmptyActorClass {
-public actor class EmptyActorClass {}
+// CHECK: public actor EmptyActorClass {
+@available(SwiftStdlib 5.5, *)
+public actor EmptyActorClass {}
 
 // CHECK: public protocol Cat : _Concurrency.Actor {
+@available(SwiftStdlib 5.5, *)
 public protocol Cat : Actor {
   func mew()
 }
 
 // CHECK: public actor HouseCat : Library.Cat {
+@available(SwiftStdlib 5.5, *)
 public actor HouseCat : Cat {
-  @asyncHandler public func mew() {}
-  @actorIndependent public func enqueue(partialTask: PartialAsyncTask) { }
+  nonisolated public func mew() {}
+  nonisolated public func enqueue(_ job: UnownedJob) { }
 }
 
 // CHECK: public protocol ToothyMouth {
+@available(SwiftStdlib 5.5, *)
 public protocol ToothyMouth {
   func chew()
 }
 
 // CHECK: public actor Lion : Library.ToothyMouth, _Concurrency.Actor {
+@available(SwiftStdlib 5.5, *)
 public actor Lion : ToothyMouth, Actor {
-  @asyncHandler public func chew() {}
-  @actorIndependent public func enqueue(partialTask: PartialAsyncTask) { }
+  nonisolated public func chew() {}
+  nonisolated public func enqueue(_ job: UnownedJob) { }
 }

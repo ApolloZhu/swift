@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Basic/LangOptions.h"
+#include "swift/AST/DiagnosticEngine.h"
 #include "swift/Basic/Feature.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Basic/Range.h"
@@ -58,6 +59,7 @@ static const SupportedConditionalValue SupportedConditionalCompilationOSs[] = {
 static const SupportedConditionalValue SupportedConditionalCompilationArches[] = {
   "arm",
   "arm64",
+  "arm64_32",
   "i386",
   "x86_64",
   "powerpc64",
@@ -303,7 +305,12 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
     addPlatformConditionValue(PlatformConditionKind::Arch, "arm");
     break;
   case llvm::Triple::ArchType::aarch64:
-    addPlatformConditionValue(PlatformConditionKind::Arch, "arm64");
+  case llvm::Triple::ArchType::aarch64_32:
+    if (Target.getArchName() == "arm64_32") {
+      addPlatformConditionValue(PlatformConditionKind::Arch, "arm64_32");
+    } else {
+      addPlatformConditionValue(PlatformConditionKind::Arch, "arm64");
+    }
     break;
   case llvm::Triple::ArchType::ppc64:
     addPlatformConditionValue(PlatformConditionKind::Arch, "powerpc64");
@@ -336,6 +343,7 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
   case llvm::Triple::ArchType::arm:
   case llvm::Triple::ArchType::thumb:
   case llvm::Triple::ArchType::aarch64:
+  case llvm::Triple::ArchType::aarch64_32:
   case llvm::Triple::ArchType::ppc64le:
   case llvm::Triple::ArchType::wasm32:
   case llvm::Triple::ArchType::x86:
@@ -383,4 +391,20 @@ llvm::StringRef swift::getFeatureName(Feature feature) {
   case Feature::FeatureName: return #FeatureName;
 #include "swift/Basic/Features.def"
   }
+  llvm_unreachable("covered switch");
+}
+
+DiagnosticBehavior LangOptions::getAccessNoteFailureLimit() const {
+  switch (AccessNoteBehavior) {
+  case AccessNoteDiagnosticBehavior::Ignore:
+    return DiagnosticBehavior::Ignore;
+
+  case AccessNoteDiagnosticBehavior::RemarkOnFailure:
+  case AccessNoteDiagnosticBehavior::RemarkOnFailureOrSuccess:
+    return DiagnosticBehavior::Remark;
+
+  case AccessNoteDiagnosticBehavior::ErrorOnFailureRemarkOnSuccess:
+    return DiagnosticBehavior::Error;
+  }
+  llvm_unreachable("covered switch");
 }

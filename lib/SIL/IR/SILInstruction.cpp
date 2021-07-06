@@ -68,7 +68,6 @@ void llvm::ilist_traits<SILInstruction>::addNodeToList(SILInstruction *I) {
 
 void llvm::ilist_traits<SILInstruction>::removeNodeFromList(SILInstruction *I) {
   // When an instruction is removed from a BB, clear the parent pointer.
-  assert(I->ParentBB && "Not in a list!");
   I->ParentBB = nullptr;
 }
 
@@ -102,6 +101,16 @@ SILFunction *SILInstruction::getFunction() const {
 
 SILModule &SILInstruction::getModule() const {
   return getFunction()->getModule();
+}
+
+void SILInstruction::removeFromParent() {
+#ifndef NDEBUG
+  for (auto result : getResults()) {
+    assert(result->use_empty() && "Uses of SILInstruction remain at deletion.");
+  }
+#endif
+  getParent()->remove(this);
+  ParentBB = nullptr;
 }
 
 /// eraseFromParent - This method unlinks 'self' from the containing basic
@@ -145,6 +154,15 @@ void SILInstruction::dropAllReferences() {
   for (auto OpI = PossiblyDeadOps.begin(),
             OpE = PossiblyDeadOps.end(); OpI != OpE; ++OpI) {
     OpI->drop();
+  }
+  dropNonOperandReferences();
+}
+
+void SILInstruction::dropNonOperandReferences() {
+  if (auto *termInst = dyn_cast<TermInst>(this)) {
+    for (SILSuccessor &succ : termInst->getSuccessors()) {
+      succ = nullptr;
+    }
   }
 
   // If we have a function ref inst, we need to especially drop its function
@@ -386,6 +404,11 @@ namespace {
     
     bool visitDestroyValueInst(const DestroyValueInst *RHS) {
       auto *left = cast<DestroyValueInst>(LHS);
+      return left->poisonRefs() == RHS->poisonRefs();
+    }
+
+    bool visitDebugValue(const DebugValueInst *RHS) {
+      auto *left = cast<DebugValueInst>(LHS);
       return left->poisonRefs() == RHS->poisonRefs();
     }
 
@@ -1521,6 +1544,28 @@ const ValueBase *SILInstructionResultArray::back() const {
 }
 
 //===----------------------------------------------------------------------===//
+//                           SingleValueInstruction
+//===----------------------------------------------------------------------===//
+
+CanArchetypeType SingleValueInstruction::getOpenedArchetype() const {
+  switch (getKind()) {
+  case SILInstructionKind::OpenExistentialAddrInst:
+  case SILInstructionKind::OpenExistentialRefInst:
+  case SILInstructionKind::OpenExistentialBoxInst:
+  case SILInstructionKind::OpenExistentialBoxValueInst:
+  case SILInstructionKind::OpenExistentialMetatypeInst:
+  case SILInstructionKind::OpenExistentialValueInst: {
+    auto Ty = getOpenedArchetypeOf(getType().getASTType());
+    assert(Ty && Ty->isOpenedExistential() &&
+           "Type should be an opened archetype");
+    return Ty;
+  }
+  default:
+    return CanArchetypeType();
+  }
+}
+
+//===----------------------------------------------------------------------===//
 //                         Multiple Value Instruction
 //===----------------------------------------------------------------------===//
 
@@ -1534,9 +1579,8 @@ MultipleValueInstruction::getIndexOfResult(SILValue Target) const {
 }
 
 MultipleValueInstructionResult::MultipleValueInstructionResult(
-    ValueKind valueKind, unsigned index, SILType type,
-    ValueOwnershipKind ownershipKind)
-    : ValueBase(valueKind, type) {
+    unsigned index, SILType type, ValueOwnershipKind ownershipKind)
+    : ValueBase(ValueKind::MultipleValueInstructionResult, type) {
   setOwnershipKind(ownershipKind);
   setIndex(index);
 }
@@ -1556,7 +1600,7 @@ ValueOwnershipKind MultipleValueInstructionResult::getOwnershipKind() const {
   return ValueOwnershipKind(Bits.MultipleValueInstructionResult.VOKind);
 }
 
-MultipleValueInstruction *MultipleValueInstructionResult::getParent() {
+MultipleValueInstruction *MultipleValueInstructionResult::getParentImpl() const {
   char *Ptr = reinterpret_cast<char *>(
       const_cast<MultipleValueInstructionResult *>(this));
 

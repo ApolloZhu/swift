@@ -32,7 +32,7 @@ class SILBuilder;
 class SILLocation;
 class SILModule;
 class SILType;
-enum class CastConsumptionKind : unsigned char;
+enum class CastConsumptionKind : uint8_t;
 struct SILDynamicCastInst;
 
 enum class DynamicCastFeasibility {
@@ -168,6 +168,7 @@ public:
     return SILDynamicCastInst(cast<ID>(inst));
 #include "swift/SIL/SILNodes.def"
     }
+    llvm_unreachable("covered switch");
   }
 
   SILDynamicCastKind getKind() const {
@@ -359,6 +360,7 @@ public:
     case SILDynamicCastKind::UnconditionalCheckedCastValueInst:
       return cast<UnconditionalCheckedCastValueInst>(inst)->getSourceLoweredType();
     }
+    llvm_unreachable("covered switch");
   }
 
   CanType getTargetFormalType() const {

@@ -10,9 +10,6 @@
 #
 #===----------------------------------------------------------------------===#
 
-set(swift_concurrency_objc_sources
-  SwiftNativeNSObject.mm)
-
 set(LLVM_OPTIONAL_SOURCES
   ${swift_concurrency_objc_sources})
 
@@ -34,10 +31,15 @@ endif()
 
 
 add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB
+  ../CompatibilityOverride/CompatibilityOverride.cpp
   Actor.cpp
   Actor.swift
+  AsyncLet.cpp
+  AsyncLet.swift
   CheckedContinuation.swift
   GlobalExecutor.cpp
+  Errors.swift
+  Error.cpp
   Executor.swift
   AsyncCompactMapSequence.swift
   AsyncDropFirstSequence.swift
@@ -55,7 +57,10 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   AsyncThrowingFlatMapSequence.swift
   AsyncThrowingMapSequence.swift
   AsyncThrowingPrefixWhileSequence.swift
+  GlobalActor.swift
+  MainActor.swift
   PartialAsyncTask.swift
+  SourceCompatibilityShims.swift
   Task.cpp
   Task.swift
   TaskCancellation.swift
@@ -65,7 +70,13 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   TaskGroup.swift
   TaskLocal.cpp
   TaskLocal.swift
+  ThreadSanitizer.cpp
   Mutex.cpp
+  AsyncStreamBuffer.swift
+  AsyncStream.swift
+  AsyncThrowingStream.swift
+  AsyncStream.cpp
+  Deque.swift
   ${swift_concurrency_objc_sources}
 
   SWIFT_MODULE_DEPENDS_LINUX Glibc
@@ -83,6 +94,8 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
     ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
     -parse-stdlib
     -Xfrontend -enable-experimental-concurrency
-  LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
+    -Xfrontend -define-availability
+    -Xfrontend \"SwiftStdlib 5.5:macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0\"
+  LINK_FLAGS "${SWIFT_RUNTIME_CONCURRENCY_SWIFT_LINK_FLAGS}"
   INSTALL_IN_COMPONENT stdlib
 )

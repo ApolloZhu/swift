@@ -767,7 +767,7 @@ protected:
     // If needed, generate constraints for everything in the case statement.
     if (cs) {
       auto locator = cs->getConstraintLocator(
-          subjectExpr, LocatorPathElt::ContextualType());
+          subjectExpr, LocatorPathElt::ContextualType(CTP_Initialization));
       Type subjectType = cs->getType(subjectExpr);
 
       if (cs->generateConstraints(caseStmt, dc, subjectType, locator)) {
@@ -851,7 +851,7 @@ protected:
     cs->addConstraint(
         ConstraintKind::Equal, cs->getType(arrayInitExpr), arrayType,
         cs->getConstraintLocator(
-          arrayInitExpr, LocatorPathElt::ContextualType()));
+            arrayInitExpr, LocatorPathElt::ContextualType(CTP_Initialization)));
 
     // Form a call to Array.append(_:) to add the result of executing each
     // iteration of the loop body to the array formed above.
@@ -1587,10 +1587,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
     }
 
     if (attr) {
-      ctx.Diags.diagnose(
-          attr->getLocation(), diag::result_builder_remove_attr)
-        .fixItRemove(attr->getRangeWithAt());
-      attr->setInvalid();
+      diagnoseAndRemoveAttr(func, attr, diag::result_builder_remove_attr);
     }
 
     // Note that one can remove all of the return statements.
@@ -1691,16 +1688,15 @@ ConstraintSystem::matchResultBuilder(
   assert(builder->getAttrs().hasAttribute<ResultBuilderAttr>());
 
   if (InvalidResultBuilderBodies.count(fn)) {
-    (void)recordFix(
-        IgnoreInvalidResultBuilderBody::duringConstraintGeneration(
-            *this, getConstraintLocator(fn.getAbstractClosureExpr())));
+    (void)recordFix(IgnoreInvalidResultBuilderBody::create(
+        *this, getConstraintLocator(fn.getAbstractClosureExpr())));
     return getTypeMatchSuccess();
   }
 
   // Pre-check the body: pre-check any expressions in it and look
   // for return statements.
   auto request =
-      PreCheckResultBuilderRequest{{fn, /*SuppressDiagnostics=*/true}};
+      PreCheckResultBuilderRequest{{fn, /*SuppressDiagnostics=*/false}};
   switch (evaluateOrDefault(getASTContext().evaluator, request,
                             ResultBuilderBodyPreCheck::Error)) {
   case ResultBuilderBodyPreCheck::Okay:
@@ -1708,10 +1704,12 @@ ConstraintSystem::matchResultBuilder(
     break;
 
   case ResultBuilderBodyPreCheck::Error: {
+    InvalidResultBuilderBodies.insert(fn);
+
     if (!shouldAttemptFixes())
       return getTypeMatchFailure(locator);
 
-    if (recordFix(IgnoreInvalidResultBuilderBody::duringPreCheck(
+    if (recordFix(IgnoreInvalidResultBuilderBody::create(
             *this, getConstraintLocator(fn.getAbstractClosureExpr()))))
       return getTypeMatchFailure(locator);
 
@@ -1776,9 +1774,8 @@ ConstraintSystem::matchResultBuilder(
     if (transaction.hasErrors()) {
       InvalidResultBuilderBodies.insert(fn);
 
-      if (recordFix(
-              IgnoreInvalidResultBuilderBody::duringConstraintGeneration(
-                  *this, getConstraintLocator(fn.getAbstractClosureExpr()))))
+      if (recordFix(IgnoreInvalidResultBuilderBody::create(
+              *this, getConstraintLocator(fn.getAbstractClosureExpr()))))
         return getTypeMatchFailure(locator);
 
       return getTypeMatchSuccess();
@@ -1869,8 +1866,11 @@ public:
       DiagnosticTransaction transaction(diagEngine);
 
       HasError |= ConstraintSystem::preCheckExpression(
-          E, DC, /*replaceInvalidRefsWithErrors=*/false);
+          E, DC, /*replaceInvalidRefsWithErrors=*/true);
       HasError |= transaction.hasErrors();
+
+      if (!HasError)
+        HasError |= containsErrorExpr(E);
 
       if (SuppressDiagnostics)
         transaction.abort();
@@ -1892,6 +1892,29 @@ public:
     return std::make_pair(true, S);
   }
 
+  /// Check whether given expression (including single-statement
+  /// closures) contains `ErrorExpr` as one of its sub-expressions.
+  bool containsErrorExpr(Expr *expr) {
+    bool hasError = false;
+
+    expr->forEachChildExpr([&](Expr *expr) -> Expr * {
+      hasError |= isa<ErrorExpr>(expr);
+      if (hasError)
+        return nullptr;
+
+      if (auto *closure = dyn_cast<ClosureExpr>(expr)) {
+        if (shouldTypeCheckInEnclosingExpression(closure)) {
+          hasError |= containsErrorExpr(closure->getSingleExpressionBody());
+          return hasError ? nullptr : expr;
+        }
+      }
+
+      return expr;
+    });
+
+    return hasError;
+  }
+
   /// Ignore patterns.
   std::pair<bool, Pattern*> walkToPatternPre(Pattern *pat) override {
     return { false, pat };
@@ -1902,13 +1925,6 @@ public:
 
 ResultBuilderBodyPreCheck PreCheckResultBuilderRequest::evaluate(
     Evaluator &evaluator, PreCheckResultBuilderDescriptor owner) const {
-  // We don't want to do the precheck if it will already have happened in
-  // the enclosing expression.
-  bool skipPrecheck = false;
-  if (auto closure = dyn_cast_or_null<ClosureExpr>(
-          owner.Fn.getAbstractClosureExpr()))
-    skipPrecheck = shouldTypeCheckInEnclosingExpression(closure);
-
   return PreCheckResultBuilderApplication(
              owner.Fn, /*skipPrecheck=*/false,
              /*suppressDiagnostics=*/owner.SuppressDiagnostics)

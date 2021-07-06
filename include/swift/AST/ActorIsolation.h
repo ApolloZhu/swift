@@ -24,13 +24,17 @@ class raw_ostream;
 }
 
 namespace swift {
-class ClassDecl;
+class DeclContext;
+class ModuleDecl;
+class NominalTypeDecl;
 class SubstitutionMap;
-class Type;
 
 /// Determine whether the given types are (canonically) equal, declared here
 /// to avoid having to include Types.h.
 bool areTypesEqual(Type type1, Type type2);
+
+/// Determine whether the given type is suitable as a concurrent value type.
+bool isSendableType(ModuleDecl *module, Type type);
 
 /// Describes the actor isolation of a given declaration, which determines
 /// the actors with which it can interact.
@@ -40,19 +44,18 @@ public:
     /// The actor isolation has not been specified. It is assumed to be
     /// unsafe to interact with this declaration from any actor.
     Unspecified = 0,
-    /// The declaration is isolated to the instance of an actor class.
+    /// The declaration is isolated to the instance of an actor.
     /// For example, a mutable stored property or synchronous function within
     /// the actor is isolated to the instance of that actor.
     ActorInstance,
+    /// The declaration is isolated to a (potentially) distributed actor.
+    /// Distributed actors may access _their_ state (same as 'ActorInstance')
+    /// however others may not access any properties on other distributed actors.
+    DistributedActorInstance,
     /// The declaration is explicitly specified to be independent of any actor,
     /// meaning that it can be used from any actor but is also unable to
     /// refer to the isolated state of any given actor.
     Independent,
-    /// The declaration is explicitly specified to be independent of any actor,
-    /// but the programmer promises to protect the declaration from concurrent
-    /// accesses manually. Thus, it is okay if this declaration is a mutable 
-    /// variable that creates storage.
-    IndependentUnsafe,
     /// The declaration is isolated to a global actor. It can refer to other
     /// entities with the same global actor.
     GlobalActor,
@@ -81,22 +84,16 @@ public:
     return ActorIsolation(Unspecified, nullptr);
   }
 
-  static ActorIsolation forIndependent(ActorIndependentKind indepKind) {
-    ActorIsolation::Kind isoKind;
-    switch (indepKind) {
-      case ActorIndependentKind::Safe:
-        isoKind = Independent;
-        break;
-        
-      case ActorIndependentKind::Unsafe:
-        isoKind = IndependentUnsafe;
-        break;
-    }
-    return ActorIsolation(isoKind, nullptr);
+  static ActorIsolation forIndependent() {
+    return ActorIsolation(Independent, nullptr);
   }
 
   static ActorIsolation forActorInstance(NominalTypeDecl *actor) {
     return ActorIsolation(ActorInstance, actor);
+  }
+
+  static ActorIsolation forDistributedActorInstance(NominalTypeDecl *actor) {
+    return ActorIsolation(DistributedActorInstance, actor);
   }
 
   static ActorIsolation forGlobalActor(Type globalActor, bool unsafe) {
@@ -111,7 +108,7 @@ public:
   bool isUnspecified() const { return kind == Unspecified; }
 
   NominalTypeDecl *getActor() const {
-    assert(getKind() == ActorInstance);
+    assert(getKind() == ActorInstance || getKind() == DistributedActorInstance);
     return actor;
   }
 
@@ -138,11 +135,11 @@ public:
 
     switch (lhs.kind) {
     case Independent:
-    case IndependentUnsafe:
     case Unspecified:
       return true;
 
     case ActorInstance:
+    case DistributedActorInstance:
       return lhs.actor == rhs.actor;
 
     case GlobalActor:

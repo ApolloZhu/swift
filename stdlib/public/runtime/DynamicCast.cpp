@@ -14,12 +14,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "CompatibilityOverride.h"
+#include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ErrorObject.h"
 #include "Private.h"
 #include "SwiftHashableSupport.h"
 #include "swift/ABI/MetadataValues.h"
 #include "swift/Basic/Lazy.h"
+#include "swift/Runtime/Bincompat.h"
 #include "swift/Runtime/Casting.h"
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/ExistentialContainer.h"
@@ -110,12 +111,6 @@ extern "C" const StructDescriptor NOMINAL_TYPE_DESCR_SYM(Sh);
 /// Nominal type descriptor for Swift.String.
 extern "C" const StructDescriptor NOMINAL_TYPE_DESCR_SYM(SS);
 
-// If this returns `true`, then we will call `fatalError` when we encounter a
-// null reference in a storage locaation whose type does not allow null.
-static bool unexpectedNullIsFatal() {
-  return true;  // Placeholder for an upcoming check.
-}
-
 /// This issues a fatal error or warning if the srcValue contains a null object
 /// reference.  It is used when the srcType is a non-nullable reference type, in
 /// which case it is dangerous to continue with a null reference.  The null
@@ -134,7 +129,7 @@ static HeapObject * getNonNullSrcObject(OpaqueValue *srcValue,
   const char *msg = "Found unexpected null pointer value"
                     " while trying to cast value of type '%s' (%p)"
                     " to '%s' (%p)%s\n";
-  if (unexpectedNullIsFatal()) {
+  if (runtime::bincompat::unexpectedObjCNullWhileCastingIsFatal()) {
     // By default, Swift 5.4 and later issue a fatal error.
     swift::fatalError(/* flags = */ 0, msg,
                       srcTypeName.c_str(), srcType,
@@ -1044,7 +1039,7 @@ initializeToNilAtDepth(OpaqueValue *destLocation, const Metadata *destType, int 
 }
 
 static void
-copyNil(OpaqueValue *destLocation, const Metadata *destType, const Metadata *srcType)
+copyNilPreservingDepth(OpaqueValue *destLocation, const Metadata *destType, const Metadata *srcType)
 {
   assert(srcType->getKind() == MetadataKind::Optional);
   assert(destType->getKind() == MetadataKind::Optional);
@@ -1087,7 +1082,13 @@ tryCastUnwrappingOptionalBoth(
     srcValue, /*emptyCases=*/1);
   auto sourceIsNil = (sourceEnumCase != 0);
   if (sourceIsNil) {
-    copyNil(destLocation, destType, srcType);
+    if (runtime::bincompat::useLegacyOptionalNilInjection()) {
+      auto destInnerType = cast<EnumMetadata>(destType)->getGenericArgs()[0];
+      // Set .none at the outer level
+      destInnerType->vw_storeEnumTagSinglePayload(destLocation, 1, 1);
+    } else {
+      copyNilPreservingDepth(destLocation, destType, srcType);
+    }
     return DynamicCastResult::SuccessViaCopy; // nil was essentially copied to dest
   } else {
     auto destEnumType = cast<EnumMetadata>(destType);
@@ -1513,41 +1514,62 @@ tryCastToClassExistentialViaSwiftValue(
   auto destExistentialLocation
     = reinterpret_cast<ClassExistentialContainer *>(destLocation);
 
-  // Fail if the target has constraints that make it unsuitable for
-  // a __SwiftValue box.
-  // FIXME: We should not have different checks here for
-  // Obj-C vs non-Obj-C.  The _SwiftValue boxes should conform
-  // to the exact same protocols on both platforms.
-  bool destIsConstrained = destExistentialType->NumProtocols != 0;
-  if (destIsConstrained) {
-#if SWIFT_OBJC_INTEROP // __SwiftValue is an Obj-C class
-    if (!findSwiftValueConformances(
-          destExistentialType, destExistentialLocation->getWitnessTables())) {
+  switch (srcType->getKind()) {
+  case MetadataKind::Class:
+  case MetadataKind::ObjCClassWrapper:
+  case MetadataKind::ForeignClass:
+    // Class references always go directly into
+    // class existentials; it makes no sense to wrap them.
+    return DynamicCastResult::Failure;
+
+  case MetadataKind::Metatype: {
+#if SWIFT_OBJC_INTEROP
+    auto metatypePtr = reinterpret_cast<const Metadata **>(srcValue);
+    auto metatype = *metatypePtr;
+    switch (metatype->getKind()) {
+    case MetadataKind::Class:
+    case MetadataKind::ObjCClassWrapper:
+    case MetadataKind::ForeignClass:
+      // Exclude class metatypes on Darwin, since those are object types and can
+      // be stored directly.
       return DynamicCastResult::Failure;
-    }
-#else // __SwiftValue is a native class
-    if (!swift_swiftValueConformsTo(destType, destType)) {
-      return DynamicCastResult::Failure;
+    default:
+      break;
     }
 #endif
+    // Non-class metatypes are never objects, and
+    // metatypes on non-Darwin are never objects, so
+    // fall through to box those.
+    SWIFT_FALLTHROUGH;
   }
 
+  default: {
+    if (destExistentialType->NumProtocols != 0) {
+      // The destination is a class-constrained protocol type
+      // and the source is not a class, so....
+      return DynamicCastResult::Failure;
+    } else {
+      // This is a simple (unconstrained) `AnyObject` so we can populate
+      // it by stuffing a non-class instance into a __SwiftValue box
 #if SWIFT_OBJC_INTEROP
-  auto object = bridgeAnythingToSwiftValueObject(
-    srcValue, srcType, takeOnSuccess);
-  destExistentialLocation->Value = object;
-  if (takeOnSuccess) {
-    return DynamicCastResult::SuccessViaTake;
-  } else {
-    return DynamicCastResult::SuccessViaCopy;
-  }
+      auto object = bridgeAnythingToSwiftValueObject(
+        srcValue, srcType, takeOnSuccess);
+      destExistentialLocation->Value = object;
+      if (takeOnSuccess) {
+        return DynamicCastResult::SuccessViaTake;
+      } else {
+        return DynamicCastResult::SuccessViaCopy;
+      }
 # else
-  // Note: Code below works correctly on both Obj-C and non-Obj-C platforms,
-  // but the code above is slightly faster on Obj-C platforms.
-  auto object = _bridgeAnythingToObjectiveC(srcValue, srcType);
-  destExistentialLocation->Value = object;
-  return DynamicCastResult::SuccessViaCopy;
+      // Note: Code below works correctly on both Obj-C and non-Obj-C platforms,
+      // but the code above is slightly faster on Obj-C platforms.
+      auto object = _bridgeAnythingToObjectiveC(srcValue, srcType);
+      destExistentialLocation->Value = object;
+      return DynamicCastResult::SuccessViaCopy;
 #endif
+    }
+  }
+  }
 }
 
 static DynamicCastResult
@@ -2327,4 +2349,4 @@ swift_dynamicCastImpl(OpaqueValue *destLocation,
 }
 
 #define OVERRIDE_DYNAMICCASTING COMPATIBILITY_OVERRIDE
-#include "CompatibilityOverride.def"
+#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH

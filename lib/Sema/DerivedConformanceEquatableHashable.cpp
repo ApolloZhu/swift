@@ -79,8 +79,8 @@ deriveBodyEquatable_enum_uninhabited_eq(AbstractFunctionDecl *eqDecl, void *) {
                                   SourceLoc(), /*HasTrailingClosure*/ false,
                                   /*implicit*/ true,
                                   TupleType::get(abTupleElts, C));
-  auto switchStmt = SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), abExpr,
-                                       SourceLoc(), cases, SourceLoc(), C);
+  auto switchStmt =
+      SwitchStmt::createImplicit(LabeledStmtInfo(), abExpr, cases, C);
   statements.push_back(switchStmt);
 
   auto body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
@@ -134,16 +134,9 @@ deriveBodyEquatable_enum_noAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
                                       fnType);
   }
 
-  TupleTypeElt abTupleElts[2] = { aIndex->getType(), bIndex->getType() };
-  TupleExpr *abTuple = TupleExpr::create(C, SourceLoc(), { aIndex, bIndex },
-                                         { }, { }, SourceLoc(),
-                                         /*HasTrailingClosure*/ false,
-                                         /*Implicit*/ true,
-                                         TupleType::get(abTupleElts, C));
-
-  auto *cmpExpr = new (C) BinaryExpr(
-      cmpFuncExpr, abTuple, /*implicit*/ true,
-      fnType->castTo<FunctionType>()->getResult());
+  auto *cmpExpr =
+      BinaryExpr::create(C, aIndex, cmpFuncExpr, bIndex, /*implicit*/ true,
+                         fnType->castTo<FunctionType>()->getResult());
   cmpExpr->setThrows(false);
   statements.push_back(new (C) ReturnStmt(SourceLoc(), cmpExpr));
 
@@ -276,8 +269,8 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
   auto abExpr = TupleExpr::create(C, SourceLoc(), { aRef, bRef }, {}, {},
                                   SourceLoc(), /*HasTrailingClosure*/ false,
                                   /*implicit*/ true);
-  auto switchStmt = SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), abExpr,
-                                       SourceLoc(), cases, SourceLoc(), C);
+  auto switchStmt =
+      SwitchStmt::createImplicit(LabeledStmtInfo(), abExpr, cases, C);
   statements.push_back(switchStmt);
 
   auto body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
@@ -396,7 +389,7 @@ deriveEquatable_eq(
     getParamDecl("b")
   });
 
-  auto boolTy = C.getBoolDecl()->getDeclaredInterfaceType();
+  auto boolTy = C.getBoolType();
 
   Identifier generatedIdentifier;
   if (parentDC->getParentModule()->isResilient()) {
@@ -750,8 +743,8 @@ deriveBodyHashable_enum_hasAssociatedValues_hashInto(
   // generate: switch enumVar { }
   auto enumRef = new (C) DeclRefExpr(selfDecl, DeclNameLoc(),
                                      /*implicit*/true);
-  auto switchStmt = SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), enumRef,
-                                       SourceLoc(), cases, SourceLoc(), C);
+  auto switchStmt =
+      SwitchStmt::createImplicit(LabeledStmtInfo(), enumRef, cases, C);
 
   auto body = BraceStmt::create(C, SourceLoc(), {ASTNode(switchStmt)},
                                 SourceLoc());
@@ -860,21 +853,20 @@ static ValueDecl *deriveHashable_hashValue(DerivedConformance &derived) {
   ASTContext &C = derived.Context;
 
   auto parentDC = derived.getConformanceContext();
-  Type intType = C.getIntDecl()->getDeclaredInterfaceType();
+  Type intType = C.getIntType();
 
   // We can't form a Hashable conformance if Int isn't Hashable or
   // ExpressibleByIntegerLiteral.
-  if (TypeChecker::conformsToProtocol(
-          intType, C.getProtocol(KnownProtocolKind::Hashable), parentDC)
-          .isInvalid()) {
+  if (!TypeChecker::conformsToKnownProtocol(
+          intType, KnownProtocolKind::Hashable,
+          derived.getParentModule())) {
     derived.ConformanceDecl->diagnose(diag::broken_int_hashable_conformance);
     return nullptr;
   }
 
-  ProtocolDecl *intLiteralProto =
-      C.getProtocol(KnownProtocolKind::ExpressibleByIntegerLiteral);
-  if (TypeChecker::conformsToProtocol(intType, intLiteralProto, parentDC)
-          .isInvalid()) {
+  if (!TypeChecker::conformsToKnownProtocol(
+          intType, KnownProtocolKind::ExpressibleByIntegerLiteral,
+          derived.getParentModule())) {
     derived.ConformanceDecl->diagnose(
       diag::broken_int_integer_literal_convertible_conformance);
     return nullptr;
@@ -892,6 +884,7 @@ static ValueDecl *deriveHashable_hashValue(DerivedConformance &derived) {
       /*FuncLoc=*/SourceLoc(), /*AccessorKeywordLoc=*/SourceLoc(),
       AccessorKind::Get, hashValueDecl,
       /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
+      /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
       /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
       /*GenericParams=*/nullptr, params,
       intType, parentDC);

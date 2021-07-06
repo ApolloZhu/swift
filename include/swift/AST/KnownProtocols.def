@@ -71,6 +71,9 @@ PROTOCOL(OptionSet)
 PROTOCOL(CaseIterable)
 PROTOCOL(SIMDScalar)
 PROTOCOL(BinaryInteger)
+PROTOCOL(RangeReplaceableCollection)
+PROTOCOL(SerialExecutor)
+PROTOCOL(GlobalActor)
 
 PROTOCOL_(BridgedNSError)
 PROTOCOL_(BridgedStoredNSError)
@@ -80,8 +83,8 @@ PROTOCOL(CodingKey)
 PROTOCOL(Encodable)
 PROTOCOL(Decodable)
 
-PROTOCOL(ConcurrentValue)
-PROTOCOL(UnsafeConcurrentValue)
+PROTOCOL(Sendable)
+PROTOCOL(UnsafeSendable)
 
 PROTOCOL_(ObjectiveCBridgeable)
 PROTOCOL_(DestructorSafeContainer)
@@ -90,6 +93,10 @@ PROTOCOL(StringInterpolationProtocol)
 
 PROTOCOL(AdditiveArithmetic)
 PROTOCOL(Differentiable)
+
+// Distributed Actors
+PROTOCOL(DistributedActor)
+PROTOCOL(ActorTransport)
 
 PROTOCOL(AsyncSequence)
 PROTOCOL(AsyncIteratorProtocol)

@@ -24,6 +24,7 @@
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
@@ -67,6 +68,7 @@ static Expr *isImplicitPromotionToOptional(Expr *E) {
 ///   - Error about collection literals that default to Any collections in
 ///     invalid positions.
 ///   - Marker protocols cannot occur as the type of an as? or is expression.
+///   - KeyPath expressions cannot refer to effectful properties / subscripts
 ///
 static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
                                          bool isExprStmt) {
@@ -149,6 +151,9 @@ static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
         CallArgs.insert(DSE->getIndex());
 
       if (auto *KPE = dyn_cast<KeyPathExpr>(E)) {
+        // raise an error if this KeyPath contains an effectful member.
+        checkForEffectfulKeyPath(KPE);
+
         for (auto Comp : KPE->getComponents()) {
           if (auto *Arg = Comp.getIndexExpr())
             CallArgs.insert(Arg);
@@ -319,6 +324,25 @@ static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
       }
       
       return { true, E };
+    }
+
+    /// Visit each component of the keypath and emit a diganostic if they
+    /// refer to a member that has effects.
+    void checkForEffectfulKeyPath(KeyPathExpr *keyPath) {
+      for (const auto &component : keyPath->getComponents()) {
+        if (component.hasDeclRef()) {
+          auto decl = component.getDeclRef().getDecl();
+          if (auto asd = dyn_cast<AbstractStorageDecl>(decl)) {
+            if (auto getter = asd->getEffectfulGetAccessor()) {
+              Ctx.Diags.diagnose(component.getLoc(),
+                                 diag::effectful_keypath_component,
+                                 asd->getDescriptiveKind());
+              Ctx.Diags.diagnose(asd->getLoc(), diag::kind_declared_here,
+                                 asd->getDescriptiveKind());
+            }
+          }
+        }
+      }
     }
 
     void checkCheckedCastExpr(CheckedCastExpr *cast) {
@@ -1546,6 +1570,13 @@ static void diagnoseImplicitSelfUseInClosure(const Expr *E,
           return false;
       }
 
+      // If the closure was used in a context where it's explicitly stated
+      // that it does not need "self." qualification, don't require it.
+      if (auto closure = dyn_cast<ClosureExpr>(CE)) {
+        if (closure->allowsImplicitSelfCapture())
+          return false;
+      }
+
       return true;
     }
 
@@ -1809,13 +1840,9 @@ bool TypeChecker::getDefaultGenericArgumentsString(
     genericParamText << contextTy;
   };
 
-  // FIXME: We can potentially be in the middle of creating a generic signature
-  // if we get here.  Break this cycle.
-  if (typeDecl->hasComputedGenericSignature()) {
-    llvm::interleave(typeDecl->getInnermostGenericParamTypes(),
-                     printGenericParamSummary,
-                     [&] { genericParamText << ", "; });
-  }
+  llvm::interleave(typeDecl->getInnermostGenericParamTypes(),
+                   printGenericParamSummary,
+                   [&] { genericParamText << ", "; });
   
   genericParamText << ">";
   return true;
@@ -1847,28 +1874,45 @@ bool swift::diagnoseArgumentLabelError(ASTContext &ctx,
   llvm::SmallString<16> missingBuffer;
   llvm::SmallString<16> extraBuffer;
   for (unsigned i = 0; i != n; ++i) {
-    Identifier oldName;
+    // oldName and newName are
+    //  - None if i is out of bounds for the argument list
+    //  - nullptr for an argument without a label
+    //  - have a value if the argument has a label
+    Optional<Identifier> oldName;
     if (i < argList.args.size())
       oldName = argList.labels[i];
-    Identifier newName;
+    Optional<Identifier> newName;
     if (i < newNames.size())
       newName = newNames[i];
 
+    assert(oldName || newName && "We can't have oldName and newName out of "
+                                 "bounds, otherwise n would be smaller");
+
     if (oldName == newName ||
-        (argList.hasTrailingClosure && i == argList.args.size()-1 &&
+        (argList.hasTrailingClosure && i == argList.args.size() - 1 &&
          (numMissing > 0 || numExtra > 0 || numWrong > 0)))
       continue;
 
-    if (oldName.empty()) {
+    if (!oldName.hasValue() && newName.hasValue()) {
       ++numMissing;
-      missingBuffer += newName.str();
-      missingBuffer += ":";
-    } else if (newName.empty()) {
+      missingBuffer += newName->str();
+      missingBuffer += ':';
+    } else if (oldName.hasValue() && !newName.hasValue()) {
       ++numExtra;
-      extraBuffer += oldName.str();
+      extraBuffer += oldName->str();
       extraBuffer += ':';
-    } else
+    } else if (oldName->empty()) {
+      // In the cases from here onwards oldValue and newValue are not null
+      ++numMissing;
+      missingBuffer += newName->str();
+      missingBuffer += ":";
+    } else if (newName->empty()) {
+      ++numExtra;
+      extraBuffer += oldName->str();
+      extraBuffer += ':';
+    } else {
       ++numWrong;
+    }
   }
 
   // Emit the diagnostic.
@@ -2448,26 +2492,16 @@ public:
     // If this is a VarDecl, then add it to our list of things to track.
     if (auto *vd = dyn_cast<VarDecl>(D)) {
       if (shouldTrackVarDecl(vd)) {
-        // Inline constructor.
-        auto defaultFlags = [&]() -> unsigned {
-          // If this VarDecl is nested inside of a CaptureListExpr, remember
-          // that fact for better diagnostics.
-          auto parentAsExpr = Parent.getAsExpr();
-          if (parentAsExpr && isa<CaptureListExpr>(parentAsExpr))
-            return RK_CaptureList | RK_Defined;
-          // Otherwise, return none.
-          return RK_Defined;
-        }();
+        unsigned flags = RK_Defined;
+        if (vd->isCaptureList())
+          flags |= RK_CaptureList;
 
-        if (!vd->isImplicit()) {
-          if (auto *childVd =
-                  vd->getCorrespondingCaseBodyVariable().getPtrOrNull()) {
-            // Child vars are never in capture lists.
-            assert(defaultFlags == RK_Defined);
-            VarDecls[childVd] |= RK_Defined;
-          }
+        if (auto childVd = vd->getCorrespondingCaseBodyVariable()) {
+          // Child vars are never in capture lists.
+          assert(flags == RK_Defined);
+          addMark(childVd.get(), flags);
         }
-        VarDecls[vd] |= defaultFlags;
+        addMark(vd, flags);
       }
     }
 
@@ -2844,12 +2878,31 @@ VarDeclUsageChecker::~VarDeclUsageChecker() {
                   
                   // If the subexpr is an "as?" cast, we can rewrite it to
                   // be an "is" test.
-                  bool isIsTest = false;
-                  if (isa<ConditionalCheckedCastExpr>(initExpr) &&
-                      !initExpr->isImplicit()) {
-                    noParens = isIsTest = true;
+                  ConditionalCheckedCastExpr *CCE = nullptr;
+
+                  // initExpr can be wrapped inside parens or try expressions.
+                  if (auto ccExpr = dyn_cast<ConditionalCheckedCastExpr>(
+                          initExpr->getValueProvidingExpr())) {
+                    if (!ccExpr->isImplicit()) {
+                      CCE = ccExpr;
+                      noParens = true;
+                    }
                   }
-                  
+
+                  // In cases where the value is optional, the cast expr is
+                  // wrapped inside OptionalEvaluationExpr. Unwrap it to get
+                  // ConditionalCheckedCastExpr.
+                  if (auto oeExpr = dyn_cast<OptionalEvaluationExpr>(
+                          initExpr->getValueProvidingExpr())) {
+                    if (auto ccExpr = dyn_cast<ConditionalCheckedCastExpr>(
+                            oeExpr->getSubExpr()->getValueProvidingExpr())) {
+                      if (!ccExpr->isImplicit()) {
+                        CCE = ccExpr;
+                        noParens = true;
+                      }
+                    }
+                  }
+
                   auto diagIF = Diags.diagnose(var->getLoc(),
                                                diag::pbd_never_used_stmtcond,
                                             var->getName());
@@ -2857,10 +2910,9 @@ VarDeclUsageChecker::~VarDeclUsageChecker() {
                   diagIF.fixItReplaceChars(introducerLoc,
                                            initExpr->getStartLoc(),
                                            &"("[noParens]);
-                  
-                  if (isIsTest) {
+
+                  if (CCE) {
                     // If this was an "x as? T" check, rewrite it to "x is T".
-                    auto CCE = cast<ConditionalCheckedCastExpr>(initExpr);
                     diagIF.fixItReplace(SourceRange(CCE->getLoc(),
                                                     CCE->getQuestionLoc()),
                                         "is");
@@ -3066,13 +3118,11 @@ void VarDeclUsageChecker::markStoredOrInOutExpr(Expr *E, unsigned Flags) {
   // reads and writes its base; an application of a ReferenceWritableKeyPath
   // only reads its base; the other KeyPath types cannot be written at all.
   if (auto *KPA = dyn_cast<KeyPathApplicationExpr>(E)) {
-    auto &C = KPA->getType()->getASTContext();
     KPA->getKeyPath()->walk(*this);
 
     bool isMutating =
       (Flags & RK_Written) &&
-      KPA->getKeyPath()->getType()->getAnyNominal()
-        == C.getWritableKeyPathDecl();
+      KPA->getKeyPath()->getType()->isWritableKeyPath();
     markBaseOfStorageUse(KPA->getBase(), isMutating);
     return;
   }
@@ -4323,9 +4373,8 @@ static void diagnoseDeprecatedWritableKeyPath(const Expr *E,
         return;
 
       if (auto *keyPathExpr = dyn_cast<KeyPathExpr>(E->getKeyPath())) {
-        auto *decl = keyPathExpr->getType()->getNominalOrBoundGenericNominal();
-        if (decl != Ctx.getWritableKeyPathDecl() &&
-            decl != Ctx.getReferenceWritableKeyPathDecl())
+        if (!keyPathExpr->getType()->isWritableKeyPath() &&
+            !keyPathExpr->getType()->isReferenceWritableKeyPath())
           return;
 
         assert(keyPathExpr->getComponents().size() > 0);
@@ -4487,11 +4536,6 @@ static void diagnoseComparisonWithNaN(const Expr *E, const DeclContext *DC) {
     void tryDiagnoseComparisonWithNaN(BinaryExpr *BE) {
       ValueDecl *comparisonDecl = nullptr;
 
-      // Comparison functions like == or <= take two arguments.
-      if (BE->getArg()->getNumElements() != 2) {
-        return;
-      }
-
       // Dig out the function declaration.
       if (auto Fn = BE->getFn()) {
         if (auto DSCE = dyn_cast<DotSyntaxCallExpr>(Fn)) {
@@ -4512,16 +4556,25 @@ static void diagnoseComparisonWithNaN(const Expr *E, const DeclContext *DC) {
         return;
       }
 
-      auto firstArg = BE->getArg()->getElement(0);
-      auto secondArg = BE->getArg()->getElement(1);
+      auto *firstArg = BE->getLHS();
+      auto *secondArg = BE->getRHS();
+
+      // Make sure that both arguments are valid before doing anything else,
+      // this helps us to debug reports of crashes in `conformsToKnownProtocol`
+      // referencing arguments (rdar://78920375).
+      //
+      // Since this diagnostic should only be run on type-checked AST,
+      // it's unclear what caused one of the arguments to have null type.
+      assert(firstArg->getType() && "Expected valid type for first argument");
+      assert(secondArg->getType() && "Expected valid type for second argument");
 
       // Both arguments must conform to FloatingPoint protocol.
-      if (!conformsToKnownProtocol(const_cast<DeclContext *>(DC),
-                                   firstArg->getType(),
-                                   KnownProtocolKind::FloatingPoint) ||
-          !conformsToKnownProtocol(const_cast<DeclContext *>(DC),
-                                   secondArg->getType(),
-                                   KnownProtocolKind::FloatingPoint)) {
+      if (!TypeChecker::conformsToKnownProtocol(firstArg->getType(),
+                                                KnownProtocolKind::FloatingPoint,
+                                                DC->getParentModule()) ||
+          !TypeChecker::conformsToKnownProtocol(secondArg->getType(),
+                                                KnownProtocolKind::FloatingPoint,
+                                                DC->getParentModule())) {
         return;
       }
 
@@ -4598,6 +4651,58 @@ static void diagnoseComparisonWithNaN(const Expr *E, const DeclContext *DC) {
 
   ComparisonWithNaNFinder Walker(DC);
   const_cast<Expr *>(E)->walk(Walker);
+}
+
+namespace {
+
+class CompletionHandlerUsageChecker final : public ASTWalker {
+  ASTContext &ctx;
+
+public:
+  CompletionHandlerUsageChecker(ASTContext &ctx) : ctx(ctx) {}
+
+  bool walkToDeclPre(Decl *D) override { return !isa<PatternBindingDecl>(D); }
+
+  std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
+    if (expr->getType().isNull())
+      return {false, expr}; // Something failed to typecheck, bail out
+
+    if (auto *closure = dyn_cast<ClosureExpr>(expr))
+      return {closure->isBodyAsync(), closure};
+
+    if (auto *call = dyn_cast<ApplyExpr>(expr)) {
+      if (auto *fn = dyn_cast<DeclRefExpr>(call->getFn())) {
+        if (auto *afd = dyn_cast<AbstractFunctionDecl>(fn->getDecl())) {
+          auto *asyncFunc = afd->getAsyncAlternative();
+          if (!asyncFunc)
+            return {false, call};
+          ctx.Diags.diagnose(call->getLoc(), diag::warn_use_async_alternative);
+          ctx.Diags.diagnose(asyncFunc->getLoc(), diag::decl_declared_here,
+                             asyncFunc->getName());
+        }
+      }
+    }
+    return {true, expr};
+  }
+};
+
+} // namespace
+
+void swift::checkFunctionAsyncUsage(AbstractFunctionDecl *decl) {
+  if (!decl->isAsyncContext())
+    return;
+  CompletionHandlerUsageChecker checker(decl->getASTContext());
+  BraceStmt *body = decl->getBody();
+  if (body)
+    body->walk(checker);
+}
+
+void swift::checkPatternBindingDeclAsyncUsage(PatternBindingDecl *decl) {
+  CompletionHandlerUsageChecker checker(decl->getASTContext());
+  for (Expr *init : decl->initializers()) {
+    if (auto closure = dyn_cast_or_null<ClosureExpr>(init))
+      closure->walk(checker);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -4729,9 +4834,6 @@ static OmissionTypeName getTypeNameForOmission(Type type) {
     return "";
 
   ASTContext &ctx = type->getASTContext();
-  Type boolType;
-  if (auto boolDecl = ctx.getBoolDecl())
-    boolType = boolDecl->getDeclaredInterfaceType();
   auto objcBoolType = ctx.getObjCBoolType();
 
   /// Determine the options associated with the given type.
@@ -4740,7 +4842,7 @@ static OmissionTypeName getTypeNameForOmission(Type type) {
     OmissionTypeOptions options;
 
     // Look for Boolean types.
-    if (boolType && type->isEqual(boolType)) {
+    if (type->isBool()) {
       // Swift.Bool
       options |= OmissionTypeFlags::Boolean;
     } else if (objcBoolType && type->isEqual(objcBoolType)) {
@@ -4788,11 +4890,8 @@ static OmissionTypeName getTypeNameForOmission(Type type) {
   if (auto nominal = type->getAnyNominal()) {
     // If we have a collection, get the element type.
     if (auto bound = type->getAs<BoundGenericType>()) {
-      ASTContext &ctx = nominal->getASTContext();
       auto args = bound->getGenericArgs();
-      if (!args.empty() &&
-          (bound->getDecl() == ctx.getArrayDecl() ||
-           bound->getDecl() == ctx.getSetDecl())) {
+      if (!args.empty() && (bound->isArray() || bound->isSet())) {
         return OmissionTypeName(nominal->getName().str(),
                                 getOptions(bound),
                                 getTypeNameForOmission(args[0]).Name);

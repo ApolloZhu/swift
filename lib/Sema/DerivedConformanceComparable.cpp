@@ -78,13 +78,8 @@ deriveBodyComparable_enum_noAssociatedValues_lt(AbstractFunctionDecl *ltDecl,
                                           /*implicit*/ true,
                                           AccessSemantics::Ordinary);
 
-  TupleExpr *abTuple = TupleExpr::create(C, SourceLoc(), { aIndex, bIndex },
-                                         { }, { }, SourceLoc(),
-                                         /*HasTrailingClosure*/ false,
-                                         /*Implicit*/ true);
-
-  auto *cmpExpr = new (C) BinaryExpr(
-      cmpFuncExpr, abTuple, /*implicit*/ true);
+  auto *cmpExpr =
+      BinaryExpr::create(C, aIndex, cmpFuncExpr, bIndex, /*implicit*/ true);
   statements.push_back(new (C) ReturnStmt(SourceLoc(), cmpExpr));
 
   BraceStmt *body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
@@ -210,8 +205,8 @@ deriveBodyComparable_enum_hasAssociatedValues_lt(AbstractFunctionDecl *ltDecl, v
   auto abExpr = TupleExpr::create(C, SourceLoc(), { aRef, bRef }, {}, {},
                                   SourceLoc(), /*HasTrailingClosure*/ false,
                                   /*implicit*/ true);
-  auto switchStmt = SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), abExpr,
-                                       SourceLoc(), cases, SourceLoc(), C);
+  auto switchStmt =
+      SwitchStmt::createImplicit(LabeledStmtInfo(), abExpr, cases, C);
   statements.push_back(switchStmt);
 
   auto body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
@@ -244,7 +239,7 @@ deriveComparable_lt(
     getParamDecl("b")
   });
 
-  auto boolTy = C.getBoolDecl()->getDeclaredInterfaceType();
+  auto boolTy = C.getBoolType();
 
   Identifier generatedIdentifier;
   if (parentDC->getParentModule()->isResilient()) {

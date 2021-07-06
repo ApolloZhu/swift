@@ -656,7 +656,7 @@ public:
   /// Read tokens until we get to one of the specified tokens, then
   /// return without consuming it.  Because we cannot guarantee that the token
   /// will ever occur, this skips to some likely good stopping point.
-  void skipUntil(tok T1, tok T2 = tok::NUM_TOKENS);
+  ParserStatus skipUntil(tok T1, tok T2 = tok::NUM_TOKENS);
   void skipUntilAnyOperator();
 
   /// Skip until a token that starts with '>', and consume it if found.
@@ -680,7 +680,10 @@ public:
   /// Note: this does \em not match angle brackets ("<" and ">")! These are
   /// matched in the source when they refer to a generic type,
   /// but not when used as comparison operators.
-  void skipSingle();
+  ///
+  /// Returns a parser status that can capture whether a code completion token
+  /// was returned.
+  ParserStatus skipSingle();
 
   /// Skip until the next '#else', '#endif' or until eof.
   void skipUntilConditionalBlockClose();
@@ -739,6 +742,14 @@ public:
   /// passed the `-enable-experimental-concurrency` flag to the frontend.
   bool shouldParseExperimentalConcurrency() const {
     return Context.LangOpts.EnableExperimentalConcurrency ||
+      Context.LangOpts.ParseForSyntaxTreeOnly;
+  }
+
+  /// Returns true to indicate that experimental 'distributed actor' syntax
+  /// should be parsed if the parser is only a syntax tree or if the user has
+  /// passed the `-enable-experimental-distributed' flag to the frontend.
+  bool shouldParseExperimentalDistributed() const {
+    return Context.LangOpts.EnableExperimentalDistributed ||
       Context.LangOpts.ParseForSyntaxTreeOnly;
   }
 
@@ -993,7 +1004,8 @@ public:
 
   /// Parse the optional modifiers before a declaration.
   bool parseDeclModifierList(DeclAttributes &Attributes, SourceLoc &StaticLoc,
-                             StaticSpellingKind &StaticSpelling);
+                             StaticSpellingKind &StaticSpelling,
+                             bool isFromClangAttribute = false);
 
   /// Parse an availability attribute of the form
   /// @available(*, introduced: 1.0, deprecated: 3.1).
@@ -1061,7 +1073,22 @@ public:
 
   /// Parse a specific attribute.
   ParserStatus parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
+                                  PatternBindingInitializer *&initContext,
                                   bool isFromClangAttribute = false);
+
+  bool isCustomAttributeArgument();
+  bool canParseCustomAttribute();
+
+  /// Parse a custom attribute after the initial '@'.
+  ///
+  /// \param atLoc The location of the already-parsed '@'.
+  ///
+  /// \param initContext A reference to the initializer context used
+  /// for the set of custom attributes. This should start as nullptr, and
+  /// will get filled in by this function. The same variable should be provided
+  /// for every custom attribute within the same attribute list.
+  ParserResult<CustomAttr> parseCustomAttribute(
+      SourceLoc atLoc, PatternBindingInitializer *&initContext);
 
   bool parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
                              DeclAttrKind DK,
@@ -1072,27 +1099,32 @@ public:
   bool parseVersionTuple(llvm::VersionTuple &Version, SourceRange &Range,
                          const Diagnostic &D);
 
-  bool parseTypeAttributeList(ParamDecl::Specifier &Specifier,
-                              SourceLoc &SpecifierLoc,
-                              TypeAttributes &Attributes) {
+  ParserStatus parseTypeAttributeList(ParamDecl::Specifier &Specifier,
+                                      SourceLoc &SpecifierLoc,
+                                      SourceLoc &IsolatedLoc,
+                                      TypeAttributes &Attributes) {
     if (Tok.isAny(tok::at_sign, tok::kw_inout) ||
         (Tok.is(tok::identifier) &&
          (Tok.getRawText().equals("__shared") ||
-          Tok.getRawText().equals("__owned"))))
-      return parseTypeAttributeListPresent(Specifier, SpecifierLoc, Attributes);
-    return false;
+          Tok.getRawText().equals("__owned") ||
+          Tok.isContextualKeyword("isolated"))))
+      return parseTypeAttributeListPresent(
+          Specifier, SpecifierLoc, IsolatedLoc, Attributes);
+    return makeParserSuccess();
   }
-  bool parseTypeAttributeListPresent(ParamDecl::Specifier &Specifier,
-                                     SourceLoc &SpecifierLoc,
-                                     TypeAttributes &Attributes);
+
+  ParserStatus parseTypeAttributeListPresent(ParamDecl::Specifier &Specifier,
+                                             SourceLoc &SpecifierLoc,
+                                             SourceLoc &IsolatedLoc,
+                                             TypeAttributes &Attributes);
 
   bool parseConventionAttributeInternal(bool justChecking,
                                         TypeAttributes::Convention &convention);
 
-  bool parseTypeAttribute(TypeAttributes &Attributes, SourceLoc AtLoc,
-                          bool justChecking = false);
-  
-  
+  ParserStatus parseTypeAttribute(TypeAttributes &Attributes, SourceLoc AtLoc,
+                                  PatternBindingInitializer *&initContext,
+                                  bool justChecking = false);
+
   ParserResult<ImportDecl> parseDeclImport(ParseDeclOptions Flags,
                                            DeclAttributes &Attributes);
   ParserStatus parseInheritance(SmallVectorImpl<TypeLoc> &Inherited,
@@ -1139,6 +1171,12 @@ public:
                                            bool hasInitializer,
                                            const DeclAttributes &Attributes,
                                            SmallVectorImpl<Decl *> &Decls);
+  ParserStatus parseGetEffectSpecifier(ParsedAccessors &accessors,
+                                       SourceLoc &asyncLoc,
+                                       SourceLoc &throwsLoc,
+                                       bool &hasEffectfulGet,
+                                       AccessorKind currentKind,
+                                       SourceLoc const& currentLoc);
   
   void consumeAbstractFunctionBody(AbstractFunctionDecl *AFD,
                                    const DeclAttributes &Attrs);
@@ -1180,15 +1218,32 @@ public:
 
   //===--------------------------------------------------------------------===//
   // Type Parsing
-  
+
+  enum class ParseTypeReason {
+    /// Any type parsing context.
+    Unspecified,
+
+    /// Whether the type is for a closure attribute.
+    CustomAttribute,
+  };
+
   ParserResult<TypeRepr> parseType();
-  ParserResult<TypeRepr> parseType(Diag<> MessageID,
-                                   bool IsSILFuncDecl = false);
+  ParserResult<TypeRepr> parseType(
+      Diag<> MessageID,
+      ParseTypeReason reason = ParseTypeReason::Unspecified);
+
+  /// Parse a type optionally prefixed by a list of named opaque parameters. If
+  /// no params present, return 'type'. Otherwise, return 'type-named-opaque'.
+  ///
+  ///   type-named-opaque:
+  ///     generic-params type
+  ParserResult<TypeRepr> parseTypeWithOpaqueParams(Diag<> MessageID);
 
   ParserResult<TypeRepr>
-    parseTypeSimpleOrComposition(Diag<> MessageID);
+    parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason);
 
-  ParserResult<TypeRepr> parseTypeSimple(Diag<> MessageID);
+  ParserResult<TypeRepr> parseTypeSimple(
+      Diag<> MessageID, ParseTypeReason reason);
 
   /// Parse layout constraint.
   LayoutConstraint parseLayoutConstraint(Identifier LayoutConstraintID);
@@ -1216,7 +1271,7 @@ public:
                                          const TypeAttributes &attrs);
   
   ParserResult<TypeRepr> parseTypeTupleBody();
-  ParserResult<TypeRepr> parseTypeArray(TypeRepr *Base);
+  ParserResult<TypeRepr> parseTypeArray(ParserResult<TypeRepr> Base);
 
   /// Parse a collection type.
   ///   type-simple:
@@ -1224,9 +1279,10 @@ public:
   ///     '[' type ':' type ']'
   ParserResult<TypeRepr> parseTypeCollection();
 
-  ParserResult<TypeRepr> parseTypeOptional(TypeRepr *Base);
+  ParserResult<TypeRepr> parseTypeOptional(ParserResult<TypeRepr> Base);
 
-  ParserResult<TypeRepr> parseTypeImplicitlyUnwrappedOptional(TypeRepr *Base);
+  ParserResult<TypeRepr>
+  parseTypeImplicitlyUnwrappedOptional(ParserResult<TypeRepr> Base);
 
   bool isOptionalToken(const Token &T) const;
   SourceLoc consumeOptionalToken();
@@ -1236,7 +1292,8 @@ public:
 
   TypeRepr *applyAttributeToType(TypeRepr *Ty, const TypeAttributes &Attr,
                                  ParamDecl::Specifier Specifier,
-                                 SourceLoc SpecifierLoc);
+                                 SourceLoc SpecifierLoc,
+                                 SourceLoc IsolatedLoc);
 
   //===--------------------------------------------------------------------===//
   // Pattern Parsing
@@ -1295,6 +1352,9 @@ public:
     /// The second name, the presence of which is indicated by \c SecondNameLoc.
     Identifier SecondName;
 
+    /// The location of the 'isolated' keyword, if present.
+    SourceLoc IsolatedLoc;
+
     /// The type following the ':'.
     TypeRepr *Type = nullptr;
 
@@ -1328,6 +1388,9 @@ public:
     /// An enum element.
     EnumElement,
   };
+
+  /// Whether we are at the start of a parameter name when parsing a parameter.
+  bool startsParameterName(bool isClosure);
 
   /// Parse a parameter-clause.
   ///
@@ -1557,7 +1620,7 @@ public:
   DeclNameRef parseDeclNameRef(DeclNameLoc &loc, const Diagnostic &diag,
                                DeclNameOptions flags);
 
-  Expr *parseExprIdentifier();
+  ParserResult<Expr> parseExprIdentifier();
   Expr *parseExprEditorPlaceholder(Token PlaceholderTok,
                                    Identifier PlaceholderId);
 
@@ -1803,10 +1866,10 @@ struct ParsedDeclName {
   }
 
   /// Form a declaration name from this parsed declaration name.
-  DeclName formDeclName(ASTContext &ctx) const;
+  DeclName formDeclName(ASTContext &ctx, bool isSubscript = false) const;
 
   /// Form a declaration name from this parsed declaration name.
-  DeclNameRef formDeclNameRef(ASTContext &ctx) const;
+  DeclNameRef formDeclNameRef(ASTContext &ctx, bool isSubscript = false) const;
 };
 
 /// To assist debugging parser crashes, tell us the location of the
@@ -1827,14 +1890,16 @@ DeclName formDeclName(ASTContext &ctx,
                       StringRef baseName,
                       ArrayRef<StringRef> argumentLabels,
                       bool isFunctionName,
-                      bool isInitializer);
+                      bool isInitializer,
+                      bool isSubscript = false);
 
 /// Form a Swift declaration name referemce from its constituent parts.
 DeclNameRef formDeclNameRef(ASTContext &ctx,
                             StringRef baseName,
                             ArrayRef<StringRef> argumentLabels,
                             bool isFunctionName,
-                            bool isInitializer);
+                            bool isInitializer,
+                            bool isSubscript = false);
 
 /// Parse a stringified Swift declaration name, e.g. "init(frame:)".
 DeclName parseDeclName(ASTContext &ctx, StringRef name);

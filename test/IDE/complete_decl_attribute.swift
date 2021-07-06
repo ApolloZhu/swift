@@ -71,7 +71,7 @@ struct MyStruct {}
 // KEYWORD2-NEXT:             Keyword/None:                       derivative[#Func Attribute#]; name=derivative
 // KEYWORD2-NEXT:             Keyword/None:                       transpose[#Func Attribute#]; name=transpose
 // KEYWORD2-NEXT:             Keyword/None:                       noDerivative[#Func Attribute#]; name=noDerivative
-// KEYWORD2-NEXT:             Keyword/None:          concurrent[#Func Attribute#]; name=concurrent
+// KEYWORD2-NEXT:             Keyword/None:          Sendable[#Func Attribute#]; name=Sendable
 // KEYWORD2-NOT:              Keyword
 // KEYWORD2:                  Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // KEYWORD2:                  End completions
@@ -92,6 +92,7 @@ struct MyStruct {}
 // KEYWORD3-NEXT:             Keyword/None:                       usableFromInline[#Class Attribute#]; name=usableFromInline
 // KEYWORD3-NEXT:             Keyword/None:                       propertyWrapper[#Class Attribute#]; name=propertyWrapper
 // KEYWORD3-NEXT:             Keyword/None:                       resultBuilder[#Class Attribute#]; name=resultBuilder
+// KEYWORD3-NEXT:             Keyword/None:                       globalActor[#Class Attribute#]; name=globalActor
 // KEYWORD3-NEXT:             End completions
 
 @#^KEYWORD3_2^#IB class C2 {}
@@ -108,6 +109,7 @@ struct MyStruct {}
 // KEYWORD4-NEXT:             Keyword/None:                       frozen[#Enum Attribute#]; name=frozen
 // KEYWORD4-NEXT:             Keyword/None:                       propertyWrapper[#Enum Attribute#]; name=propertyWrapper
 // KEYWORD4-NEXT:             Keyword/None:                       resultBuilder[#Enum Attribute#]; name=resultBuilder
+// KEYWORD4-NEXT:             Keyword/None:                       globalActor[#Enum Attribute#]; name=globalActor
 // KEYWORD4-NEXT:             End completions
 
 
@@ -121,6 +123,7 @@ struct MyStruct {}
 // KEYWORD5-NEXT:             Keyword/None:                       frozen[#Struct Attribute#]; name=frozen
 // KEYWORD5-NEXT:             Keyword/None:                       propertyWrapper[#Struct Attribute#]; name=propertyWrapper
 // KEYWORD5-NEXT:             Keyword/None:                       resultBuilder[#Struct Attribute#]; name=resultBuilder
+// KEYWORD5-NEXT:             Keyword/None:                       globalActor[#Struct Attribute#]; name=globalActor
 // KEYWORD5-NEXT:             End completions
 
 @#^ON_GLOBALVAR^# var globalVar
@@ -191,7 +194,7 @@ struct _S {
 // ON_METHOD-DAG: Keyword/None:                       differentiable[#Func Attribute#]; name=differentiable
 // ON_METHOD-DAG: Keyword/None:                       derivative[#Func Attribute#]; name=derivative
 // ON_METHOD-DAG: Keyword/None:                       transpose[#Func Attribute#]; name=transpose
-// ON_METHOD-DAG: Keyword/None:                       concurrent[#Func Attribute#]; name=concurrent
+// ON_METHOD-DAG: Keyword/None:                       Sendable[#Func Attribute#]; name=Sendable
 // ON_METHOD-DAG: Keyword/None:                       noDerivative[#Func Attribute#]; name=noDerivative
 // ON_METHOD-NOT: Keyword
 // ON_METHOD: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
@@ -253,7 +256,7 @@ struct _S {
 // ON_MEMBER_LAST-DAG: Keyword/None:                       derivative[#Declaration Attribute#]; name=derivative
 // ON_MEMBER_LAST-DAG: Keyword/None:                       transpose[#Declaration Attribute#]; name=transpose
 // ON_MEMBER_LAST-DAG: Keyword/None:                       noDerivative[#Declaration Attribute#]; name=noDerivative
-// ON_MEMBER_LAST-DAG: Keyword/None:                       concurrent[#Declaration Attribute#]; name=concurrent
+// ON_MEMBER_LAST-DAG: Keyword/None:                       Sendable[#Declaration Attribute#]; name=Sendable
 // ON_MEMBER_LAST-NOT: Keyword
 // ON_MEMBER_LAST: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // ON_MEMBER_LAST-NOT: Decl[PrecedenceGroup]
@@ -303,7 +306,7 @@ func dummy2() {}
 // KEYWORD_LAST-DAG: Keyword/None:                       derivative[#Declaration Attribute#]; name=derivative
 // KEYWORD_LAST-DAG: Keyword/None:                       transpose[#Declaration Attribute#]; name=transpose
 // KEYWORD_LAST-DAG: Keyword/None:                       noDerivative[#Declaration Attribute#]; name=noDerivative
-// KEYWORD_LAST-DAG: Keyword/None:                       concurrent[#Declaration Attribute#]; name=concurrent
+// KEYWORD_LAST-DAG: Keyword/None:                       Sendable[#Declaration Attribute#]; name=Sendable
 // KEYWORD_LAST-NOT: Keyword
 // KEYWORD_LAST: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // KEYWORD_LAST:                  End completions

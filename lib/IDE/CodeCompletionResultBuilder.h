@@ -76,6 +76,7 @@ class CodeCompletionResultBuilder {
   CodeCompletionResultSink &Sink;
   CodeCompletionResult::ResultKind Kind;
   SemanticContextKind SemanticContext;
+  CodeCompletionFlair Flair;
   unsigned NumBytesToErase = 0;
   const Decl *AssociatedDecl = nullptr;
   Optional<CodeCompletionLiteralKind> LiteralKind;
@@ -89,9 +90,8 @@ class CodeCompletionResultBuilder {
       CodeCompletionResult::Unknown;
   bool Cancelled = false;
   ArrayRef<std::pair<StringRef, StringRef>> CommentWords;
-  bool IsNotRecommended = false;
   CodeCompletionResult::NotRecommendedReason NotRecReason =
-    CodeCompletionResult::NotRecommendedReason::NoReason;
+      CodeCompletionResult::NotRecommendedReason::None;
   StringRef BriefDocComment = StringRef();
 
   void addChunkWithText(CodeCompletionString::Chunk::ChunkKind Kind,
@@ -148,12 +148,15 @@ public:
   void setLiteralKind(CodeCompletionLiteralKind kind) { LiteralKind = kind; }
   void setKeywordKind(CodeCompletionKeywordKind kind) { KeywordKind = kind; }
   void setNotRecommended(CodeCompletionResult::NotRecommendedReason Reason) {
-    IsNotRecommended = true;
     NotRecReason = Reason;
   }
 
   void setSemanticContext(SemanticContextKind Kind) {
     SemanticContext = Kind;
+  }
+
+  void addFlair(CodeCompletionFlair Options) {
+    Flair |= Options;
   }
 
   void
@@ -353,6 +356,12 @@ public:
   void addDeclAttrKeyword(StringRef Name, StringRef Annotation) {
     addChunkWithText(CodeCompletionString::Chunk::ChunkKind::
                      DeclAttrKeyword, Name);
+    if (!Annotation.empty())
+      addTypeAnnotation(Annotation);
+  }
+
+  void addAttributeKeyword(StringRef Name, StringRef Annotation) {
+    addChunkWithText(CodeCompletionString::Chunk::ChunkKind::Attribute, Name);
     if (!Annotation.empty())
       addTypeAnnotation(Annotation);
   }

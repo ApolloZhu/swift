@@ -75,6 +75,31 @@ inline bool isForwardingConsume(SILValue value) {
   return canOpcodeForwardOwnedValues(value);
 }
 
+/// Find all "use points" of \p guaranteedValue that determine its lifetime
+/// requirement.
+///
+/// Precondition: \p guaranteedValue is not a BorrowedValue.
+///
+/// In general, if the client does not know whether \p guaranteed value
+/// introduces a borrow scope or not, it should instead call
+/// findTransitiveGuaranteedUses() which efficiently gathers use
+/// points for arbitrary guaranteed values, including those that introduce a
+/// borrow scope and may be reborrowed.
+///
+/// In valid OSSA, this should never be called on values that introduce a new
+/// scope (doing so would be extremely innefficient). The lifetime of a borrow
+/// introducing instruction is always determined by its direct EndBorrow uses
+/// (see BorrowedValue::visitLocalScopeEndingUses). None of the non-scope-ending
+/// uses are relevant, and there's no need to transively follow forwarding
+/// uses. However, this utility may be used on borrow-introducing values when
+/// updating OSSA form to place EndBorrow uses after introducing new phis.
+///
+/// When this is called on a value that does not introduce a new scope, none of
+/// the use points can be EndBorrows or Reborrows. Those uses are only allowed
+/// on borrow-introducing values.
+bool findInnerTransitiveGuaranteedUses(SILValue guaranteedValue,
+                                       SmallVectorImpl<Operand *> &usePoints);
+
 /// Find all "use points" of a guaranteed value within its enclosing borrow
 /// scope (without looking through reborrows). To find the use points of the
 /// extended borrow scope, after looking through reborrows, use
@@ -101,7 +126,7 @@ inline bool isForwardingConsume(SILValue value) {
 /// 2. If \p guaranteedValue does not introduce a borrow scope (it is not a
 /// valid BorrowedValue), then its uses are discovered transitively by looking
 /// through forwarding operations. If any use is a PointerEscape, then this
-/// returns false without adding more uses--the guaranteed values lifetime is
+/// returns false without adding more uses--the guaranteed value's lifetime is
 /// indeterminite. If a use introduces a nested borrow scope, it creates use
 /// points where the "extended" borrow scope ends. An extended borrow
 /// scope is found by looking through any reborrows that end the nested
@@ -230,6 +255,9 @@ struct BorrowedValue;
 /// borrowed and thus the incoming value must implicitly be borrowed until the
 /// user's corresponding end scope instruction.
 ///
+/// Invariant: For a given operand, BorrowingOperand is valid iff
+/// it has OperandOwnership::Borrow or OperandOwnership::Reborrow.
+///
 /// NOTE: We do not require that the guaranteed scope be represented by a
 /// guaranteed value in the same function: see begin_apply. In such cases, we
 /// require instead an end_* instruction to mark the end of the scope's region.
@@ -238,7 +266,16 @@ struct BorrowingOperand {
   BorrowingOperandKind kind;
 
   BorrowingOperand(Operand *op)
-      : op(op), kind(BorrowingOperandKind::get(op->getUser()->getKind())) {}
+      : op(op), kind(BorrowingOperandKind::get(op->getUser()->getKind())) {
+    auto ownership = op->getOperandOwnership();
+    if (ownership != OperandOwnership::Borrow
+        && ownership != OperandOwnership::Reborrow) {
+      // consuming applies and branch arguments are not borrowing operands.
+      kind = BorrowingOperandKind::Invalid;
+      return;
+    }
+    assert(kind != BorrowingOperandKind::Invalid && "missing case");
+  }
   BorrowingOperand(const BorrowingOperand &other)
       : op(other.op), kind(other.kind) {}
   BorrowingOperand &operator=(const BorrowingOperand &other) {
@@ -254,23 +291,7 @@ struct BorrowingOperand {
   const Operand *operator->() const { return op; }
   Operand *operator->() { return op; }
 
-  operator bool() const { return kind != BorrowingOperandKind::Invalid && op; }
-
-  /// If \p op is a borrow introducing operand return it after doing some
-  /// checks.
-  static BorrowingOperand get(Operand *op) {
-    auto *user = op->getUser();
-    auto kind = BorrowingOperandKind::get(user->getKind());
-    if (!kind)
-      return {nullptr, kind};
-    return {op, kind};
-  }
-
-  /// If \p op is a borrow introducing operand return it after doing some
-  /// checks.
-  static BorrowingOperand get(const Operand *op) {
-    return get(const_cast<Operand *>(op));
-  }
+  operator bool() const { return kind != BorrowingOperandKind::Invalid; }
 
   /// If this borrowing operand results in the underlying value being borrowed
   /// over a region of code instead of just for a single instruction, visit
@@ -312,8 +333,14 @@ struct BorrowingOperand {
     llvm_unreachable("Covered switch isn't covered?!");
   }
 
-  /// Return true if the user instruction introduces a borrow scope? This is
-  /// true for both reborrows and nested borrows.
+  /// Return true if the user instruction defines a borrowed value that
+  /// introduces a borrow scope and therefore may be reborrowed. This is true
+  /// for both reborrows and nested borrows.
+  ///
+  /// Note that begin_apply does create a borrow scope, and may define
+  /// guaranteed value within that scope. The difference is that those yielded
+  /// values do not themselves introduce a borrow scope. In other words, they
+  /// cannot be reborrowed.
   ///
   /// If true, the visitBorrowIntroducingUserResults() can be called to acquire
   /// each BorrowedValue that introduces a new borrow scopes.
@@ -564,7 +591,7 @@ struct BorrowedValue {
                            &foundReborrows) const {
     bool foundAnyReborrows = false;
     for (auto *op : value->getUses()) {
-      if (auto borrowingOperand = BorrowingOperand::get(op)) {
+      if (auto borrowingOperand = BorrowingOperand(op)) {
         if (borrowingOperand.isReborrow()) {
           foundReborrows.push_back(
               {value->getParentBlock(), op->getOperandNumber()});
@@ -727,6 +754,7 @@ struct InteriorPointerOperand {
       return InteriorPointerOperand(op, kind);
     }
     }
+    llvm_unreachable("covered switch");
   }
 
   /// Return the end scope of all borrow introducers of the parent value of this
@@ -869,8 +897,10 @@ public:
       ;
     case ValueKind::ApplyInst:
       return Kind::Apply;
-    case ValueKind::BeginApplyResult:
-      return Kind::BeginApply;
+    case ValueKind::MultipleValueInstructionResult:
+      if (isaResultOf<BeginApplyInst>(value))
+        return Kind::BeginApply;
+      return Kind::Invalid;
     case ValueKind::StructInst:
       return Kind::Struct;
     case ValueKind::TupleInst:
@@ -1008,6 +1038,7 @@ struct OwnedValueIntroducer {
     case OwnedValueIntroducerKind::AllocRefInit:
       return false;
     }
+    llvm_unreachable("covered switch");
   }
 
   bool operator==(const OwnedValueIntroducer &other) const {
@@ -1049,10 +1080,10 @@ void findTransitiveReborrowBaseValuePairs(
     BorrowingOperand initialScopeOperand, SILValue origBaseValue,
     function_ref<void(SILPhiArgument *, SILValue)> visitReborrowBaseValuePair);
 
-/// Given a begin_borrow visit all end_borrow users of the borrow or its
-/// reborrows.
+/// Given a begin of a borrow scope, visit all end_borrow users of the borrow or
+/// its reborrows.
 void visitTransitiveEndBorrows(
-    BeginBorrowInst *borrowInst,
+    BorrowedValue beginBorrow,
     function_ref<void(EndBorrowInst *)> visitEndBorrow);
 
 } // namespace swift

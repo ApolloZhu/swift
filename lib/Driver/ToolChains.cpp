@@ -169,9 +169,14 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   }
 
   // Enable address top-byte ignored in the ARM64 backend.
-  if (Triple.getArch() == llvm::Triple::aarch64) {
+  if (Triple.getArch() == llvm::Triple::aarch64 ||
+      Triple.getArch() == llvm::Triple::aarch64_32) {
     arguments.push_back("-Xllvm");
     arguments.push_back("-aarch64-use-tbi");
+  }
+
+  if (output.getPrimaryOutputType() == file_types::TY_SwiftModuleFile) {
+    arguments.push_back("-warn-on-potentially-unavailable-enum-case");
   }
 
   // Enable or disable ObjC interop appropriately for the platform
@@ -217,6 +222,9 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments,
                        options::OPT_warn_swift3_objc_inference_minimal,
                        options::OPT_warn_swift3_objc_inference_complete);
+  inputArgs.AddLastArg(arguments,
+                       options::OPT_enable_actor_data_race_checks,
+                       options::OPT_disable_actor_data_race_checks);
   inputArgs.AddLastArg(arguments, options::OPT_warn_concurrency);
   inputArgs.AddLastArg(arguments, options::OPT_warn_implicit_overrides);
   inputArgs.AddLastArg(arguments, options::OPT_typo_correction_limit);
@@ -231,6 +239,7 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments, options::OPT_import_underlying_module);
   inputArgs.AddLastArg(arguments, options::OPT_module_cache_path);
   inputArgs.AddLastArg(arguments, options::OPT_module_link_name);
+  inputArgs.AddLastArg(arguments, options::OPT_module_abi_name);
   inputArgs.AddLastArg(arguments, options::OPT_nostdimport);
   inputArgs.AddLastArg(arguments, options::OPT_parse_stdlib);
   inputArgs.AddLastArg(arguments, options::OPT_resource_dir);
@@ -576,6 +585,7 @@ ToolChain::constructInvocation(const CompileJobAction &job,
   if (context.OI.CompilerMode == OutputInfo::Mode::SingleCompile) {
     context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph);
     context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
+    context.Args.AddLastArg(Arguments, options::OPT_include_spi_symbols);
   }
 
   return II;
@@ -965,7 +975,8 @@ ToolChain::constructInvocation(const BackendJobAction &job,
   Arguments.push_back(context.Args.MakeArgString(getTriple().str()));
 
   // Enable address top-byte ignored in the ARM64 backend.
-  if (getTriple().getArch() == llvm::Triple::aarch64) {
+  if (getTriple().getArch() == llvm::Triple::aarch64 ||
+      getTriple().getArch() == llvm::Triple::aarch64_32) {
     Arguments.push_back("-Xllvm");
     Arguments.push_back("-aarch64-use-tbi");
   }
@@ -1065,6 +1076,7 @@ ToolChain::constructInvocation(const MergeModuleJobAction &job,
 
   context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph);
   context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
+  context.Args.AddLastArg(Arguments, options::OPT_include_spi_symbols);
 
   context.Args.AddLastArg(Arguments, options::OPT_import_objc_header);
 

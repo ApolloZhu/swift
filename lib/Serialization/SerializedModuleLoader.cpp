@@ -22,7 +22,10 @@
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Version.h"
+#include "swift/Option/Options.h"
 
+#include "llvm/Option/OptTable.h"
+#include "llvm/Option/ArgList.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
@@ -30,6 +33,7 @@
 #include "llvm/Support/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/CommandLine.h"
 #include <system_error>
 
 using namespace swift;
@@ -496,7 +500,7 @@ bool ImplicitSerializedModuleLoader::maybeDiagnoseTargetMismatch(
   }
 
   Ctx.Diags.diagnose(sourceLocation, diag::sema_no_import_target, moduleName,
-                     target, foundArchs);
+                     target, foundArchs, dir);
   return true;
 }
 
@@ -686,10 +690,16 @@ LoadedFile *SerializedModuleLoaderBase::loadAST(
     std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
     bool isFramework) {
   assert(moduleInputBuffer);
+
+  // The buffers are moved into the shared core, so grab their IDs now in case
+  // they're needed for diagnostics later.
   StringRef moduleBufferID = moduleInputBuffer->getBufferIdentifier();
   StringRef moduleDocBufferID;
   if (moduleDocInputBuffer)
     moduleDocBufferID = moduleDocInputBuffer->getBufferIdentifier();
+  StringRef moduleSourceInfoID;
+  if (moduleSourceInfoInputBuffer)
+    moduleSourceInfoID = moduleSourceInfoInputBuffer->getBufferIdentifier();
 
   if (moduleInputBuffer->getBufferSize() % 4 != 0) {
     if (diagLoc)
@@ -715,6 +725,7 @@ LoadedFile *SerializedModuleLoaderBase::loadAST(
 
     // We've loaded the file. Now try to bring it into the AST.
     fileUnit = new (Ctx) SerializedASTFile(M, *loadedModuleFile);
+    M.setStaticLibrary(loadedModuleFile->isStaticLibrary());
     if (loadedModuleFile->isTestable())
       M.setTestingEnabled();
     if (loadedModuleFile->arePrivateImportsEnabled())
@@ -723,7 +734,9 @@ LoadedFile *SerializedModuleLoaderBase::loadAST(
       M.setImplicitDynamicEnabled();
     if (loadedModuleFile->hasIncrementalInfo())
       M.setHasIncrementalInfo();
-
+    if (!loadedModuleFile->getModuleABIName().empty())
+      M.setABIName(Ctx.getIdentifier(loadedModuleFile->getModuleABIName()));
+    M.setUserModuleVersion(loadedModuleFile->getUserModuleVersion());
     auto diagLocOrInvalid = diagLoc.getValueOr(SourceLoc());
     loadInfo.status = loadedModuleFile->associateWithFileContext(
         fileUnit, diagLocOrInvalid, Ctx.LangOpts.AllowModuleWithCompilerErrors);
@@ -740,6 +753,12 @@ LoadedFile *SerializedModuleLoaderBase::loadAST(
         (Ctx.LangOpts.AllowModuleWithCompilerErrors &&
          (loadInfo.status == serialization::Status::TargetTooNew ||
           loadInfo.status == serialization::Status::TargetIncompatible))) {
+      if (loadedModuleFile->hasSourceInfoFile() &&
+          !loadedModuleFile->hasSourceInfo())
+        Ctx.Diags.diagnose(diagLocOrInvalid,
+                           diag::serialization_malformed_sourceinfo,
+                           moduleSourceInfoID);
+
       Ctx.bumpGeneration();
       LoadedModuleFiles.emplace_back(std::move(loadedModuleFile),
                                      Ctx.getCurrentGeneration());
@@ -945,25 +964,168 @@ void swift::serialization::diagnoseSerializedASTLoadFailure(
   }
 }
 
-bool SerializedModuleLoaderBase::canImportModule(ImportPath::Module path) {
+bool swift::extractCompilerFlagsFromInterface(StringRef interfacePath,
+                                              StringRef buffer,
+                                              llvm::StringSaver &ArgSaver,
+                                              SmallVectorImpl<const char *> &SubArgs) {
+  SmallVector<StringRef, 1> FlagMatches;
+  auto FlagRe = llvm::Regex("^// swift-module-flags:(.*)$", llvm::Regex::Newline);
+  if (!FlagRe.match(buffer, &FlagMatches))
+    return true;
+  assert(FlagMatches.size() == 2);
+  llvm::cl::TokenizeGNUCommandLine(FlagMatches[1], ArgSaver, SubArgs);
+
+  auto intFileName = llvm::sys::path::filename(interfacePath);
+
+  // Sanitize arch if the file name and the encoded flags disagree.
+  // It's a known issue that we are using arm64e interfaces contents for the arm64 target,
+  // meaning the encoded module flags are using -target arm64e-x-x. Fortunately,
+  // we can tell the target arch from the interface file name, so we could sanitize
+  // the target to use by inferring target from the file name.
+  StringRef arm64 = "arm64";
+  StringRef arm64e = "arm64e";
+  if (intFileName.contains(arm64) && !intFileName.contains(arm64e)) {
+    for (unsigned I = 1; I < SubArgs.size(); ++I) {
+      if (strcmp(SubArgs[I - 1], "-target") != 0) {
+        continue;
+      }
+      StringRef triple(SubArgs[I]);
+      if (triple.startswith(arm64e)) {
+        SubArgs[I] = ArgSaver.save((llvm::Twine(arm64) +
+          triple.substr(arm64e.size())).str()).data();
+      }
+    }
+  }
+
+  SmallVector<StringRef, 1> IgnFlagMatches;
+  // Cherry-pick supported options from the ignorable list.
+  auto IgnFlagRe = llvm::Regex("^// swift-module-flags-ignorable:(.*)$",
+                               llvm::Regex::Newline);
+  // It's OK the interface doesn't have the ignorable list, we just ignore them
+  // all.
+  if (!IgnFlagRe.match(buffer, &IgnFlagMatches))
+    return false;
+  SmallVector<const char *, 8> IgnSubArgs;
+  llvm::cl::TokenizeGNUCommandLine(IgnFlagMatches[1], ArgSaver, IgnSubArgs);
+  std::unique_ptr<llvm::opt::OptTable> table = swift::createSwiftOptTable();
+  unsigned missingArgIdx = 0;
+  unsigned missingArgCount = 0;
+  auto parsedIgns = table->ParseArgs(IgnSubArgs, missingArgIdx, missingArgCount);
+  for (auto parse: parsedIgns) {
+    // Check if the option is a frontend option. This will filter out unknown
+    // options and input-like options.
+    if (!parse->getOption().hasFlag(options::FrontendOption))
+      continue;
+    // Push the supported option and its value to the list.
+    // We shouldn't need to worry about cases like -tbd-install_name=Foo because
+    // the parsing function should have droped alias options already.
+    SubArgs.push_back(ArgSaver.save(parse->getSpelling()).data());
+    for (auto value: parse->getValues())
+      SubArgs.push_back(value);
+  }
+
+  return false;
+}
+
+llvm::VersionTuple
+swift::extractUserModuleVersionFromInterface(StringRef moduleInterfacePath) {
+  llvm::VersionTuple result;
+  // Read the inteface file and extract its compiler arguments line
+  if (auto file = llvm::MemoryBuffer::getFile(moduleInterfacePath)) {
+    llvm::BumpPtrAllocator alloc;
+    llvm::StringSaver argSaver(alloc);
+    SmallVector<const char*, 8> args;
+    (void)extractCompilerFlagsFromInterface(moduleInterfacePath,
+                                            (*file)->getBuffer(), argSaver, args);
+    for (unsigned I = 0, N = args.size(); I + 1 < N; I++) {
+      // Check the version number specified via -user-module-version.
+      StringRef current(args[I]), next(args[I + 1]);
+      if (current == "-user-module-version") {
+        result.tryParse(next);
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+bool SerializedModuleLoaderBase::canImportModule(
+    ImportPath::Module path, llvm::VersionTuple version, bool underlyingVersion) {
+  // If underlying version is specified, this should be handled by Clang importer.
+  if (!version.empty() && underlyingVersion)
+    return false;
   // Look on disk.
-  SmallVector<char, 0> *unusedModuleInterfacePath = nullptr;
+  SmallVectorImpl<char> *unusedModuleInterfacePath = nullptr;
   std::unique_ptr<llvm::MemoryBuffer> *unusedModuleBuffer = nullptr;
   std::unique_ptr<llvm::MemoryBuffer> *unusedModuleDocBuffer = nullptr;
   std::unique_ptr<llvm::MemoryBuffer> *unusedModuleSourceInfoBuffer = nullptr;
   bool isFramework = false;
   bool isSystemModule = false;
+
+  llvm::SmallString<256> moduleInterfacePath;
+  std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer;
+  std::unique_ptr<llvm::MemoryBuffer> moduleDocBuffer;
+  if (!version.empty()) {
+    unusedModuleInterfacePath = &moduleInterfacePath;
+    unusedModuleBuffer = &moduleInputBuffer;
+    unusedModuleDocBuffer = &moduleDocBuffer;
+  }
+
   // FIXME: Swift submodules?
-  return findModule(path[0], unusedModuleInterfacePath, unusedModuleBuffer,
-                    unusedModuleDocBuffer, unusedModuleSourceInfoBuffer,
-                    isFramework, isSystemModule);
+  auto mID = path[0];
+  auto found = findModule(mID, unusedModuleInterfacePath, unusedModuleBuffer,
+                          unusedModuleDocBuffer, unusedModuleSourceInfoBuffer,
+                          isFramework, isSystemModule);
+  // If we cannot find the module, don't continue.
+  if (!found)
+    return false;
+  // If no version number is specified, don't continue.
+  if (version.empty())
+    return true;
+  assert(found);
+  assert(!version.empty());
+  assert(!underlyingVersion);
+  llvm::VersionTuple currentVersion;
+  if (!moduleInterfacePath.empty()) {
+    currentVersion = extractUserModuleVersionFromInterface(moduleInterfacePath);
+  }
+  // If failing to extract the user version from the interface file, try the binary
+  // format, if present.
+  if (currentVersion.empty() && unusedModuleBuffer) {
+    auto metaData =
+      serialization::validateSerializedAST((*unusedModuleBuffer)->getBuffer());
+    currentVersion = metaData.userModuleVersion;
+  }
+
+  if (currentVersion.empty()) {
+    Ctx.Diags.diagnose(mID.Loc, diag::cannot_find_project_version, "Swift",
+                       mID.Item.str());
+    return true;
+  }
+
+  return currentVersion >= version;
 }
 
 bool MemoryBufferSerializedModuleLoader::canImportModule(
-    ImportPath::Module path) {
-  // See if we find it in the registered memory buffers.
+    ImportPath::Module path, llvm::VersionTuple version, bool underlyingVersion) {
+  // If underlying version is specified, this should be handled by Clang importer.
+  if (!version.empty() && underlyingVersion)
+    return false;
   // FIXME: Swift submodules?
-  return MemoryBuffers.count(path[0].Item.str());
+  auto mID = path[0];
+  auto mIt = MemoryBuffers.find(mID.Item.str());
+  if (mIt == MemoryBuffers.end())
+    return false;
+  if (version.empty())
+    return true;
+  if (mIt->second.userVersion.empty()) {
+    Ctx.Diags.diagnose(mID.Loc, diag::cannot_find_project_version, "Swift",
+                       mID.Item.str());
+    return true;
+  }
+  assert(!version.empty());
+  assert(!(mIt->second.userVersion.empty()));
+  return mIt->second.userVersion >= version;
 }
 
 ModuleDecl *
@@ -1041,7 +1203,7 @@ MemoryBufferSerializedModuleLoader::loadModule(SourceLoc importLoc,
 
   bool isFramework = false;
   std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer;
-  moduleInputBuffer = std::move(bufIter->second);
+  moduleInputBuffer = std::move(bufIter->second.buffer);
   MemoryBuffers.erase(bufIter);
   assert(moduleInputBuffer);
 
@@ -1242,9 +1404,9 @@ SerializedASTFile::getCommentForDecl(const Decl *D) const {
   return File.getCommentForDecl(D);
 }
 
-Optional<BasicDeclLocs>
-SerializedASTFile::getBasicLocsForDecl(const Decl *D) const {
-  return File.getBasicDeclLocsForDecl(D);
+Optional<ExternalSourceLocs::RawLocs>
+SerializedASTFile::getExternalRawLocsForDecl(const Decl *D) const {
+  return File.getExternalRawLocsForDecl(D);
 }
 
 Optional<StringRef>
@@ -1263,8 +1425,8 @@ SerializedASTFile::getSourceOrderForDecl(const Decl *D) const {
   return File.getSourceOrderForDecl(D);
 }
 
-void
-SerializedASTFile::collectAllGroups(std::vector<StringRef> &Names) const {
+void SerializedASTFile::collectAllGroups(
+    SmallVectorImpl<StringRef> &Names) const {
   File.collectAllGroups(Names);
 };
 

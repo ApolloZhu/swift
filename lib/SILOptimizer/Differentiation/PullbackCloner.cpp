@@ -149,7 +149,7 @@ private:
   }
   DifferentiationInvoker getInvoker() const { return vjpCloner.getInvoker(); }
   LinearMapInfo &getPullbackInfo() const { return vjpCloner.getPullbackInfo(); }
-  AutoDiffConfig getConfig() const { return vjpCloner.getConfig(); }
+  const AutoDiffConfig &getConfig() const { return vjpCloner.getConfig(); }
   const DifferentiableActivityInfo &getActivityInfo() const {
     return vjpCloner.getActivityInfo();
   }
@@ -1801,7 +1801,7 @@ bool PullbackCloner::Implementation::run() {
       // Do not diagnose `Optional`-typed values, which will have special-case
       // differentiation support.
       if (auto *enumDecl = type.getEnumOrBoundGenericEnum()) {
-        if (enumDecl != getContext().getASTContext().getOptionalDecl()) {
+        if (!type.getASTType()->isOptional()) {
           getContext().emitNondifferentiabilityError(
               v, getInvoker(), diag::autodiff_enums_unsupported);
           errorOccurred = true;
@@ -2052,6 +2052,8 @@ bool PullbackCloner::Implementation::run() {
   SmallVector<SILValue, 8> retElts;
   // This vector will contain all indirect parameter adjoint buffers.
   SmallVector<SILValue, 4> indParamAdjoints;
+  // This vector will identify the locations where initialization is needed.
+  SmallBitVector outputsToInitialize;
 
   auto conv = getOriginal().getConventions();
   auto origParams = getOriginal().getArgumentsWithoutIndirectResults();
@@ -2071,25 +2073,62 @@ bool PullbackCloner::Implementation::run() {
     case SILValueCategory::Address: {
       auto adjBuf = getAdjointBuffer(origEntry, origParam);
       indParamAdjoints.push_back(adjBuf);
+      outputsToInitialize.push_back(
+        !conv.getParameters()[parameterIndex].isIndirectMutating());
       break;
     }
     }
   };
+  SmallVector<SILArgument *, 4> pullbackIndirectResults(
+        getPullback().getIndirectResults().begin(),
+        getPullback().getIndirectResults().end());
+
   // Collect differentiation parameter adjoints.
+  // Do a first pass to collect non-inout values.
+  unsigned pullbackInoutArgumentIndex = 0;
   for (auto i : getConfig().parameterIndices->getIndices()) {
-    // Skip `inout` parameters.
-    if (conv.getParameters()[i].isIndirectMutating())
+    auto isParameterInout = conv.getParameters()[i].isIndirectMutating();
+    if (!isParameterInout) {
+      addRetElt(i);
+    }
+  }
+
+  // Do a second pass for all inout parameters.
+  for (auto i : getConfig().parameterIndices->getIndices()) {
+    // Skip non-inout parameters.
+    auto isParameterInout = conv.getParameters()[i].isIndirectMutating();
+    if (!isParameterInout)
       continue;
+
+    // Skip `inout` parameters for functions with a single basic block:
+    // adjoint accumulation for those parameters is already done by
+    // per-instruction visitors.
+    if (getOriginal().size() == 1)
+      continue;
+
+    // For functions with multiple basic blocks, accumulation is needed
+    // for `inout` parameters because pullback basic blocks have different
+    // adjoint buffers.
+    auto pullbackInoutArgument =
+        getPullback()
+            .getArgumentsWithoutIndirectResults()[pullbackInoutArgumentIndex++];
+    pullbackIndirectResults.push_back(pullbackInoutArgument);
     addRetElt(i);
   }
 
   // Copy them to adjoint indirect results.
-  assert(indParamAdjoints.size() == getPullback().getIndirectResults().size() &&
+  assert(indParamAdjoints.size() == pullbackIndirectResults.size() &&
          "Indirect parameter adjoint count mismatch");
-  for (auto pair : zip(indParamAdjoints, getPullback().getIndirectResults())) {
+  unsigned currentIndex = 0;
+  for (auto pair : zip(indParamAdjoints, pullbackIndirectResults)) {
     auto source = std::get<0>(pair);
     auto *dest = std::get<1>(pair);
-    builder.createCopyAddr(pbLoc, source, dest, IsTake, IsInitialization);
+    if (outputsToInitialize[currentIndex]) {
+      builder.createCopyAddr(pbLoc, source, dest, IsTake, IsInitialization);
+    } else {
+      builder.createCopyAddr(pbLoc, source, dest, IsTake, IsNotInitialization);
+    }
+    currentIndex++;
     // Prevent source buffer from being deallocated, since the underlying
     // value is moved.
     destroyedLocalAllocations.insert(source);
@@ -2188,8 +2227,7 @@ void PullbackCloner::Implementation::accumulateAdjointForOptional(
   // Handle `switch_enum` on `Optional`.
   // `Optional<T>`
   auto optionalTy = remapType(optionalValue->getType());
-  assert(optionalTy.getASTType().getEnumOrBoundGenericEnum() ==
-         getASTContext().getOptionalDecl());
+  assert(optionalTy.getASTType()->isOptional());
   // `T`
   auto wrappedType = optionalTy.getOptionalObjectType();
   // `T.TangentVector`
@@ -2346,6 +2384,9 @@ SILBasicBlock *PullbackCloner::Implementation::buildPullbackSuccessor(
   // Propagate pullback struct argument.
   TangentBuilder pullbackTrampolineBBBuilder(
       pullbackTrampolineBB, getContext());
+  pullbackTrampolineBBBuilder.setCurrentDebugScope(
+      remapScope(origPredBB->getTerminator()->getDebugScope()));
+
   auto *pullbackTrampolineBBArg = pullbackTrampolineBB->getArguments().front();
   if (vjpCloner.getLoopInfo()->getLoopFor(origPredBB)) {
     assert(pullbackTrampolineBBArg->getType() ==
@@ -2431,10 +2472,8 @@ void PullbackCloner::Implementation::visitSILBasicBlock(SILBasicBlock *bb) {
           if (!termInst)
             return false;
           if (auto *sei = dyn_cast<SwitchEnumInst>(termInst)) {
-            auto *optionalEnumDecl = ctx.getOptionalDecl();
             auto operandTy = sei->getOperand()->getType();
-            return operandTy.getASTType().getEnumOrBoundGenericEnum() ==
-                   optionalEnumDecl;
+            return operandTy.getASTType()->isOptional();
           }
           return false;
         };
@@ -3026,7 +3065,7 @@ AllocStackInst *PullbackCloner::Implementation::getArrayAdjointElementBuffer(
   auto *eltIndexLiteral =
       builder.createIntegerLiteral(loc, builtinIntType, eltIndex);
   auto intType = SILType::getPrimitiveObjectType(
-      ctx.getIntDecl()->getDeclaredInterfaceType()->getCanonicalType());
+      ctx.getIntType()->getCanonicalType());
   // %index_int = struct $Int (%index_literal)
   auto *eltIndexInt = builder.createStruct(loc, intType, {eltIndexLiteral});
   auto *swiftModule = getModule().getSwiftModule();

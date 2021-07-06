@@ -703,7 +703,7 @@ public:
   Decl *getDecl() const override { return decl; }
 };
 
-/// Since each generic parameter can "see" the preceeding ones,
+/// Since each generic parameter can "see" the preceding ones,
 /// (e.g. <A, B: A>) -- it's not legal but that's how lookup behaves --
 /// Each GenericParamScope scopes just ONE parameter, and we next
 /// each one within the previous one.
@@ -957,7 +957,9 @@ class PatternEntryInitializerScope final : public AbstractPatternEntryScope {
 public:
   PatternEntryInitializerScope(PatternBindingDecl *pbDecl, unsigned entryIndex)
       : AbstractPatternEntryScope(pbDecl, entryIndex),
-        initAsWrittenWhenCreated(pbDecl->getOriginalInit(entryIndex)) {}
+        initAsWrittenWhenCreated(pbDecl->isDebuggerBinding() ?
+                                 pbDecl->getInit(entryIndex) :
+                                 pbDecl->getOriginalInit(entryIndex)) {}
   virtual ~PatternEntryInitializerScope() {}
 
 protected:

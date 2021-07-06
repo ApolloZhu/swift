@@ -198,7 +198,24 @@ MarkExplicitlyEscaping::create(ConstraintSystem &cs, Type lhs, Type rhs,
   return new (cs.getAllocator()) MarkExplicitlyEscaping(cs, lhs, rhs, locator);
 }
 
-bool AddConcurrentAttribute::diagnose(const Solution &solution,
+bool MarkGlobalActorFunction::diagnose(const Solution &solution,
+                                      bool asNote) const {
+  DroppedGlobalActorFunctionAttr failure(
+      solution, getFromType(), getToType(), getLocator());
+  return failure.diagnose(asNote);
+}
+
+MarkGlobalActorFunction *
+MarkGlobalActorFunction::create(ConstraintSystem &cs, Type lhs, Type rhs,
+                               ConstraintLocator *locator) {
+  if (locator->isLastElement<LocatorPathElt::ApplyArgToParam>())
+    locator = cs.getConstraintLocator(
+        locator, LocatorPathElt::ArgumentAttribute::forGlobalActor());
+
+  return new (cs.getAllocator()) MarkGlobalActorFunction(cs, lhs, rhs, locator);
+}
+
+bool AddSendableAttribute::diagnose(const Solution &solution,
                                       bool asNote) const {
   AttributedFuncToTypeConversionFailure failure(
       solution, getFromType(), getToType(), getLocator(),
@@ -206,8 +223,8 @@ bool AddConcurrentAttribute::diagnose(const Solution &solution,
   return failure.diagnose(asNote);
 }
 
-AddConcurrentAttribute *
-AddConcurrentAttribute::create(ConstraintSystem &cs,
+AddSendableAttribute *
+AddSendableAttribute::create(ConstraintSystem &cs,
                                FunctionType *fromType,
                                FunctionType *toType,
                                ConstraintLocator *locator) {
@@ -215,7 +232,7 @@ AddConcurrentAttribute::create(ConstraintSystem &cs,
     locator = cs.getConstraintLocator(
         locator, LocatorPathElt::ArgumentAttribute::forConcurrent());
 
-  return new (cs.getAllocator()) AddConcurrentAttribute(
+  return new (cs.getAllocator()) AddSendableAttribute(
       cs, fromType, toType, locator);
 }
 bool RelabelArguments::diagnose(const Solution &solution, bool asNote) const {
@@ -355,6 +372,18 @@ ContextualMismatch *ContextualMismatch::create(ConstraintSystem &cs, Type lhs,
   return new (cs.getAllocator()) ContextualMismatch(cs, lhs, rhs, locator);
 }
 
+bool AllowWrappedValueMismatch::diagnose(const Solution &solution, bool asError) const {
+  WrappedValueMismatch failure(solution, getFromType(), getToType(), getLocator());
+  return failure.diagnoseAsError();
+}
+
+AllowWrappedValueMismatch *AllowWrappedValueMismatch::create(ConstraintSystem &cs,
+                                                             Type lhs,
+                                                             Type rhs,
+                                                             ConstraintLocator *locator) {
+  return new (cs.getAllocator()) AllowWrappedValueMismatch(cs, lhs, rhs, locator);
+}
+
 /// Computes the contextual type information for a type mismatch of a
 /// component in a structural type (tuple or function type).
 ///
@@ -362,7 +391,8 @@ ContextualMismatch *ContextualMismatch::create(ConstraintSystem &cs, Type lhs,
 /// and the contextual type.
 static Optional<std::tuple<ContextualTypePurpose, Type, Type>>
 getStructuralTypeContext(const Solution &solution, ConstraintLocator *locator) {
-  if (locator->findLast<LocatorPathElt::ContextualType>()) {
+  if (auto contextualTypeElt =
+          locator->findLast<LocatorPathElt::ContextualType>()) {
     assert(locator->isLastElement<LocatorPathElt::ContextualType>() ||
            locator->isLastElement<LocatorPathElt::FunctionArgument>());
 
@@ -370,12 +400,24 @@ getStructuralTypeContext(const Solution &solution, ConstraintLocator *locator) {
     auto anchor = locator->getAnchor();
     auto contextualType = cs.getContextualType(anchor);
     auto exprType = cs.getType(anchor);
-    return std::make_tuple(cs.getContextualTypePurpose(anchor), exprType,
+    return std::make_tuple(contextualTypeElt->getPurpose(), exprType,
                            contextualType);
   } else if (auto argApplyInfo = solution.getFunctionArgApplyInfo(locator)) {
-    return std::make_tuple(CTP_CallArgument,
-                           argApplyInfo->getArgType(),
-                           argApplyInfo->getParamType());
+    Type fromType = argApplyInfo->getArgType();
+    Type toType = argApplyInfo->getParamType();
+    // In case locator points to the function result we want the
+    // argument and param function types result.
+    if (locator->isLastElement<LocatorPathElt::FunctionResult>()) {
+      auto fromFnType = fromType->getAs<FunctionType>();
+      auto toFnType = toType->getAs<FunctionType>();
+      if (fromFnType && toFnType) {
+        auto &cs = solution.getConstraintSystem();
+        return std::make_tuple(
+            cs.getContextualTypePurpose(locator->getAnchor()),
+            fromFnType->getResult(), toFnType->getResult());
+      }
+    }
+    return std::make_tuple(CTP_CallArgument, fromType, toType);
   } else if (auto *coerceExpr = getAsExpr<CoerceExpr>(locator->getAnchor())) {
     return std::make_tuple(CTP_CoerceOperand,
                            solution.getType(coerceExpr->getSubExpr()),
@@ -411,26 +453,19 @@ bool AllowTupleTypeMismatch::coalesceAndDiagnose(
     indices.push_back(*tupleFix->Index);
   }
 
-  auto &cs = getConstraintSystem();
   auto *locator = getLocator();
   ContextualTypePurpose purpose;
-  Type fromType;
-  Type toType;
-
-  if (getFromType()->is<TupleType>() && getToType()->is<TupleType>()) {
-    purpose = cs.getContextualTypePurpose(locator->getAnchor());
-    fromType = getFromType();
-    toType = getToType();
-  } else if (auto contextualTypeInfo =
-                 getStructuralTypeContext(solution, locator)) {
-    std::tie(purpose, fromType, toType) = *contextualTypeInfo;
+  if (isExpr<CoerceExpr>(locator->getAnchor())) {
+    purpose = CTP_CoerceOperand;
+  } else if (auto *assignExpr = getAsExpr<AssignExpr>(locator->getAnchor())) {
+    purpose = isa<SubscriptExpr>(assignExpr->getDest()) ? CTP_SubscriptAssignSource
+                                                        : CTP_AssignSource;
   } else {
-    return false;
+    auto &cs = getConstraintSystem();
+    purpose = cs.getContextualTypePurpose(locator->getAnchor());
   }
 
-  TupleContextualFailure failure(solution, purpose,
-                                 fromType->lookThroughAllOptionalTypes(),
-                                 toType->lookThroughAllOptionalTypes(),
+  TupleContextualFailure failure(solution, purpose, getFromType(), getToType(),
                                  indices, locator);
   return failure.diagnose(asNote);
 }
@@ -629,25 +664,26 @@ UseWrappedValue *UseWrappedValue::create(ConstraintSystem &cs,
       UseWrappedValue(cs, propertyWrapper, base, wrapper, locator);
 }
 
-bool AddProjectedValue::diagnose(const Solution &solution, bool asNote) const {
-  MissingProjectedValueFailure failure(solution, wrapperType, getLocator());
+bool AllowInvalidPropertyWrapperType::diagnose(const Solution &solution, bool asNote) const {
+  InvalidPropertyWrapperType failure(solution, wrapperType, getLocator());
   return failure.diagnose(asNote);
 }
 
-AddProjectedValue *AddProjectedValue::create(ConstraintSystem &cs, Type wrapperType,
-                                             ConstraintLocator *locator) {
-  return new (cs.getAllocator()) AddProjectedValue(cs, wrapperType, locator);
+AllowInvalidPropertyWrapperType *
+AllowInvalidPropertyWrapperType::create(ConstraintSystem &cs, Type wrapperType,
+                                        ConstraintLocator *locator) {
+  return new (cs.getAllocator()) AllowInvalidPropertyWrapperType(cs, wrapperType, locator);
 }
 
-bool AddPropertyWrapperAttribute::diagnose(const Solution &solution, bool asNote) const {
-  MissingPropertyWrapperAttributeFailure failure(solution, wrapperType, getLocator());
+bool RemoveProjectedValueArgument::diagnose(const Solution &solution, bool asNote) const {
+  InvalidProjectedValueArgument failure(solution, wrapperType, param, getLocator());
   return failure.diagnose(asNote);
 }
 
-AddPropertyWrapperAttribute *AddPropertyWrapperAttribute::create(ConstraintSystem &cs,
-                                                                 Type wrapperType,
-                                                                 ConstraintLocator *locator) {
-  return new (cs.getAllocator()) AddPropertyWrapperAttribute(cs, wrapperType, locator);
+RemoveProjectedValueArgument *
+RemoveProjectedValueArgument::create(ConstraintSystem &cs, Type wrapperType,
+                                      ParamDecl *param, ConstraintLocator *locator) {
+  return new (cs.getAllocator()) RemoveProjectedValueArgument(cs, wrapperType, param, locator);
 }
 
 bool UseSubscriptOperator::diagnose(const Solution &solution,
@@ -1310,7 +1346,8 @@ bool IgnoreAssignmentDestinationType::diagnose(const Solution &solution,
 
   AssignmentTypeMismatchFailure failure(
       solution, CTP, getFromType(), getToType(),
-      cs.getConstraintLocator(AE->getSrc(), LocatorPathElt::ContextualType()));
+      cs.getConstraintLocator(AE->getSrc(),
+                              LocatorPathElt::ContextualType(CTP)));
   return failure.diagnose(asNote);
 }
 
@@ -1513,11 +1550,7 @@ std::string SpecifyClosureParameterType::getName() const {
   auto *PD = closure->getParameters()->get(paramLoc.getIndex());
 
   OS << "specify type for parameter ";
-  if (PD->isAnonClosureParam()) {
-    OS << "$" << paramLoc.getIndex();
-  } else {
-    OS << "'" << PD->getParameterName() << "'";
-  }
+  OS << "'" << PD->getParameterName() << "'";
 
   return OS.str();
 }
@@ -1702,55 +1735,14 @@ AllowKeyPathWithoutComponents::create(ConstraintSystem &cs,
 }
 
 bool IgnoreInvalidResultBuilderBody::diagnose(const Solution &solution,
-                                                bool asNote) const {
-  switch (Phase) {
-  // Handled below
-  case ErrorInPhase::PreCheck:
-    break;
-  case ErrorInPhase::ConstraintGeneration:
-    return true; // Already diagnosed by `matchResultBuilder`.
-  }
-
-  auto *S = castToExpr<ClosureExpr>(getAnchor())->getBody();
-
-  class PreCheckWalker : public ASTWalker {
-    DeclContext *DC;
-    DiagnosticTransaction Transaction;
-
-  public:
-    PreCheckWalker(DeclContext *dc)
-        : DC(dc), Transaction(dc->getASTContext().Diags) {}
-
-    std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
-      auto hasError = ConstraintSystem::preCheckExpression(
-          E, DC, /*replaceInvalidRefsWithErrors=*/true);
-      return std::make_pair(false, hasError ? nullptr : E);
-    }
-
-    std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
-      return std::make_pair(true, S);
-    }
-
-    // Ignore patterns because result builder pre-check does so as well.
-    std::pair<bool, Pattern *> walkToPatternPre(Pattern *P) override {
-      return std::make_pair(false, P);
-    }
-
-    bool diagnosed() const {
-      return Transaction.hasErrors();
-    }
-  };
-
-  PreCheckWalker walker(solution.getDC());
-  S->walk(walker);
-
-  return walker.diagnosed();
+                                              bool asNote) const {
+  return true; // Already diagnosed by `matchResultBuilder`.
 }
 
-IgnoreInvalidResultBuilderBody *IgnoreInvalidResultBuilderBody::create(
-    ConstraintSystem &cs, ErrorInPhase phase, ConstraintLocator *locator) {
-  return new (cs.getAllocator())
-      IgnoreInvalidResultBuilderBody(cs, phase, locator);
+IgnoreInvalidResultBuilderBody *
+IgnoreInvalidResultBuilderBody::create(ConstraintSystem &cs,
+                                       ConstraintLocator *locator) {
+  return new (cs.getAllocator()) IgnoreInvalidResultBuilderBody(cs, locator);
 }
 
 bool SpecifyContextualTypeForNil::diagnose(const Solution &solution,
@@ -1840,6 +1832,26 @@ SpecifyBaseTypeForOptionalUnresolvedMember::attempt(
             continue;
           if (memberDecl->isInstanceMember())
             continue;
+
+          // Disable this warning for ambiguities related to a
+          // static member lookup in generic context because it's
+          // possible to declare a member with the same name on
+          // a concrete type and in an extension of a protocol
+          // that type conforms to e.g.:
+          //
+          // struct S : P { static var test: S { ... }
+          //
+          // extension P where Self == S { static var test: { ... } }
+          //
+          // And use that in an optional context e.g. passing `.test`
+          // to a parameter of expecting `S?`.
+          if (auto *extension =
+                  dyn_cast<ExtensionDecl>(memberDecl->getDeclContext())) {
+            if (extension->getSelfProtocolDecl()) {
+              allOptionalBase = false;
+              break;
+            }
+          }
 
           allOptionalBase &= bool(choice.getBaseType()
                                       ->getMetatypeInstanceType()

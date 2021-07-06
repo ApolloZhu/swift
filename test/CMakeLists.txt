@@ -54,7 +54,6 @@ function(get_test_dependencies SDK result_var_name)
       sil-opt
       sil-passpipeline-dumper
       swift-frontend
-      swift-api-digester
       swift-demangle
       swift-demangle-yamldump
       swift-dependency-tool
@@ -96,7 +95,8 @@ function(get_test_dependencies SDK result_var_name)
       llvm-readelf
       llvm-readobj
       llvm-strings
-      not)
+      not
+      split-file)
   endif()
 
   if(("${SDK}" STREQUAL "IOS") OR
@@ -129,11 +129,7 @@ endfunction()
 
 set(LIT "${LLVM_MAIN_SRC_DIR}/utils/lit/lit.py")
 
-# Incremental mode in lit orders test files by the last modification time
-# instead of by the path, which is good for CI. In this mode lit also updates
-# the mtime on the failed tests, which makes them run first on the
-# consecutive execution, which makes local builds fail faster.
-set(SWIFT_LIT_ARGS "--incremental" CACHE STRING "Arguments to pass to lit")
+set(SWIFT_LIT_ARGS "" CACHE STRING "Arguments to pass to lit")
 
 set(SWIFT_LIT_ENVIRONMENT "" CACHE STRING "Environment to use for lit invocations")
 
@@ -158,6 +154,10 @@ if(NOT CMAKE_CFG_INTDIR STREQUAL ".")
        "--param" "build_mode=${CMAKE_CFG_INTDIR}")
 endif()
 
+if(SWIFT_TOOLS_ENABLE_LIBSWIFT)
+  list(APPEND SWIFT_LIT_ARGS "--param" "libswift")
+endif()
+
 if (LLVM_USE_SANITIZER STREQUAL "Address")
   set(SWIFT_ASAN_BUILD TRUE)
 endif()
@@ -171,6 +171,7 @@ normalize_boolean_spelling(SWIFT_BUILD_SYNTAXPARSERLIB)
 normalize_boolean_spelling(SWIFT_ENABLE_SOURCEKIT_TESTS)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
+normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
 is_build_type_optimized("${SWIFT_STDLIB_BUILD_TYPE}" SWIFT_OPTIMIZED)
 
 set(profdata_merge_worker
@@ -189,6 +190,7 @@ set(TEST_SUBSETS
     only_validation
     only_long
     only_stress
+    only_early_swiftdriver
 )
 
 if(NOT "${COVERAGE_DB}" STREQUAL "")
@@ -346,6 +348,10 @@ foreach(SDK ${SWIFT_SDKS})
           list(APPEND LIT_ARGS "--param" "concurrency")
         endif()
 
+        if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
+          list(APPEND LIT_ARGS "--param" "distributed")
+        endif()
+
         foreach(test_subset ${TEST_SUBSETS})
           set(directories)
           set(dependencies ${test_dependencies})
@@ -354,6 +360,7 @@ foreach(SDK ${SWIFT_SDKS})
              (test_subset STREQUAL "validation") OR
              (test_subset STREQUAL "only_long") OR
              (test_subset STREQUAL "only_stress") OR
+             (test_subset STREQUAL "only_early_swiftdriver") OR
              (test_subset STREQUAL "all"))
             list(APPEND directories "${test_bin_dir}")
           endif()

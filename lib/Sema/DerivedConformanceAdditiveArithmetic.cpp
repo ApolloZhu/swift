@@ -77,7 +77,8 @@ bool DerivedConformance::canDeriveAdditiveArithmetic(NominalTypeDecl *nominal,
     if (v->getInterfaceType()->hasError())
       return false;
     auto varType = DC->mapTypeIntoContext(v->getValueInterfaceType());
-    return (bool)TypeChecker::conformsToProtocol(varType, proto, DC);
+    return (bool)TypeChecker::conformsToProtocol(varType, proto,
+                                                 DC->getParentModule());
   });
 }
 
@@ -142,13 +143,8 @@ deriveBodyMathOperator(AbstractFunctionDecl *funcDecl, MathOperator op) {
                                          DeclNameLoc(), /*Implicit*/ true);
     auto *rhsArg = new (C) MemberRefExpr(rhsDRE, SourceLoc(), member,
                                          DeclNameLoc(), /*Implicit*/ true);
-    auto *memberOpArgs =
-        TupleExpr::create(C, SourceLoc(), {lhsArg, rhsArg}, {}, {}, SourceLoc(),
-                          /*HasTrailingClosure*/ false,
-                          /*Implicit*/ true);
-    auto *memberOpCallExpr =
-        new (C) BinaryExpr(memberOpExpr, memberOpArgs, /*Implicit*/ true);
-    return memberOpCallExpr;
+    return BinaryExpr::create(C, lhsArg, memberOpExpr, rhsArg,
+                              /*implicit*/ true);
   };
 
   // Create array of member operator call expressions.
@@ -207,6 +203,12 @@ static ValueDecl *deriveMathOperator(DerivedConformance &derived,
   operatorDecl->copyFormalAccessFrom(nominal, /*sourceIsParentContext*/ true);
 
   derived.addMembersToConformanceContext({operatorDecl});
+
+  // For the effective memberwise initializer before we force the body,
+  // so that it becomes part of the emitted ABI members even if we don't
+  // emit the body.
+  (void) nominal->getEffectiveMemberwiseInitializer();
+
   return operatorDecl;
 }
 
@@ -311,6 +313,12 @@ static ValueDecl *deriveAdditiveArithmetic_zero(DerivedConformance &derived) {
   getterDecl->setBodySynthesizer(deriveBodyAdditiveArithmetic_zero, nullptr);
 
   derived.addMembersToConformanceContext({propDecl, pbDecl});
+
+  // For the effective memberwise initializer before we force the body,
+  // so that it becomes part of the emitted ABI members even if we don't
+  // emit the body.
+  (void) nominal->getEffectiveMemberwiseInitializer();
+
   return propDecl;
 }
 

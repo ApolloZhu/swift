@@ -29,7 +29,7 @@ func testSlowServing(p: SlowServing) async throws {
 
 class SlowSwiftServer: NSObject, SlowServing {
     // CHECK-LABEL: sil {{.*}} @${{.*}}10requestInt{{.*}}To :
-    // CHECK:         [[BLOCK_COPY:%.*]] = copy_value %0
+    // CHECK:         [[BLOCK_COPY:%.*]] = copy_block %0
     // CHECK:         [[SELF:%.*]] = copy_value %1
     // CHECK:         [[CLOSURE_REF:%.*]] = function_ref [[CLOSURE_IMP:@\$.*10requestInt.*U_To]] :
     // CHECK:         [[CLOSURE:%.*]] = partial_apply [callee_guaranteed] [[CLOSURE_REF]]([[BLOCK_COPY]], [[SELF]])
@@ -108,3 +108,15 @@ class SlowServerlet: SlowServer {
     }
 }
 
+@globalActor actor FooActor {
+    static var shared = FooActor()
+}
+
+@FooActor
+class ActorConstrained: NSObject {
+    // CHECK-LABEL: sil shared [thunk] [ossa] @$s{{.*}}16ActorConstrainedC3foo{{.*}}U_To
+    // CHECK:         hop_to_executor {{%.*}} : $FooActor
+    @objc func foo() async -> Bool {
+        return true
+    }
+}

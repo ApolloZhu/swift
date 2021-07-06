@@ -156,6 +156,7 @@ StringRef OwnershipKind::asString() const {
   case OwnershipKind::None:
     return "none";
   }
+  llvm_unreachable("covered switch");
 }
 
 //===----------------------------------------------------------------------===//
@@ -339,6 +340,13 @@ bool Operand::isLifetimeEnding() const {
   return get().getOwnershipKind() != OwnershipKind::None;
 }
 
+bool Operand::isConsuming() const {
+  if (!getOwnershipConstraint().isConsuming())
+    return false;
+
+  return get().getOwnershipKind() != OwnershipKind::None;
+}
+
 //===----------------------------------------------------------------------===//
 //                             OperandConstraint
 //===----------------------------------------------------------------------===//
@@ -382,9 +390,26 @@ StringRef OperandOwnership::asString() const {
   case OperandOwnership::Reborrow:
     return "reborrow";
   }
+  llvm_unreachable("covered switch");
 }
 
 llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
                                      const OperandOwnership &operandOwnership) {
   return os << operandOwnership.asString();
 }
+
+//===----------------------------------------------------------------------===//
+//                              PlaceholderValue
+//===----------------------------------------------------------------------===//
+
+int PlaceholderValue::numPlaceholderValuesAlive = 0;
+
+PlaceholderValue::PlaceholderValue(SILType type)
+      : ValueBase(ValueKind::PlaceholderValue, type) {
+  numPlaceholderValuesAlive++;
+}
+
+PlaceholderValue::~PlaceholderValue() {
+  numPlaceholderValuesAlive--;
+}
+

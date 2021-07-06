@@ -21,7 +21,6 @@
 #include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
-#include "swift/AST/GenericParamList.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -113,107 +112,6 @@ namespace {
 
   };
 } // end anonymous namespace
-
-//===----------------------------------------------------------------------===//
-//  Generic param list printing.
-//===----------------------------------------------------------------------===//
-
-void RequirementRepr::dump() const {
-  print(llvm::errs());
-  llvm::errs() << "\n";
-}
-
-void RequirementRepr::printImpl(ASTPrinter &out) const {
-  auto printLayoutConstraint =
-      [&](const LayoutConstraintLoc &LayoutConstraintLoc) {
-        LayoutConstraintLoc.getLayoutConstraint()->print(out, PrintOptions());
-      };
-
-  switch (getKind()) {
-  case RequirementReprKind::LayoutConstraint:
-    if (auto *repr = getSubjectRepr()) {
-      repr->print(out, PrintOptions());
-    }
-    out << " : ";
-    printLayoutConstraint(getLayoutConstraintLoc());
-    break;
-
-  case RequirementReprKind::TypeConstraint:
-    if (auto *repr = getSubjectRepr()) {
-      repr->print(out, PrintOptions());
-    }
-    out << " : ";
-    if (auto *repr = getConstraintRepr()) {
-      repr->print(out, PrintOptions());
-    }
-    break;
-
-  case RequirementReprKind::SameType:
-    if (auto *repr = getFirstTypeRepr()) {
-      repr->print(out, PrintOptions());
-    }
-    out << " == ";
-    if (auto *repr = getSecondTypeRepr()) {
-      repr->print(out, PrintOptions());
-    }
-    break;
-  }
-}
-
-void RequirementRepr::print(raw_ostream &out) const {
-  StreamPrinter printer(out);
-  printImpl(printer);
-}
-void RequirementRepr::print(ASTPrinter &out) const {
-  printImpl(out);
-}
-
-static void printTrailingRequirements(ASTPrinter &Printer,
-                                      ArrayRef<RequirementRepr> Reqs,
-                                      bool printWhereKeyword) {
-  if (Reqs.empty()) return;
-
-  if (printWhereKeyword)
-    Printer << " where ";
-  interleave(
-      Reqs,
-      [&](const RequirementRepr &req) {
-        Printer.callPrintStructurePre(PrintStructureKind::GenericRequirement);
-        req.print(Printer);
-        Printer.printStructurePost(PrintStructureKind::GenericRequirement);
-      },
-      [&] { Printer << ", "; });
-}
-
-void GenericParamList::print(llvm::raw_ostream &OS) const {
-  OS << '<';
-  interleave(*this,
-             [&](const GenericTypeParamDecl *P) {
-               OS << P->getName();
-               if (!P->getInherited().empty()) {
-                 OS << " : ";
-                 P->getInherited()[0].getType().print(OS);
-               }
-             },
-             [&] { OS << ", "; });
-
-  StreamPrinter Printer(OS);
-  printTrailingRequirements(Printer, getRequirements(),
-                            /*printWhereKeyword*/true);
-  OS << '>';
-}
-
-void GenericParamList::dump() const {
-  print(llvm::errs());
-  llvm::errs() << '\n';
-}
-
-void TrailingWhereClause::print(llvm::raw_ostream &OS,
-                                bool printWhereKeyword) const {
-  StreamPrinter Printer(OS);
-  printTrailingRequirements(Printer, getRequirements(),
-                            printWhereKeyword);
-}
 
 static void printGenericParameters(raw_ostream &OS, GenericParamList *Params) {
   if (!Params)
@@ -2270,6 +2168,11 @@ public:
     printRec(E->getResultExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
+  void visitUnresolvedTypeConversionExpr(UnresolvedTypeConversionExpr *E) {
+    printCommon(E, "unresolvedtype_conversion_expr") << '\n';
+    printRec(E->getSubExpr());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
   void visitFunctionConversionExpr(FunctionConversionExpr *E) {
     printCommon(E, "function_conversion_expr") << '\n';
     printRec(E->getSubExpr());
@@ -2491,8 +2394,7 @@ public:
     for (auto capture : E->getCaptureList()) {
       OS << '\n';
       Indent += 2;
-      printRec(capture.Var);
-      printRec(capture.Init);
+      printRec(capture.PBD);
       Indent -= 2;
     }
     printRec(E->getClosureBody());
@@ -2529,7 +2431,7 @@ public:
       if (auto fType = Ty->getAs<AnyFunctionType>()) {
         if (!fType->getExtInfo().isNoEscape())
           PrintWithColorRAII(OS, ClosureModifierColor) << " escaping";
-        if (fType->getExtInfo().isConcurrent())
+        if (fType->getExtInfo().isSendable())
           PrintWithColorRAII(OS, ClosureModifierColor) << " concurrent";
       }
     }
@@ -2541,6 +2443,10 @@ public:
     printClosure(E, "closure_expr");
     if (E->hasSingleExpressionBody())
       PrintWithColorRAII(OS, ClosureModifierColor) << " single-expression";
+    if (E->allowsImplicitSelfCapture())
+      PrintWithColorRAII(OS, ClosureModifierColor) << " implicit-self";
+    if (E->inheritsActorContext())
+      PrintWithColorRAII(OS, ClosureModifierColor) << " inherits-actor-context";
 
     if (E->getParameters()) {
       OS << '\n';
@@ -2612,8 +2518,6 @@ public:
 
   void printApplyExpr(ApplyExpr *E, const char *NodeName) {
     printCommon(E, NodeName);
-    if (E->isSuper())
-      PrintWithColorRAII(OS, ExprModifierColor) << " super";
     if (E->isThrowsSet()) {
       PrintWithColorRAII(OS, ExprModifierColor)
         << (E->throws() ? " throws" : " nothrow");
@@ -2871,6 +2775,9 @@ public:
         PrintWithColorRAII(OS, IdentifierColor)
           << "  key='" << component.getUnresolvedDeclName() << "'";
         break;
+      case KeyPathExpr::Component::Kind::CodeCompletion:
+        PrintWithColorRAII(OS, ASTNodeColor) << "completion";
+        break;
       }
       PrintWithColorRAII(OS, TypeColor)
         << " type='" << GetTypeOfKeyPathComponent(E, i) << "'";
@@ -3108,6 +3015,12 @@ public:
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
+  void visitIsolatedTypeRepr(IsolatedTypeRepr *T) {
+    printCommon("isolated") << '\n';
+    printRec(T->getBase());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
   void visitOptionalTypeRepr(OptionalTypeRepr *T) {
     printCommon("type_optional") << '\n';
     printRec(T->getBase());
@@ -3124,6 +3037,12 @@ public:
   void visitOpaqueReturnTypeRepr(OpaqueReturnTypeRepr *T) {
     printCommon("type_opaque_return");
     printRec(T->getConstraint());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
+  void visitNamedOpaqueReturnTypeRepr(NamedOpaqueReturnTypeRepr *T) {
+    printCommon("type_named_opaque_return") << '\n';
+    printRec(T->getBase());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -3279,8 +3198,7 @@ static void dumpProtocolConformanceRec(
       }
     }
 
-    if (auto condReqs = normal->getConditionalRequirementsIfAvailableOrCached(
-            /*computeIfPossible=*/false)) {
+    if (auto condReqs = normal->getConditionalRequirementsIfAvailable()) {
       for (auto requirement : *condReqs) {
         out << '\n';
         out.indent(indent + 2);
@@ -3573,6 +3491,7 @@ namespace {
 
     TRIVIAL_TYPE_PRINTER(BuiltinIntegerLiteral, builtin_integer_literal)
     TRIVIAL_TYPE_PRINTER(BuiltinJob, builtin_job)
+    TRIVIAL_TYPE_PRINTER(BuiltinExecutor, builtin_executor_ref)
     TRIVIAL_TYPE_PRINTER(BuiltinDefaultActorStorage, builtin_default_actor_storage)
     TRIVIAL_TYPE_PRINTER(BuiltinRawPointer, builtin_raw_pointer)
     TRIVIAL_TYPE_PRINTER(BuiltinRawUnsafeContinuation, builtin_raw_unsafe_continuation)
@@ -3803,6 +3722,8 @@ namespace {
         PrintWithColorRAII(OS, TypeFieldColor) << "param";
         if (param.hasLabel())
           printField("name", param.getLabel().str());
+        if (param.hasInternalLabel())
+          printField("internal_name", param.getInternalLabel().str());
         dumpParameterFlags(param.getParameterFlags());
         printRec(param.getPlainType());
         OS << ")";
@@ -3822,7 +3743,7 @@ namespace {
                    getSILFunctionTypeRepresentationString(representation));
 
       printFlag(!T->isNoEscape(), "escaping");
-      printFlag(T->isConcurrent(), "concurrent");
+      printFlag(T->isSendable(), "Sendable");
       printFlag(T->isAsync(), "async");
       printFlag(T->isThrowing(), "throws");
 
@@ -3837,6 +3758,11 @@ namespace {
         T->getClangTypeInfo().dump(os, ctx);
         printField("clang_type", os.str());
       }
+
+      if (Type globalActor = T->getGlobalActor()) {
+        printField("global_actor", globalActor.getString());
+      }
+
       printAnyFunctionParams(T->getParams(), "input");
       Indent -=2;
       printRec("output", T->getResult());

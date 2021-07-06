@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 #include "ImporterImpl.h"
 #include "swift/AST/ModuleDependencies.h"
+#include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "clang/Tooling/DependencyScanning/DependencyScanningService.h"
 #include "clang/Tooling/DependencyScanning/DependencyScanningTool.h"
@@ -214,7 +215,7 @@ void ClangImporter::recordModuleDependencies(
 
     // Ensure the arguments we collected is sufficient to create a Clang
     // invocation.
-    assert(createClangInvocation(this, Opts, allArgs));
+    assert(createClangInvocation(this, Opts, nullptr, allArgs));
 
     std::vector<std::string> swiftArgs;
     // We are using Swift frontend mode.

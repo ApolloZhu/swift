@@ -37,6 +37,7 @@ class PostOrderFunctionInfo;
 class ReversePostOrderInfo;
 class Operand;
 class SILInstruction;
+class SILArgument;
 class SILLocation;
 class DeadEndBlocks;
 class ValueBaseUseIterator;
@@ -874,6 +875,7 @@ inline OwnershipConstraint OperandOwnership::getOwnershipConstraint() {
   case OperandOwnership::Reborrow:
     return {OwnershipKind::Guaranteed, UseLifetimeConstraint::LifetimeEnding};
   }
+  llvm_unreachable("covered switch");
 }
 
 /// Return true if this use can accept Unowned values.
@@ -899,7 +901,11 @@ inline bool canAcceptUnownedValue(OperandOwnership operandOwnership) {
   case OperandOwnership::Reborrow:
     return false;
   }
+  llvm_unreachable("covered switch");
 }
+
+/// Return true if all OperandOwnership invariants hold.
+bool checkOperandOwnershipInvariants(const Operand *operand);
 
 /// Return the OperandOwnership for a forwarded operand when the forwarding
 /// operation has this "forwarding ownership" (as returned by
@@ -1003,6 +1009,8 @@ public:
   SILInstruction *getUser() { return Owner; }
   const SILInstruction *getUser() const { return Owner; }
 
+  Operand *getNextUse() const { return NextUse; }
+
   /// Return true if this operand is a type dependent operand.
   ///
   /// Implemented in SILInstruction.h
@@ -1035,6 +1043,9 @@ public:
   /// associated value, either by consuming the owned value or ending the
   /// guaranteed scope.
   bool isLifetimeEnding() const;
+
+  /// Returns true if this ends the lifetime of an owned operand.
+  bool isConsuming() const;
 
   SILBasicBlock *getParentBlock() const;
   SILFunction *getParentFunction() const;
@@ -1352,6 +1363,25 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILValue V) {
   V->print(OS);
   return OS;
 }
+
+/// Used internally in e.g. the SIL parser and deserializer to handle forward-
+/// referenced values.
+/// A PlaceholderValue must not appear in valid SIL.
+class PlaceholderValue : public ValueBase {
+  static int numPlaceholderValuesAlive;
+
+public:
+  PlaceholderValue(SILType type);
+  ~PlaceholderValue();
+
+  static int getNumPlaceholderValuesAlive() { return numPlaceholderValuesAlive; }
+
+  static bool classof(const SILArgument *) = delete;
+  static bool classof(const SILInstruction *) = delete;
+  static bool classof(SILNodePointer node) {
+    return node->getKind() == SILNodeKind::PlaceholderValue;
+  }
+};
 
 } // end namespace swift
 

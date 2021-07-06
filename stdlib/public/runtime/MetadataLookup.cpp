@@ -33,7 +33,7 @@
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/StringExtras.h"
 #include "Private.h"
-#include "CompatibilityOverride.h"
+#include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ImageInspection.h"
 #include <functional>
 #include <vector>
@@ -673,6 +673,10 @@ _searchTypeMetadataRecords(TypeMetadataPrivateState &T,
 #define STANDARD_TYPE(KIND, MANGLING, TYPENAME) \
   extern "C" const ContextDescriptor DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND));
 
+// FIXME: When the _Concurrency library gets merged into the Standard Library,
+// we will be able to reference those symbols directly as well.
+#define STANDARD_TYPE_2(KIND, MANGLING, TYPENAME)
+
 #if !SWIFT_OBJC_INTEROP
 # define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
 #endif
@@ -703,6 +707,9 @@ _findContextDescriptor(Demangle::NodePointer node,
     if (name.equals(#TYPENAME)) { \
       return &DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND)); \
     }
+  // FIXME: When the _Concurrency library gets merged into the Standard Library,
+  // we will be able to reference those symbols directly as well.
+#define STANDARD_TYPE_2(KIND, MANGLING, TYPENAME)
 #if !SWIFT_OBJC_INTEROP
 # define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
 #endif
@@ -1477,8 +1484,14 @@ public:
   }
 
   TypeLookupErrorOr<BuiltType>
-  createFunctionType(llvm::ArrayRef<Demangle::FunctionParam<BuiltType>> params,
-                     BuiltType result, FunctionTypeFlags flags) const {
+  createFunctionType(
+      llvm::ArrayRef<Demangle::FunctionParam<BuiltType>> params,
+      BuiltType result, FunctionTypeFlags flags,
+      FunctionMetadataDifferentiabilityKind diffKind,
+      BuiltType globalActorType) const {
+    assert(
+        (flags.isDifferentiable() && diffKind.isDifferentiable()) ||
+        (!flags.isDifferentiable() && !diffKind.isDifferentiable()));
     llvm::SmallVector<BuiltType, 8> paramTypes;
     llvm::SmallVector<uint32_t, 8> paramFlags;
 
@@ -1492,11 +1505,22 @@ public:
         paramFlags.push_back(param.getFlags().getIntValue());
     }
 
-    return swift_getFunctionTypeMetadata(flags, paramTypes.data(),
-                                         flags.hasParameterFlags()
-                                           ? paramFlags.data()
-                                           : nullptr,
-                                         result);
+    if (globalActorType)
+      flags = flags.withGlobalActor(true);
+
+    return flags.hasGlobalActor()
+        ? swift_getFunctionTypeMetadataGlobalActor(flags, diffKind, paramTypes.data(),
+            flags.hasParameterFlags() ? paramFlags.data() : nullptr, result,
+            globalActorType)
+        : flags.isDifferentiable()
+          ? swift_getFunctionTypeMetadataDifferentiable(
+                flags, diffKind, paramTypes.data(),
+                flags.hasParameterFlags() ? paramFlags.data() : nullptr,
+                result)
+          : swift_getFunctionTypeMetadata(
+                flags, paramTypes.data(),
+                flags.hasParameterFlags() ? paramFlags.data() : nullptr,
+                result);
   }
 
   TypeLookupErrorOr<BuiltType> createImplFunctionType(
@@ -1935,23 +1959,9 @@ getObjCClassByMangledName(const char * _Nonnull typeName,
 
 __attribute__((constructor))
 static void installGetClassHook() {
-  // FIXME: delete this #if and dlsym once we don't
-  // need to build with older libobjc headers
-#if !OBJC_GETCLASSHOOK_DEFINED
-  using objc_hook_getClass =  BOOL(*)(const char * _Nonnull name,
-                                      Class _Nullable * _Nonnull outClass);
-  auto objc_setHook_getClass =
-    (void(*)(objc_hook_getClass _Nonnull,
-             objc_hook_getClass _Nullable * _Nonnull))
-    dlsym(RTLD_DEFAULT, "objc_setHook_getClass");
-#endif
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunguarded-availability"
-  if (&objc_setHook_getClass) {
-    objc_setHook_getClass(getObjCClassByMangledName, &OldGetClassHook);
+  if (SWIFT_RUNTIME_WEAK_CHECK(objc_setHook_getClass)) {
+    SWIFT_RUNTIME_WEAK_USE(objc_setHook_getClass(getObjCClassByMangledName, &OldGetClassHook));
   }
-#pragma clang diagnostic pop
 }
 
 #endif
@@ -2300,30 +2310,33 @@ void DynamicReplacementDescriptor::enableReplacement() const {
     auto *previous = chainRoot->next;
     chainRoot->next = previous->next;
     //chainRoot->implementationFunction = previous->implementationFunction;
-    swift_ptrauth_copy(
-      reinterpret_cast<void **>(&chainRoot->implementationFunction),
-      reinterpret_cast<void *const *>(&previous->implementationFunction),
-      replacedFunctionKey->getExtraDiscriminator());
+    swift_ptrauth_copy_code_or_data(
+        reinterpret_cast<void **>(&chainRoot->implementationFunction),
+        reinterpret_cast<void *const *>(&previous->implementationFunction),
+        replacedFunctionKey->getExtraDiscriminator(),
+        !replacedFunctionKey->isAsync());
   }
 
   // First populate the current replacement's chain entry.
   auto *currentEntry =
       const_cast<DynamicReplacementChainEntry *>(chainEntry.get());
   // currentEntry->implementationFunction = chainRoot->implementationFunction;
-  swift_ptrauth_copy(
+  swift_ptrauth_copy_code_or_data(
       reinterpret_cast<void **>(&currentEntry->implementationFunction),
       reinterpret_cast<void *const *>(&chainRoot->implementationFunction),
-      replacedFunctionKey->getExtraDiscriminator());
+      replacedFunctionKey->getExtraDiscriminator(),
+      !replacedFunctionKey->isAsync());
 
   currentEntry->next = chainRoot->next;
 
   // Link the replacement entry.
   chainRoot->next = chainEntry.get();
   // chainRoot->implementationFunction = replacementFunction.get();
-  swift_ptrauth_init(
+  swift_ptrauth_init_code_or_data(
       reinterpret_cast<void **>(&chainRoot->implementationFunction),
       reinterpret_cast<void *>(replacementFunction.get()),
-      replacedFunctionKey->getExtraDiscriminator());
+      replacedFunctionKey->getExtraDiscriminator(),
+      !replacedFunctionKey->isAsync());
 }
 
 void DynamicReplacementDescriptor::disableReplacement() const {
@@ -2344,10 +2357,11 @@ void DynamicReplacementDescriptor::disableReplacement() const {
   auto *previous = const_cast<DynamicReplacementChainEntry *>(prev);
   previous->next = thisEntry->next;
   // previous->implementationFunction = thisEntry->implementationFunction;
-  swift_ptrauth_copy(
+  swift_ptrauth_copy_code_or_data(
       reinterpret_cast<void **>(&previous->implementationFunction),
       reinterpret_cast<void *const *>(&thisEntry->implementationFunction),
-      replacedFunctionKey->getExtraDiscriminator());
+      replacedFunctionKey->getExtraDiscriminator(),
+      !replacedFunctionKey->isAsync());
 }
 
 /// An automatic dymamic replacement entry.
@@ -2504,4 +2518,4 @@ void swift::swift_disableDynamicReplacementScope(
   DynamicReplacementLock.get().withLock([=] { scope->disable(); });
 }
 #define OVERRIDE_METADATALOOKUP COMPATIBILITY_OVERRIDE
-#include "CompatibilityOverride.def"
+#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH

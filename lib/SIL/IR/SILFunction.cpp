@@ -14,6 +14,7 @@
 
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
+#include "swift/SIL/SILBridging.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
@@ -124,6 +125,8 @@ SILFunction::create(SILModule &M, SILLinkage linkage, StringRef name,
   return fn;
 }
 
+SwiftMetatype SILFunction::registeredMetatype;
+
 SILFunction::SILFunction(SILModule &Module, SILLinkage Linkage, StringRef Name,
                          CanSILFunctionType LoweredType,
                          GenericEnvironment *genericEnv,
@@ -135,7 +138,8 @@ SILFunction::SILFunction(SILModule &Module, SILLinkage Linkage, StringRef Name,
                          const SILDebugScope *DebugScope,
                          IsDynamicallyReplaceable_t isDynamic,
                          IsExactSelfClass_t isExactSelfClass)
-    : Module(Module), Availability(AvailabilityContext::alwaysAvailable())  {
+    : SwiftObjectHeader(registeredMetatype),
+      Module(Module), Availability(AvailabilityContext::alwaysAvailable())  {
   init(Linkage, Name, LoweredType, genericEnv, Loc, isBareSILFunction, isTrans,
        isSerialized, entryCount, isThunk, classSubclassScope, inlineStrategy,
        E, DebugScope, isDynamic, isExactSelfClass);
@@ -178,6 +182,7 @@ void SILFunction::init(SILLinkage Linkage, StringRef Name,
   this->Zombie = false;
   this->HasOwnership = true,
   this->WasDeserializedCanonical = false;
+  this->IsStaticallyLinked = false;
   this->IsWithoutActuallyEscapingThunk = false;
   this->OptMode = unsigned(OptimizationMode::NotSet);
   this->EffectsKindAttr = unsigned(E);
@@ -201,16 +206,7 @@ SILFunction::~SILFunction() {
 
   auto &M = getModule();
   for (auto &BB : *this) {
-    for (auto I = BB.begin(), E = BB.end(); I != E;) {
-      auto Inst = &*I;
-      ++I;
-      SILInstruction::destroy(Inst);
-      // TODO: It is only safe to directly deallocate an
-      // instruction if this BB is being removed in scope
-      // of destructing a SILFunction.
-      M.deallocateInst(Inst);
-    }
-    BB.InstList.clearAndLeakNodesUnsafely();
+    BB.eraseAllInstructions(M);
   }
 
   assert(RefCount == 0 &&
@@ -381,6 +377,30 @@ SILBasicBlock *SILFunction::createBasicBlockBefore(SILBasicBlock *beforeBB) {
   SILBasicBlock *newBlock = new (getModule()) SILBasicBlock(this);
   BlockList.insert(beforeBB->getIterator(), newBlock);
   return newBlock;
+}
+
+void SILFunction::moveAllBlocksFromOtherFunction(SILFunction *F) {
+  BlockList.splice(begin(), F->BlockList);
+  
+  SILModule &mod = getModule();
+  for (SILBasicBlock &block : *this) {
+    for (SILInstruction &inst : block) {
+      mod.notifyMovedInstruction(&inst, F);
+    }
+  }
+}
+
+void SILFunction::moveBlockFromOtherFunction(SILBasicBlock *blockInOtherFunction,
+                                iterator insertPointInThisFunction) {
+  SILFunction *otherFunc = blockInOtherFunction->getParent();
+  assert(otherFunc != this);
+  BlockList.splice(insertPointInThisFunction, otherFunc->BlockList,
+                   blockInOtherFunction);
+
+  SILModule &mod = getModule();
+  for (SILInstruction &inst : *blockInOtherFunction) {
+    mod.notifyMovedInstruction(&inst, otherFunc);
+  }
 }
 
 void SILFunction::moveBlockBefore(SILBasicBlock *BB, SILFunction::iterator IP) {
@@ -665,6 +685,10 @@ bool SILFunction::isExternallyUsedSymbol() const {
 
 void SILFunction::clear() {
   dropAllReferences();
+  eraseAllBlocks();
+}
+
+void SILFunction::eraseAllBlocks() {
   BlockList.clear();
 }
 

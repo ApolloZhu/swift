@@ -1042,9 +1042,7 @@ public:
       case StmtConditionElement::CK_Boolean: {
         auto *E = elt.getBoolean();
         if (shouldVerifyChecked(E))
-          checkSameType(E->getType(),
-                        Ctx.getBoolDecl()->getDeclaredInterfaceType(),
-                        "condition type");
+          checkSameType(E->getType(), Ctx.getBoolType(), "condition type");
         break;
       }
 
@@ -1386,8 +1384,7 @@ public:
       
       // Ensure we don't convert an array to a void pointer this way.
       
-      if (fromElement->getNominalOrBoundGenericNominal() == Ctx.getArrayDecl()
-          && toElement->isEqual(Ctx.TheEmptyTupleType)) {
+      if (fromElement->isArray() && toElement->isVoid()) {
         Out << "InOutToPointer is converting an array to a void pointer; "
                "ArrayToPointer should be used instead:\n";
         E->dump(Out);
@@ -1410,7 +1407,7 @@ public:
       // The source may be optionally inout.
       auto fromArray = E->getSubExpr()->getType()->getInOutObjectType();
       
-      if (fromArray->getNominalOrBoundGenericNominal() != Ctx.getArrayDecl()) {
+      if (!fromArray->isArray()) {
         Out << "ArrayToPointer does not convert from array:\n";
         E->dump(Out);
         Out << "\n";
@@ -1431,8 +1428,7 @@ public:
       PrettyStackTraceExpr debugStack(Ctx,
                                       "verifying StringToPointer", E);
       
-      if (E->getSubExpr()->getType()->getNominalOrBoundGenericNominal()
-            != Ctx.getStringDecl()) {
+      if (!E->getSubExpr()->getType()->isString()) {
         Out << "StringToPointer does not convert from string:\n";
         E->dump(Out);
         Out << "\n";
@@ -1762,6 +1758,26 @@ public:
       }
     }
 
+    /// A version of AnyFunctionType::equalParams() that ignores "isolated"
+    /// parameters, which aren't represented in the type system.
+    static bool equalParamsIgnoringIsolation(
+        ArrayRef<AnyFunctionType::Param> a,
+        ArrayRef<AnyFunctionType::Param> b) {
+      auto withoutIsolation = [](AnyFunctionType::Param param) {
+        return param.withFlags(param.getParameterFlags().withIsolated(false));
+      };
+
+      if (a.size() != b.size())
+        return false;
+
+      for (unsigned i = 0, n = a.size(); i != n; ++i) {
+        if (withoutIsolation(a[i]) != withoutIsolation(b[i]))
+          return false;
+      }
+
+      return true;
+    }
+
     void verifyChecked(ApplyExpr *E) {
       PrettyStackTraceExpr debugStack(Ctx, "verifying ApplyExpr", E);
 
@@ -1786,7 +1802,7 @@ public:
       Type InputExprTy = E->getArg()->getType();
       AnyFunctionType::decomposeInput(InputExprTy, Args);
       auto Params = FT->getParams();
-      if (!AnyFunctionType::equalParams(Args, Params)) {
+      if (!equalParamsIgnoringIsolation(Args, Params)) {
         Out << "Argument type does not match parameter type in ApplyExpr:"
                "\nArgument type: ";
         InputExprTy.print(Out);
@@ -1803,7 +1819,7 @@ public:
         E->dump(Out);
         Out << "\n";
         abort();
-      } else if (E->throws() && !FT->isThrowing()) {
+      } else if (E->throws() && !FT->isThrowing() && !E->implicitlyThrows()) {
         PolymorphicEffectKind rethrowingKind = PolymorphicEffectKind::Invalid;
         if (auto DRE = dyn_cast<DeclRefExpr>(E->getFn())) {
           if (auto fnDecl = dyn_cast<AbstractFunctionDecl>(DRE->getDecl())) {
@@ -1825,12 +1841,6 @@ public:
         }
       }
 
-      if (E->isSuper() != E->getArg()->isSuperExpr()) {
-        Out << "Function application's isSuper() bit mismatch.\n";
-        E->dump(Out);
-        Out << "\n";
-        abort();
-      }
       verifyCheckedBase(E);
     }
 
@@ -2212,22 +2222,20 @@ public:
       auto keyPathTy = E->getKeyPath()->getType();
       auto resultTy = E->getType();
       
-      if (auto nom = keyPathTy->getAs<NominalType>()) {
-        if (nom->getDecl() == Ctx.getAnyKeyPathDecl()) {
-          // AnyKeyPath application is <T> rvalue T -> rvalue Any?
-          if (baseTy->is<LValueType>()) {
-            Out << "AnyKeyPath application base is not an rvalue\n";
-            abort();
-          }
-          auto resultObjTy = resultTy->getOptionalObjectType();
-          if (!resultObjTy || !resultObjTy->isAny()) {
-            Out << "AnyKeyPath application result must be Any?\n";
-            abort();
-          }
-          return;
+      if (keyPathTy->isAnyKeyPath()) {
+        // AnyKeyPath application is <T> rvalue T -> rvalue Any?
+        if (baseTy->is<LValueType>()) {
+          Out << "AnyKeyPath application base is not an rvalue\n";
+          abort();
         }
+        auto resultObjTy = resultTy->getOptionalObjectType();
+        if (!resultObjTy || !resultObjTy->isAny()) {
+          Out << "AnyKeyPath application result must be Any?\n";
+          abort();
+        }
+        return;
       } else if (auto bgt = keyPathTy->getAs<BoundGenericType>()) {
-        if (bgt->getDecl() == Ctx.getPartialKeyPathDecl()) {
+        if (keyPathTy->isPartialKeyPath()) {
           // PartialKeyPath<T> application is rvalue T -> rvalue Any
           if (!baseTy->isEqual(bgt->getGenericArgs()[0])) {
             Out << "PartialKeyPath application base doesn't match type\n";
@@ -2238,7 +2246,7 @@ public:
             abort();
           }
           return;
-        } else if (bgt->getDecl() == Ctx.getKeyPathDecl()) {
+        } else if (keyPathTy->isKeyPath()) {
           // KeyPath<T, U> application is rvalue T -> rvalue U
           if (!baseTy->isEqual(bgt->getGenericArgs()[0])) {
             Out << "KeyPath application base doesn't match type\n";
@@ -2249,7 +2257,7 @@ public:
             abort();
           }
           return;
-        } else if (bgt->getDecl() == Ctx.getWritableKeyPathDecl()) {
+        } else if (keyPathTy->isWritableKeyPath()) {
           // WritableKeyPath<T, U> application is
           //    lvalue T -> lvalue U
           // or rvalue T -> rvalue U
@@ -2271,7 +2279,7 @@ public:
             abort();
           }
           return;
-        } else if (bgt->getDecl() == Ctx.getReferenceWritableKeyPathDecl()) {
+        } else if (keyPathTy->isReferenceWritableKeyPath()) {
           // ReferenceWritableKeyPath<T, U> application is
           //    rvalue T -> lvalue U
           // or lvalue T -> lvalue U
@@ -2945,8 +2953,7 @@ public:
       // Verify that the optionality of the result type of the
       // initializer matches the failability of the initializer.
       if (!CD->isInvalid() &&
-          CD->getDeclContext()->getDeclaredInterfaceType()->getAnyNominal() !=
-              Ctx.getOptionalDecl()) {
+          !CD->getDeclContext()->getDeclaredInterfaceType()->isOptional()) {
         bool resultIsOptional = (bool) CD->getResultInterfaceType()
             ->getOptionalObjectType();
         auto declIsOptional = CD->isFailable();

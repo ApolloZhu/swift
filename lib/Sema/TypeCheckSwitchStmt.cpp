@@ -131,13 +131,13 @@ namespace {
         case SpaceKind::UnknownCase:
           return isAllowedButNotRequired() ? 0 : 1;
         case SpaceKind::Type: {
-          if (!canDecompose(getType(), DC)) {
+          if (!canDecompose(getType())) {
             return 1;
           }
           cache.insert(getType().getPointer());
 
           SmallVector<Space, 4> spaces;
-          decompose(DC, getType(), spaces);
+          decomposeDisjuncts(DC, getType(), {}, spaces);
           size_t acc = 0;
           for (auto &sp : spaces) {
             // Decomposed pattern spaces grow with the sum of the subspaces.
@@ -316,15 +316,15 @@ namespace {
           }
 
           // (_ : Ty1) <= (_ : Ty2) iff D(Ty1) == D(Ty2)
-          if (canDecompose(this->getType(), DC)) {
-            Space or1Space = decompose(DC, this->getType());
+          if (canDecompose(this->getType())) {
+            Space or1Space = decompose(DC, this->getType(), {});
             if (or1Space.isSubspace(other, DC)) {
               return true;
             }
           }
 
-          if (canDecompose(other.getType(), DC)) {
-            Space or2Space = decompose(DC, other.getType());
+          if (canDecompose(other.getType())) {
+            Space or2Space = decompose(DC, other.getType(), {});
             return this->isSubspace(or2Space, DC);
           }
 
@@ -339,16 +339,16 @@ namespace {
           }
 
           // (_ : Ty1) <= (S1 | ... | Sn) iff D(Ty1) <= (S1 | ... | Sn)
-          if (!canDecompose(this->getType(), DC)) {
+          if (!canDecompose(this->getType())) {
             return false;
           }
-          Space or1Space = decompose(DC, this->getType());
+          Space or1Space = decompose(DC, this->getType(), {});
           return or1Space.isSubspace(other, DC);
         }
         PAIRCASE (SpaceKind::Type, SpaceKind::Constructor): {
           // (_ : Ty1) <= H(p1 | ... | pn) iff D(Ty1) <= H(p1 | ... | pn)
-          if (canDecompose(this->getType(), DC)) {
-            Space or1Space = decompose(DC, this->getType());
+          if (canDecompose(this->getType())) {
+            Space or1Space = decompose(DC, this->getType(), {});
             return or1Space.isSubspace(other, DC);
           }
           // An undecomposable type is always larger than its constructor space.
@@ -465,8 +465,8 @@ namespace {
           return *this;
         }
         PAIRCASE (SpaceKind::Type, SpaceKind::Constructor): {
-          if (canDecompose(this->getType(), DC)) {
-            auto decomposition = decompose(DC, this->getType());
+          if (canDecompose(this->getType())) {
+            auto decomposition = decompose(DC, this->getType(), {});
             return decomposition.minus(other, DC, minusCount);
           } else {
             return *this;
@@ -480,8 +480,38 @@ namespace {
           // decomposable.
           return *this;
 
+        PAIRCASE (SpaceKind::Type, SpaceKind::Disjunct): {
+          // Optimize for the common case of a type minus a disjunct of
+          // constructor subspaces. This form of subtraction is guaranteed to
+          // happen very early on, and we can eliminate a huge part of the
+          // pattern space by only decomposing the parts of the type space that
+          // aren't actually covered by the disjunction.
+          if (canDecompose(this->getType())) {
+            llvm::StringSet<> otherConstructors;
+            for (auto s : other.getSpaces()) {
+              // Filter for constructor spaces with no payloads.
+              if (s.getKind() != SpaceKind::Constructor) {
+                continue;
+              }
+
+              if (!s.getSpaces().empty()) {
+                continue;
+              }
+
+              otherConstructors.insert(s.Head.getBaseIdentifier().str());
+            }
+
+            auto decomposition = decompose(DC, this->getType(),
+                                           otherConstructors);
+            return decomposition.minus(other, DC, minusCount);
+          } else {
+            // If the type isn't decomposable then there's no way we can
+            // subtract from it. Report the total space as uncovered.
+            return *this;
+          }
+        }
+
         PAIRCASE (SpaceKind::Empty, SpaceKind::Disjunct):
-        PAIRCASE (SpaceKind::Type, SpaceKind::Disjunct):
         PAIRCASE (SpaceKind::Constructor, SpaceKind::Disjunct):
         PAIRCASE (SpaceKind::Disjunct, SpaceKind::Disjunct):
         PAIRCASE (SpaceKind::BooleanConstant, SpaceKind::Disjunct):
@@ -627,8 +657,8 @@ namespace {
             return (getKind() == SpaceKind::BooleanConstant)  ? Space() : *this;
           }
 
-          if (canDecompose(other.getType(), DC)) {
-            auto decomposition = decompose(DC, other.getType());
+          if (canDecompose(other.getType())) {
+            auto decomposition = decompose(DC, other.getType(), {});
             return this->minus(decomposition, DC, minusCount);
           }
           return *this;
@@ -639,8 +669,8 @@ namespace {
           return *this;
 
         PAIRCASE (SpaceKind::Type, SpaceKind::BooleanConstant): {
-          if (canDecompose(this->getType(), DC)) {
-            auto orSpace = decompose(DC, this->getType());
+          if (canDecompose(this->getType())) {
+            auto orSpace = decompose(DC, this->getType(), {});
             return orSpace.minus(other, DC, minusCount);
           } else {
             return *this;
@@ -778,10 +808,17 @@ namespace {
         }
       };
 
-      // Decompose a type into its component spaces.
-      static void decompose(const DeclContext *DC, Type tp,
-                            SmallVectorImpl<Space> &arr) {
-        assert(canDecompose(tp, DC) && "Non-decomposable type?");
+      // Decompose a type into its component spaces, ignoring any enum
+      // cases that have no payloads and are also in the `voidList`. Membership
+      // there means the space is guaranteed by the subtraction procedure to be
+      // covered, so there's no reason to include it. Note that this *only*
+      // works for constructor spaces with no payloads as these cannot be
+      // overloaded and there is no further recursive structure to subtract
+      // into.
+      static void decomposeDisjuncts(const DeclContext *DC, Type tp,
+                                     const llvm::StringSet<> &voidList,
+                                     SmallVectorImpl<Space> &arr) {
+        assert(canDecompose(tp) && "Non-decomposable type?");
 
         if (tp->isBool()) {
           arr.push_back(Space::forBool(true));
@@ -794,6 +831,14 @@ namespace {
                 // Don't force people to match unavailable cases; they can't
                 // even write them.
                 if (AvailableAttr::isUnavailable(eed)) {
+                  return Space();
+                }
+
+                // If we're guaranteed a match from a subtraction, don't include
+                // the space at all. See the `Type - Disjunct` case of
+                // subtraction for when this optimization applies.
+                if (!eed->hasAssociatedValues() &&
+                    voidList.contains(eed->getBaseIdentifier().str())) {
                   return Space();
                 }
 
@@ -838,13 +883,15 @@ namespace {
         }
       }
 
-      static Space decompose(const DeclContext *DC, Type type) {
+      static Space decompose(const DeclContext *DC,
+                             Type type,
+                             const llvm::StringSet<> &voidList) {
         SmallVector<Space, 4> spaces;
-        decompose(DC, type, spaces);
+        decomposeDisjuncts(DC, type, voidList, spaces);
         return Space::forDisjunct(spaces);
       }
 
-      static bool canDecompose(Type tp, const DeclContext *DC) {
+      static bool canDecompose(Type tp) {
         return tp->is<TupleType>() || tp->isBool() ||
                tp->getEnumOrBoundGenericEnum();
       }
@@ -1032,9 +1079,9 @@ namespace {
       // decompose the type space and offer them as fixits, or simply offer
       // to insert a `default` clause.
       if (uncovered.getKind() == SpaceKind::Type) {
-        if (Space::canDecompose(uncovered.getType(), DC)) {
+        if (Space::canDecompose(uncovered.getType())) {
           SmallVector<Space, 4> spaces;
-          Space::decompose(DC, uncovered.getType(), spaces);
+          Space::decomposeDisjuncts(DC, uncovered.getType(), {}, spaces);
           diagnoseMissingCases(RequiresDefault::No, Space::forDisjunct(spaces),
                                unknownCase);
         } else {
@@ -1058,6 +1105,12 @@ namespace {
 
     void diagnoseMissingCases(RequiresDefault defaultReason, Space uncovered,
                               const CaseStmt *unknownCase = nullptr) {
+      if (!Switch->getLBraceLoc().isValid()) {
+        // There is no '{' in the switch statement, which we already diagnosed
+        // in the parser. So there's no real body to speak of and it doesn't
+        // make sense to emit diagnostics about missing cases.
+        return;
+      }
       auto &DE = Context.Diags;
       SourceLoc startLoc = Switch->getStartLoc();
       SourceLoc insertLoc;

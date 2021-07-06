@@ -99,7 +99,7 @@ private:
 
   /// Either the class marked \@NS/UIApplicationMain or the synthesized FuncDecl
   /// that calls main on the type marked @main.
-  Decl *MainDecl = nullptr;
+  ValueDecl *MainDecl = nullptr;
 
   /// The source location of the main type.
   SourceLoc MainDeclDiagLoc;
@@ -217,9 +217,6 @@ public:
   /// The list of local type declarations in the source file.
   llvm::SetVector<TypeDecl *> LocalTypeDecls;
 
-  /// A set of synthesized declarations that need to be type checked.
-  llvm::SmallVector<Decl *, 8> SynthesizedDecls;
-
   /// The list of functions defined in this file whose bodies have yet to be
   /// typechecked. They must be held in this list instead of eagerly validated
   /// because their bodies may force us to perform semantic checks of arbitrary
@@ -227,11 +224,6 @@ public:
   /// we cannot, in general, perform witness matching on singular requirements
   /// unless the entire conformance has been evaluated.
   std::vector<AbstractFunctionDecl *> DelayedFunctions;
-
-  /// We might perform type checking on the same source file more than once,
-  /// if its the main file or a REPL instance, so keep track of the last
-  /// checked synthesized declaration to avoid duplicating work.
-  unsigned LastCheckedSynthesizedDecl = 0;
 
   /// A mapping from Objective-C selectors to the methods that have
   /// those selectors.
@@ -249,10 +241,17 @@ public:
   /// unsatisfied, which might conflict with other Objective-C methods.
   std::vector<ObjCUnsatisfiedOptReq> ObjCUnsatisfiedOptReqs;
 
+  /// A selector that is used by two different declarations in the same class.
+  /// Fields: classDecl, selector, isInstanceMethod.
   using ObjCMethodConflict = std::tuple<ClassDecl *, ObjCSelector, bool>;
 
   /// List of Objective-C member conflicts we have found during type checking.
   std::vector<ObjCMethodConflict> ObjCMethodConflicts;
+
+  /// List of attributes added by access notes, used to emit remarks for valid
+  /// ones.
+  llvm::DenseMap<ValueDecl *, std::vector<DeclAttribute *>>
+      AttrsAddedByAccessNotes;
 
   /// Describes what kind of file this is, which can affect some type checking
   /// and other behavior.
@@ -407,7 +406,8 @@ public:
 
   Identifier getDiscriminatorForPrivateValue(const ValueDecl *D) const override;
   Identifier getPrivateDiscriminator() const { return PrivateDiscriminator; }
-  Optional<BasicDeclLocs> getBasicLocsForDecl(const Decl *D) const override;
+  Optional<ExternalSourceLocs::RawLocs>
+  getExternalRawLocsForDecl(const Decl *D) const override;
 
   /// Returns the synthesized file for this source file, if it exists.
   SynthesizedFileUnit *getSynthesizedFile() const { return SynthesizedFile; };
@@ -487,7 +487,7 @@ public:
     llvm_unreachable("bad SourceFileKind");
   }
 
-  Decl *getMainDecl() const override { return MainDecl; }
+  ValueDecl *getMainDecl() const override { return MainDecl; }
   SourceLoc getMainDeclDiagLoc() const {
     assert(hasMainDecl());
     return MainDeclDiagLoc;
@@ -501,7 +501,7 @@ public:
   /// one.
   ///
   /// Should only be called during type-checking.
-  bool registerMainDecl(Decl *mainDecl, SourceLoc diagLoc);
+  bool registerMainDecl(ValueDecl *mainDecl, SourceLoc diagLoc);
 
   /// True if this source file has an application entry point.
   ///

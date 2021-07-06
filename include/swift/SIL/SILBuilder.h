@@ -18,7 +18,7 @@
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/SIL/SILOpenedArchetypesTracker.h"
+#include "swift/SIL/SILUndef.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/StringExtras.h"
 
@@ -57,16 +57,6 @@ class SILBuilderContext {
   /// currently provide their own InsertedInstrs.
   SmallVectorImpl<SILInstruction *> *InsertedInstrs = nullptr;
 
-  /// An immutable view on the set of available opened archetypes.
-  /// It is passed down to SILInstruction constructors and create
-  /// methods.
-  SILOpenedArchetypesState OpenedArchetypes;
-
-  /// Maps opened archetypes to their definitions. If provided,
-  /// can be used by the builder. It is supposed to be used
-  /// only by SILGen or SIL deserializers.
-  SILOpenedArchetypesTracker *OpenedArchetypesTracker = nullptr;
-
 public:
   explicit SILBuilderContext(
       SILModule &M, SmallVectorImpl<SILInstruction *> *InsertedInstrs = 0)
@@ -79,15 +69,6 @@ public:
   // (e.g. AddressLowering).
   void setSILConventions(SILModuleConventions silConv) {
     this->silConv = silConv;
-  }
-
-  void setOpenedArchetypesTracker(SILOpenedArchetypesTracker *Tracker) {
-    OpenedArchetypesTracker = Tracker;
-    OpenedArchetypes.setOpenedArchetypesTracker(OpenedArchetypesTracker);
-  }
-
-  SILOpenedArchetypesTracker *getOpenedArchetypesTracker() const {
-    return OpenedArchetypesTracker;
   }
 
 protected:
@@ -139,6 +120,13 @@ public:
                       SmallVectorImpl<SILInstruction *> *InsertedInstrs = 0)
       : TempContext(I->getFunction()->getModule(), InsertedInstrs),
         C(TempContext), F(I->getFunction()) {
+    setInsertionPoint(I);
+  }
+
+  // Used by libswift bridging.
+  explicit SILBuilder(SILInstruction *I, const SILDebugScope *debugScope)
+      : TempContext(I->getFunction()->getModule()),
+        C(TempContext), F(I->getFunction()), CurDebugScope(debugScope) {
     setInsertionPoint(I);
   }
 
@@ -221,16 +209,6 @@ public:
     return getModule().Types.getTypeLowering(T, expansion);
   }
 
-  void setOpenedArchetypesTracker(SILOpenedArchetypesTracker *Tracker) {
-    C.setOpenedArchetypesTracker(Tracker);
-  }
-
-  SILOpenedArchetypesTracker *getOpenedArchetypesTracker() const {
-    return C.getOpenedArchetypesTracker();
-  }
-
-  SILOpenedArchetypesState &getOpenedArchetypes() { return C.OpenedArchetypes; }
-
   void setCurrentDebugScope(const SILDebugScope *DS) { CurDebugScope = DS; }
   const SILDebugScope *getCurrentDebugScope() const { return CurDebugScope; }
 
@@ -293,8 +271,6 @@ public:
     this->InsertPt = InsertPt;
     if (InsertPt == BB->end())
       return;
-    // Set the opened archetype context from the instruction.
-    addOpenedArchetypeOperands(&*InsertPt);
   }
 
   /// setInsertionPoint - Set the insertion point to insert before the specified
@@ -336,11 +312,6 @@ public:
   SmallVectorImpl<SILInstruction *> *getTrackingList() {
     return C.InsertedInstrs;
   }
-
-  //===--------------------------------------------------------------------===//
-  // Opened archetypes handling
-  //===--------------------------------------------------------------------===//
-  void addOpenedArchetypeOperands(SILInstruction *I);
 
   //===--------------------------------------------------------------------===//
   // Type remapping
@@ -399,7 +370,7 @@ public:
     assert((!dyn_cast_or_null<VarDecl>(Loc.getAsASTNode<Decl>()) || Var) &&
            "location is a VarDecl, but SILDebugVariable is empty");
     return insert(AllocStackInst::create(getSILDebugLocation(Loc), elementType,
-                                         getFunction(), C.OpenedArchetypes,
+                                         getFunction(),
                                          Var, hasDynamicLifetime));
   }
 
@@ -412,8 +383,7 @@ public:
     assert(!Loc.isInPrologue());
     return insert(AllocRefInst::create(getSILDebugLocation(Loc), getFunction(),
                                        ObjectType, objc, canAllocOnStack,
-                                       ElementTypes, ElementCountOperands,
-                                       C.OpenedArchetypes));
+                                       ElementTypes, ElementCountOperands));
   }
 
   AllocRefDynamicInst *createAllocRefDynamic(SILLocation Loc, SILValue operand,
@@ -425,13 +395,13 @@ public:
     assert(!Loc.isInPrologue());
     return insert(AllocRefDynamicInst::create(
         getSILDebugLocation(Loc), *F, operand, type, objc, ElementTypes,
-        ElementCountOperands, C.OpenedArchetypes));
+        ElementCountOperands));
   }
 
   AllocValueBufferInst *
   createAllocValueBuffer(SILLocation Loc, SILType valueType, SILValue operand) {
     return insert(AllocValueBufferInst::create(
-        getSILDebugLocation(Loc), valueType, operand, *F, C.OpenedArchetypes));
+        getSILDebugLocation(Loc), valueType, operand, *F));
   }
 
   AllocBoxInst *createAllocBox(SILLocation Loc, CanSILBoxType BoxType,
@@ -441,8 +411,7 @@ public:
     assert((!dyn_cast_or_null<VarDecl>(Loc.getAsASTNode<Decl>()) || Var) &&
            "location is a VarDecl, but SILDebugVariable is empty");
     return insert(AllocBoxInst::create(getSILDebugLocation(Loc), BoxType, *F,
-                                       C.OpenedArchetypes, Var,
-                                       hasDynamicLifetime));
+                                       Var, hasDynamicLifetime));
   }
 
   AllocExistentialBoxInst *
@@ -450,8 +419,7 @@ public:
                             CanType ConcreteType,
                             ArrayRef<ProtocolConformanceRef> Conformances) {
     return insert(AllocExistentialBoxInst::create(
-        getSILDebugLocation(Loc), ExistentialType, ConcreteType, Conformances,
-        F, C.OpenedArchetypes));
+      getSILDebugLocation(Loc), ExistentialType, ConcreteType, Conformances, F));
   }
 
   ApplyInst *createApply(
@@ -469,7 +437,7 @@ public:
       const GenericSpecializationInformation *SpecializationInfo = nullptr) {
     return insert(ApplyInst::create(getSILDebugLocation(Loc), Fn, Subs, Args,
                                     options, C.silConv, *F,
-                                    C.OpenedArchetypes, SpecializationInfo));
+                                    SpecializationInfo));
   }
 
   TryApplyInst *createTryApply(
@@ -479,7 +447,7 @@ public:
       const GenericSpecializationInformation *SpecializationInfo = nullptr) {
     return insertTerminator(TryApplyInst::create(
         getSILDebugLocation(Loc), fn, subs, args, normalBB, errorBB,
-        options, *F, C.OpenedArchetypes, SpecializationInfo));
+        options, *F, SpecializationInfo));
   }
 
   PartialApplyInst *createPartialApply(
@@ -490,7 +458,7 @@ public:
       const GenericSpecializationInformation *SpecializationInfo = nullptr) {
     return insert(PartialApplyInst::create(
         getSILDebugLocation(Loc), Fn, Args, Subs, CalleeConvention, *F,
-        C.OpenedArchetypes, SpecializationInfo, OnStack));
+        SpecializationInfo, OnStack));
   }
 
   BeginApplyInst *createBeginApply(
@@ -499,7 +467,7 @@ public:
       const GenericSpecializationInformation *SpecializationInfo = nullptr) {
     return insert(BeginApplyInst::create(
         getSILDebugLocation(Loc), Fn, Subs, Args, options, C.silConv, *F,
-        C.OpenedArchetypes, SpecializationInfo));
+        SpecializationInfo));
   }
 
   AbortApplyInst *createAbortApply(SILLocation loc, SILValue beginApply) {
@@ -956,7 +924,8 @@ public:
   }
 
   DebugValueInst *createDebugValue(SILLocation Loc, SILValue src,
-                                   SILDebugVariable Var);
+                                   SILDebugVariable Var,
+                                   bool poisonRefs = false);
   DebugValueAddrInst *createDebugValueAddr(SILLocation Loc, SILValue src,
                                            SILDebugVariable Var);
 
@@ -1039,8 +1008,7 @@ public:
   BindMemoryInst *createBindMemory(SILLocation Loc, SILValue base,
                                    SILValue index, SILType boundType) {
     return insert(BindMemoryInst::create(getSILDebugLocation(Loc), base, index,
-                                         boundType, getFunction(),
-                                         C.OpenedArchetypes));
+                                         boundType, getFunction()));
   }
 
   ConvertFunctionInst *createConvertFunction(SILLocation Loc, SILValue Op,
@@ -1055,7 +1023,7 @@ public:
                         bool WithoutActuallyEscaping,
                         ValueOwnershipKind forwardingOwnershipKind) {
     return insert(ConvertFunctionInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getModule(), F, C.OpenedArchetypes,
+        getSILDebugLocation(Loc), Op, Ty, getModule(), F,
         WithoutActuallyEscaping, forwardingOwnershipKind));
   }
 
@@ -1063,7 +1031,7 @@ public:
   createConvertEscapeToNoEscape(SILLocation Loc, SILValue Op, SILType Ty,
                                 bool lifetimeGuaranteed) {
     return insert(ConvertEscapeToNoEscapeInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes,
+        getSILDebugLocation(Loc), Op, Ty, getFunction(),
         lifetimeGuaranteed));
   }
 
@@ -1076,7 +1044,7 @@ public:
   PointerToThinFunctionInst *
   createPointerToThinFunction(SILLocation Loc, SILValue Op, SILType Ty) {
     return insert(PointerToThinFunctionInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
+        getSILDebugLocation(Loc), Op, Ty, getFunction()));
   }
 
   UpcastInst *createUpcast(SILLocation Loc, SILValue Op, SILType Ty) {
@@ -1086,8 +1054,7 @@ public:
   UpcastInst *createUpcast(SILLocation Loc, SILValue Op, SILType Ty,
                            ValueOwnershipKind forwardingOwnershipKind) {
     return insert(UpcastInst::create(getSILDebugLocation(Loc), Op, Ty,
-                                     getFunction(), C.OpenedArchetypes,
-                                     forwardingOwnershipKind));
+                                     getFunction(), forwardingOwnershipKind));
   }
 
   AddressToPointerInst *createAddressToPointer(SILLocation Loc, SILValue Op,
@@ -1107,15 +1074,14 @@ public:
   UncheckedRefCastInst *createUncheckedRefCast(SILLocation Loc, SILValue Op,
                                                SILType Ty) {
     return insert(UncheckedRefCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes,
-        Op.getOwnershipKind()));
+        getSILDebugLocation(Loc), Op, Ty, getFunction(), Op.getOwnershipKind()));
   }
 
   UncheckedRefCastInst *
   createUncheckedRefCast(SILLocation Loc, SILValue Op, SILType Ty,
                          ValueOwnershipKind forwardingOwnershipKind) {
     return insert(UncheckedRefCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes,
+        getSILDebugLocation(Loc), Op, Ty, getFunction(),
         forwardingOwnershipKind));
   }
 
@@ -1125,25 +1091,25 @@ public:
                              SILValue dest, CanType targetFormalType) {
     return insert(UncheckedRefCastAddrInst::create(
         getSILDebugLocation(Loc), src, sourceFormalType,
-        dest, targetFormalType, getFunction(), C.OpenedArchetypes));
+        dest, targetFormalType, getFunction()));
   }
 
   UncheckedAddrCastInst *createUncheckedAddrCast(SILLocation Loc, SILValue Op,
                                                  SILType Ty) {
     return insert(UncheckedAddrCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
+        getSILDebugLocation(Loc), Op, Ty, getFunction()));
   }
 
   UncheckedTrivialBitCastInst *
   createUncheckedTrivialBitCast(SILLocation Loc, SILValue Op, SILType Ty) {
     return insert(UncheckedTrivialBitCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
+        getSILDebugLocation(Loc), Op, Ty, getFunction()));
   }
 
   UncheckedBitwiseCastInst *
   createUncheckedBitwiseCast(SILLocation Loc, SILValue Op, SILType Ty) {
     return insert(UncheckedBitwiseCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
+        getSILDebugLocation(Loc), Op, Ty, getFunction()));
   }
 
   UncheckedValueCastInst *createUncheckedValueCast(SILLocation Loc, SILValue Op,
@@ -1156,7 +1122,7 @@ public:
                            ValueOwnershipKind forwardingOwnershipKind) {
     assert(hasOwnership());
     return insert(UncheckedValueCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes,
+        getSILDebugLocation(Loc), Op, Ty, getFunction(),
         forwardingOwnershipKind));
   }
 
@@ -1225,7 +1191,7 @@ public:
   createThinToThickFunction(SILLocation Loc, SILValue Op, SILType Ty,
                             ValueOwnershipKind forwardingOwnershipKind) {
     return insert(ThinToThickFunctionInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getModule(), F, C.OpenedArchetypes,
+        getSILDebugLocation(Loc), Op, Ty, getModule(), F,
         forwardingOwnershipKind));
   }
 
@@ -1279,7 +1245,7 @@ public:
                                  ValueOwnershipKind forwardingOwnershipKind) {
     return insert(UnconditionalCheckedCastInst::create(
         getSILDebugLocation(Loc), op, destLoweredTy, destFormalTy,
-        getFunction(), C.OpenedArchetypes, forwardingOwnershipKind));
+        getFunction(), forwardingOwnershipKind));
   }
 
   UnconditionalCheckedCastAddrInst *
@@ -1288,7 +1254,7 @@ public:
                                      SILValue dest, CanType targetFormalType) {
     return insert(UnconditionalCheckedCastAddrInst::create(
         getSILDebugLocation(Loc), src, sourceFormalType,
-        dest, targetFormalType, getFunction(), C.OpenedArchetypes));
+        dest, targetFormalType, getFunction()));
   }
 
   UnconditionalCheckedCastValueInst *
@@ -1298,8 +1264,7 @@ public:
                                       CanType destFormalTy) {
     return insert(UnconditionalCheckedCastValueInst::create(
         getSILDebugLocation(Loc), op, srcFormalTy,
-        destLoweredTy, destFormalTy,
-        getFunction(), C.OpenedArchetypes));
+        destLoweredTy, destFormalTy, getFunction()));
   }
 
   RetainValueInst *createRetainValue(SILLocation Loc, SILValue operand,
@@ -1728,8 +1693,7 @@ public:
   ObjCMethodInst *createObjCMethod(SILLocation Loc, SILValue Operand,
                                    SILDeclRef Member, SILType MethodTy) {
     return insert(ObjCMethodInst::create(getSILDebugLocation(Loc), Operand,
-                                         Member, MethodTy, &getFunction(),
-                                         C.OpenedArchetypes));
+                                         Member, MethodTy, &getFunction()));
   }
 
   ObjCSuperMethodInst *createObjCSuperMethod(SILLocation Loc, SILValue Operand,
@@ -1743,17 +1707,14 @@ public:
                                          SILDeclRef Member, SILType MethodTy) {
     return insert(WitnessMethodInst::create(
         getSILDebugLocation(Loc), LookupTy, Conformance, Member, MethodTy,
-        &getFunction(), C.OpenedArchetypes));
+        &getFunction()));
   }
 
   OpenExistentialAddrInst *
   createOpenExistentialAddr(SILLocation Loc, SILValue Operand, SILType SelfTy,
                             OpenedExistentialAccess ForAccess) {
-    auto *I = insert(new (getModule()) OpenExistentialAddrInst(
+    return insert(new (getModule()) OpenExistentialAddrInst(
         getSILDebugLocation(Loc), Operand, SelfTy, ForAccess));
-    if (C.OpenedArchetypesTracker)
-      C.OpenedArchetypesTracker->registerOpenedArchetypes(I);
-    return I;
   }
 
   OpenExistentialValueInst *createOpenExistentialValue(SILLocation Loc,
@@ -1766,21 +1727,15 @@ public:
   OpenExistentialValueInst *
   createOpenExistentialValue(SILLocation Loc, SILValue Operand, SILType SelfTy,
                              ValueOwnershipKind forwardingOwnershipKind) {
-    auto *I = insert(new (getModule()) OpenExistentialValueInst(
+    return insert(new (getModule()) OpenExistentialValueInst(
         getSILDebugLocation(Loc), Operand, SelfTy, forwardingOwnershipKind));
-    if (C.OpenedArchetypesTracker)
-      C.OpenedArchetypesTracker->registerOpenedArchetypes(I);
-    return I;
   }
 
   OpenExistentialMetatypeInst *createOpenExistentialMetatype(SILLocation Loc,
                                                              SILValue operand,
                                                              SILType selfTy) {
-    auto *I = insert(new (getModule()) OpenExistentialMetatypeInst(
+    return insert(new (getModule()) OpenExistentialMetatypeInst(
         getSILDebugLocation(Loc), operand, selfTy));
-    if (C.OpenedArchetypesTracker)
-      C.OpenedArchetypesTracker->registerOpenedArchetypes(I);
-    return I;
   }
 
   OpenExistentialRefInst *
@@ -1792,20 +1747,14 @@ public:
   OpenExistentialRefInst *
   createOpenExistentialRef(SILLocation Loc, SILValue Operand, SILType Ty,
                            ValueOwnershipKind forwardingOwnershipKind) {
-    auto *I = insert(new (getModule()) OpenExistentialRefInst(
+    return insert(new (getModule()) OpenExistentialRefInst(
         getSILDebugLocation(Loc), Operand, Ty, forwardingOwnershipKind));
-    if (C.OpenedArchetypesTracker)
-      C.OpenedArchetypesTracker->registerOpenedArchetypes(I);
-    return I;
   }
 
   OpenExistentialBoxInst *
   createOpenExistentialBox(SILLocation Loc, SILValue Operand, SILType Ty) {
-    auto *I = insert(new (getModule()) OpenExistentialBoxInst(
+    return insert(new (getModule()) OpenExistentialBoxInst(
         getSILDebugLocation(Loc), Operand, Ty));
-    if (C.OpenedArchetypesTracker)
-      C.OpenedArchetypesTracker->registerOpenedArchetypes(I);
-    return I;
   }
 
   OpenExistentialBoxValueInst *
@@ -1817,11 +1766,8 @@ public:
   OpenExistentialBoxValueInst *
   createOpenExistentialBoxValue(SILLocation Loc, SILValue Operand, SILType Ty,
                                 ValueOwnershipKind forwardingOwnershipKind) {
-    auto *I = insert(new (getModule()) OpenExistentialBoxValueInst(
+    return insert(new (getModule()) OpenExistentialBoxValueInst(
         getSILDebugLocation(Loc), Operand, Ty, forwardingOwnershipKind));
-    if (C.OpenedArchetypesTracker)
-      C.OpenedArchetypesTracker->registerOpenedArchetypes(I);
-    return I;
   }
 
   InitExistentialAddrInst *
@@ -1831,7 +1777,7 @@ public:
                             ArrayRef<ProtocolConformanceRef> Conformances) {
     return insert(InitExistentialAddrInst::create(
         getSILDebugLocation(Loc), Existential, FormalConcreteType,
-        LoweredConcreteType, Conformances, &getFunction(), C.OpenedArchetypes));
+        LoweredConcreteType, Conformances, &getFunction()));
   }
 
   InitExistentialValueInst *
@@ -1840,7 +1786,7 @@ public:
                               ArrayRef<ProtocolConformanceRef> Conformances) {
     return insert(InitExistentialValueInst::create(
         getSILDebugLocation(Loc), ExistentialType, FormalConcreteType, Concrete,
-        Conformances, &getFunction(), C.OpenedArchetypes));
+        Conformances, &getFunction()));
   }
 
   InitExistentialMetatypeInst *
@@ -1849,7 +1795,7 @@ public:
                                 ArrayRef<ProtocolConformanceRef> conformances) {
     return insert(InitExistentialMetatypeInst::create(
         getSILDebugLocation(Loc), existentialType, metatype, conformances,
-        &getFunction(), C.OpenedArchetypes));
+        &getFunction()));
   }
 
   InitExistentialRefInst *
@@ -1868,8 +1814,7 @@ public:
                            ValueOwnershipKind forwardingOwnershipKind) {
     return insert(InitExistentialRefInst::create(
         getSILDebugLocation(Loc), ExistentialType, FormalConcreteType, Concrete,
-        Conformances, &getFunction(), C.OpenedArchetypes,
-        forwardingOwnershipKind));
+        Conformances, &getFunction(), forwardingOwnershipKind));
   }
 
   DeinitExistentialAddrInst *createDeinitExistentialAddr(SILLocation Loc,
@@ -1908,7 +1853,7 @@ public:
 
   MetatypeInst *createMetatype(SILLocation Loc, SILType Metatype) {
     return insert(MetatypeInst::create(getSILDebugLocation(Loc), Metatype,
-                                       &getFunction(), C.OpenedArchetypes));
+                                       &getFunction()));
   }
 
   ObjCMetatypeToObjectInst *
@@ -2162,9 +2107,18 @@ public:
                                                                  Throws));
   }
 
-  HopToExecutorInst *createHopToExecutor(SILLocation Loc, SILValue Actor) {
+  HopToExecutorInst *createHopToExecutor(SILLocation Loc, SILValue Actor,
+                                         bool mandatory) {
     return insert(new (getModule()) HopToExecutorInst(getSILDebugLocation(Loc),
-                                                      Actor, hasOwnership()));
+                                                      Actor, hasOwnership(),
+                                                      mandatory));
+  }
+
+  ExtractExecutorInst *createExtractExecutor(SILLocation Loc, SILValue Actor) {
+    auto resultType = SILType::getPrimitiveObjectType(getASTContext().TheExecutorType);
+    return insert(new (getModule()) ExtractExecutorInst(getSILDebugLocation(Loc),
+                                                        Actor, hasOwnership(),
+                                                        resultType));
   }
 
   //===--------------------------------------------------------------------===//
@@ -2336,8 +2290,7 @@ public:
                                SILBasicBlock *failureBB) {
     return insertTerminator(CheckedCastValueBranchInst::create(
         getSILDebugLocation(Loc), op, srcFormalTy,
-        destLoweredTy, destFormalTy,
-        successBB, failureBB, getFunction(), C.OpenedArchetypes));
+        destLoweredTy, destFormalTy, successBB, failureBB, getFunction()));
   }
 
   CheckedCastAddrBranchInst *
@@ -2351,7 +2304,7 @@ public:
     return insertTerminator(CheckedCastAddrBranchInst::create(
         getSILDebugLocation(Loc), consumption, src, sourceFormalType, dest,
         targetFormalType, successBB, failureBB, Target1Count, Target2Count,
-        getFunction(), C.OpenedArchetypes));
+        getFunction()));
   }
 
   //===--------------------------------------------------------------------===//
@@ -2674,10 +2627,15 @@ private:
   void insertImpl(SILInstruction *TheInst) {
     assert(hasValidInsertionPoint());
     BB->insert(InsertPt, TheInst);
-
+    getModule().notifyAddedInstruction(TheInst);
     C.notifyInserted(TheInst);
 
 #ifndef NDEBUG
+    // If we are inserting into a specific function (rather than a block for a
+    // global_addr), verify that our instruction/the associated location are in
+    // sync. We don't care if an instruction is used in global_addr.
+    if (F)
+      TheInst->verifyDebugInfo();
     TheInst->verifyOperandOwnership();
 #endif
   }

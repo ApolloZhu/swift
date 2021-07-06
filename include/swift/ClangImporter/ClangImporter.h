@@ -25,6 +25,9 @@ namespace llvm {
   class Triple;
   class FileCollectorBase;
   template<typename Fn> class function_ref;
+  namespace vfs {
+    class FileSystem;
+  }
 }
 
 namespace clang {
@@ -158,6 +161,7 @@ public:
   static std::unique_ptr<clang::CompilerInvocation>
   createClangInvocation(ClangImporter *importer,
                         const ClangImporterOptions &importerOpts,
+                        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
                         ArrayRef<std::string> invocationArgStrs,
                         std::vector<std::string> *CC1Args = nullptr);
   ClangImporter(const ClangImporter &) = delete;
@@ -186,7 +190,8 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  virtual bool canImportModule(ImportPath::Module named) override;
+  virtual bool canImportModule(ImportPath::Module named, llvm::VersionTuple version,
+                               bool underlyingVersion) override;
 
   /// Import a module with the given module path.
   ///

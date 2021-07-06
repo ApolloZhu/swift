@@ -20,6 +20,7 @@
 #include "TypeCheckDecl.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
+#include "TypeCheckDistributed.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/Expr.h"
@@ -184,7 +185,7 @@ static void maybeAddMemberwiseDefaultArg(ParamDecl *arg, VarDecl *var,
   bool isNilInitialized =
     var->getAttrs().hasAttribute<LazyAttr>() ||
     (!isExplicitlyInitialized && isDefaultInitializable &&
-     var->getValueInterfaceType()->getAnyNominal() == ctx.getOptionalDecl() &&
+     var->getValueInterfaceType()->isOptional() &&
      (var->getAttachedPropertyWrappers().empty() ||
       var->isPropertyMemberwiseInitializedWithWrappedType()));
   if (isNilInitialized) {
@@ -226,6 +227,16 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
                                                   ASTContext &ctx) {
   assert(!decl->hasClangNode());
 
+  // Don't synthesize for distributed actors, they're a bit special.
+  //
+  // They have their special inits, and should not get the usual
+  // default/implicit constructor (i.e. `init()` is illegal for them, as they
+  // always must have an associated transport - via `init(transport:)` or
+  // `init(resolve:using:)`).
+  if (auto clazz = dyn_cast<ClassDecl>(decl))
+    if (clazz->isDistributedActor())
+      return nullptr;
+
   SourceLoc Loc = decl->getLoc();
   auto accessLevel = AccessLevel::Internal;
 
@@ -265,8 +276,8 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
         if (var->isPropertyMemberwiseInitializedWithWrappedType()) {
           varInterfaceType = var->getPropertyWrapperInitValueInterfaceType();
 
-          auto wrapperInfo = var->getPropertyWrapperBackingPropertyInfo();
-          isAutoClosure = wrapperInfo.getWrappedValuePlaceholder()->isAutoClosure();
+          auto initInfo = var->getPropertyWrapperInitializerInfo();
+          isAutoClosure = initInfo.getWrappedValuePlaceholder()->isAutoClosure();
         } else {
           varInterfaceType = backingPropertyType;
         }
@@ -319,6 +330,7 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
   auto *ctor =
     new (ctx) ConstructorDecl(name, Loc,
                               /*Failable=*/false, /*FailabilityLoc=*/SourceLoc(),
+                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
                               /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
                               paramList, /*GenericParams=*/nullptr, decl);
 
@@ -417,30 +429,49 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
            /*isTypeChecked=*/true };
 }
 
-static std::tuple<GenericSignature, GenericParamList *, SubstitutionMap>
-configureGenericDesignatedInitOverride(ASTContext &ctx,
+namespace {
+  struct DesignatedInitOverrideInfo {
+    GenericSignature GenericSig;
+    GenericParamList *GenericParams;
+    SubstitutionMap OverrideSubMap;
+  };
+}
+
+static DesignatedInitOverrideInfo
+computeDesignatedInitOverrideSignature(ASTContext &ctx,
                                        ClassDecl *classDecl,
                                        Type superclassTy,
                                        ConstructorDecl *superclassCtor) {
+  auto *moduleDecl = classDecl->getParentModule();
+
   auto *superclassDecl = superclassTy->getAnyNominal();
 
-  auto *moduleDecl = classDecl->getParentModule();
-  auto subMap = superclassTy->getContextSubstitutionMap(
-      moduleDecl, superclassDecl);
-
-  GenericSignature genericSig;
-  auto *genericParams = superclassCtor->getGenericParams();
-
+  auto classSig = classDecl->getGenericSignature();
   auto superclassCtorSig = superclassCtor->getGenericSignature();
   auto superclassSig = superclassDecl->getGenericSignature();
 
+  // These are our outputs.
+  GenericSignature genericSig = classSig;
+  auto *genericParams = superclassCtor->getGenericParams();
+  auto subMap = superclassTy->getContextSubstitutionMap(
+      moduleDecl, superclassDecl);
+
   if (superclassCtorSig.getPointer() != superclassSig.getPointer()) {
+    // If the base initiliazer's generic signature is different
+    // from that of the base class, the base class initializer either
+    // has generic parameters or a 'where' clause.
+    //
+    // We need to "rebase" the requirements on top of the derived class's
+    // generic signature.
+
     SmallVector<GenericTypeParamDecl *, 4> newParams;
     SmallVector<GenericTypeParamType *, 1> newParamTypes;
 
-    // Inheriting initializers that have their own generic parameters
+    // If genericParams is non-null, the base class initializer has its own
+    // generic parameters. Otherwise, it is non-generic with a contextual
+    // 'where' clause.
     if (genericParams) {
-      // First, clone the superclass constructor's generic parameter list,
+      // First, clone the base class initializer's generic parameter list,
       // but change the depth of the generic parameters to be one greater
       // than the depth of the subclass.
       unsigned depth = 0;
@@ -456,8 +487,8 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
         newParams.push_back(newParam);
       }
 
-      // We don't have to clone the requirements, because they're not
-      // used for anything.
+      // We don't have to clone the RequirementReprs, because they're not
+      // used for anything other than SIL mode.
       genericParams = GenericParamList::create(ctx,
                                                SourceLoc(),
                                                newParams,
@@ -472,7 +503,7 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
       }
     }
 
-    // Build a generic signature for the derived class initializer.
+    // The depth at which the initializer's own generic parameters start, if any.
     unsigned superclassDepth = 0;
     if (superclassSig)
       superclassDepth = superclassSig->getGenericParams().back()->getDepth() + 1;
@@ -481,44 +512,52 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
     // initializer to form the requirements of the derived class initializer.
     auto substFn = [&](SubstitutableType *type) -> Type {
       auto *gp = cast<GenericTypeParamType>(type);
+      // Generic parameters of the base class itself are mapped via the
+      // substitution map of the superclass type.
       if (gp->getDepth() < superclassDepth)
         return Type(gp).subst(subMap);
+
+      // Generic parameters added by the base class initializer map to the new
+      // generic parameters of the derived initializer.
       return genericParams->getParams()[gp->getIndex()]
                  ->getDeclaredInterfaceType();
     };
 
-    auto lookupConformanceFn =
-        [&](CanType depTy, Type substTy,
-            ProtocolDecl *proto) -> ProtocolConformanceRef {
-      if (auto conf = subMap.lookupConformance(depTy, proto))
-        return conf;
+    // If we don't have any new generic parameters and the derived class is
+    // not generic, the base class initializer's 'where' clause should already
+    // be fully satisfied, and we can just drop it.
+    if (genericParams != nullptr || classSig) {
+      auto lookupConformanceFn =
+          [&](CanType depTy, Type substTy,
+              ProtocolDecl *proto) -> ProtocolConformanceRef {
+        if (auto conf = subMap.lookupConformance(depTy, proto))
+          return conf;
 
-      return ProtocolConformanceRef(proto);
-    };
+        return ProtocolConformanceRef(proto);
+      };
 
-    SmallVector<Requirement, 2> requirements;
-    for (auto reqt : superclassCtorSig->getRequirements())
-      if (auto substReqt = reqt.subst(substFn, lookupConformanceFn))
-        requirements.push_back(*substReqt);
+      SmallVector<Requirement, 2> requirements;
+      for (auto reqt : superclassCtorSig->getRequirements())
+        if (auto substReqt = reqt.subst(substFn, lookupConformanceFn))
+          requirements.push_back(*substReqt);
 
-    // Now form the substitution map that will be used to remap parameter
-    // types.
-    subMap = SubstitutionMap::get(superclassCtorSig,
-                                  substFn, lookupConformanceFn);
+      // Now form the substitution map that will be used to remap parameter
+      // types.
+      subMap = SubstitutionMap::get(superclassCtorSig,
+                                    substFn, lookupConformanceFn);
 
-    genericSig = evaluateOrDefault(
-        ctx.evaluator,
-        AbstractGenericSignatureRequest{
-          classDecl->getGenericSignature().getPointer(),
-          std::move(newParamTypes),
-          std::move(requirements)
-        },
-        GenericSignature());
-  } else {
-    genericSig = classDecl->getGenericSignature();
+      genericSig = evaluateOrDefault(
+          ctx.evaluator,
+          AbstractGenericSignatureRequest{
+            classSig.getPointer(),
+            std::move(newParamTypes),
+            std::move(requirements)
+          },
+          GenericSignature());
+    }
   }
 
-  return std::make_tuple(genericSig, genericParams, subMap);
+  return DesignatedInitOverrideInfo{genericSig, genericParams, subMap};
 }
 
 static void
@@ -566,17 +605,15 @@ configureInheritedDesignatedInitAttributes(ClassDecl *classDecl,
   // If the superclass has its own availability, make sure the synthesized
   // constructor is only as available as its superclass's constructor.
   if (superclassCtor->getAttrs().hasAttribute<AvailableAttr>()) {
-    SmallVector<Decl *, 2> asAvailableAs;
+    SmallVector<const Decl *, 2> asAvailableAs;
 
     // We don't have to look at enclosing contexts of the superclass constructor,
     // because designated initializers must always be defined in the superclass
     // body, and we already enforce that a superclass is at least as available as
     // a subclass.
     asAvailableAs.push_back(superclassCtor);
-    Decl *parentDecl = classDecl;
-    while (parentDecl != nullptr) {
+    if (auto *parentDecl = classDecl->getInnermostDeclWithAvailability()) {
       asAvailableAs.push_back(parentDecl);
-      parentDecl = parentDecl->getDeclContext()->getAsDecl();
     }
     AvailabilityInference::applyInferredAvailableAttrs(
         ctor, asAvailableAs, ctx);
@@ -627,7 +664,6 @@ synthesizeDesignatedInitOverride(AbstractFunctionDecl *fn, void *context) {
     type = funcTy->getResult();
   auto *superclassCtorRefExpr =
       new (ctx) DotSyntaxCallExpr(ctorRefExpr, SourceLoc(), superRef, type);
-  superclassCtorRefExpr->setIsSuper(true);
   superclassCtorRefExpr->setThrows(false);
 
   auto *bodyParams = ctor->getParameters();
@@ -704,17 +740,32 @@ createDesignatedInitOverride(ClassDecl *classDecl,
     return nullptr;
   }
 
-  GenericSignature genericSig;
-  GenericParamList *genericParams;
-  SubstitutionMap subMap;
-
-  std::tie(genericSig, genericParams, subMap) =
-      configureGenericDesignatedInitOverride(ctx,
+  auto overrideInfo =
+      computeDesignatedInitOverrideSignature(ctx,
                                              classDecl,
                                              superclassTy,
                                              superclassCtor);
 
-  // Determine the initializer parameters.
+  if (auto superclassCtorSig = superclassCtor->getGenericSignature()) {
+    auto *genericEnv = (overrideInfo.GenericSig
+                        ? overrideInfo.GenericSig->getGenericEnvironment()
+                        : nullptr);
+
+    // If the base class initializer has a 'where' clause, it might impose
+    // requirements on the base class's own generic parameters that are not
+    // satisfied by the derived class. In this case, we don't want to inherit
+    // this initializer; there's no way to call it on the derived class.
+    auto checkResult = TypeChecker::checkGenericArguments(
+        classDecl->getParentModule(),
+        superclassCtorSig->getRequirements(),
+        [&](Type type) -> Type {
+          auto substType = type.subst(overrideInfo.OverrideSubMap);
+          return GenericEnvironment::mapTypeIntoContext(
+            genericEnv, substType);
+        });
+    if (checkResult != RequirementCheckResult::Success)
+      return nullptr;
+  }
 
   // Create the initializer parameter patterns.
   OptionSet<ParameterList::CloneFlags> options
@@ -734,7 +785,7 @@ createDesignatedInitOverride(ClassDecl *classDecl,
     auto *bodyParam = bodyParams->get(idx);
 
     auto paramTy = superclassParam->getInterfaceType();
-    auto substTy = paramTy.subst(subMap);
+    auto substTy = paramTy.subst(overrideInfo.OverrideSubMap);
 
     bodyParam->setInterfaceType(substTy);
   }
@@ -746,14 +797,16 @@ createDesignatedInitOverride(ClassDecl *classDecl,
                               classDecl->getBraces().Start,
                               superclassCtor->isFailable(),
                               /*FailabilityLoc=*/SourceLoc(),
+                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
                               /*Throws=*/superclassCtor->hasThrows(),
                               /*ThrowsLoc=*/SourceLoc(),
-                              bodyParams, genericParams, classDecl);
+                              bodyParams, overrideInfo.GenericParams,
+                              classDecl);
 
   ctor->setImplicit();
 
   // Set the interface type of the initializer.
-  ctor->setGenericSignature(genericSig);
+  ctor->setGenericSignature(overrideInfo.GenericSig);
 
   ctor->setImplicitlyUnwrappedOptional(
     superclassCtor->isImplicitlyUnwrappedOptional());
@@ -1143,14 +1196,16 @@ void TypeChecker::addImplicitConstructors(NominalTypeDecl *decl) {
   // If we already added implicit initializers, we're done.
   if (decl->addedImplicitInitializers())
     return;
-  
+
   if (!shouldAttemptInitializerSynthesis(decl)) {
     decl->setAddedImplicitInitializers();
     return;
   }
 
-  if (auto *classDecl = dyn_cast<ClassDecl>(decl))
+  if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
     addImplicitInheritedConstructorsToClass(classDecl);
+    addImplicitDistributedActorMembersToClass(classDecl);
+  }
 
   // Force the memberwise and default initializers if the type has them.
   // FIXME: We need to be more lazy about synthesizing constructors.
@@ -1230,6 +1285,18 @@ ResolveImplicitMemberRequest::evaluate(Evaluator &evaluator,
     TypeChecker::addImplicitConstructors(target);
     auto *decodableProto = Context.getProtocol(KnownProtocolKind::Decodable);
     (void)evaluateTargetConformanceTo(decodableProto);
+  }
+    break;
+  case ImplicitMemberAction::ResolveDistributedActor:
+  case ImplicitMemberAction::ResolveDistributedActorAddress: {
+    // init(transport:) and init(resolve:using:) may be synthesized as part of
+    // derived conformance to the DistributedActor protocol.
+    // If the target should conform to the DistributedActor protocol, check the
+    // conformance here to attempt synthesis.
+    TypeChecker::addImplicitConstructors(target);
+    auto *distributedActorProto =
+        Context.getProtocol(KnownProtocolKind::DistributedActor);
+    (void)evaluateTargetConformanceTo(distributedActorProto);
   }
     break;
   }
@@ -1312,10 +1379,6 @@ ResolveEffectiveMemberwiseInitRequest::evaluate(Evaluator &evaluator,
         continue;
       storedProperties.push_back(vd);
     }
-    // Return false if initializer does not have interface type set. It is not
-    // possible to determine whether it is a memberwise initializer.
-    if (!initDecl->hasInterfaceType())
-      return false;
     auto initDeclType =
         initDecl->getMethodInterfaceType()->getAs<AnyFunctionType>();
     // Return false if initializer does not have a valid interface type.
@@ -1389,6 +1452,24 @@ HasDefaultInitRequest::evaluate(Evaluator &evaluator,
   return areAllStoredPropertiesDefaultInitializable(evaluator, decl);
 }
 
+bool
+HasDistributedActorLocalInitRequest::evaluate(Evaluator &evaluator,
+                                                     NominalTypeDecl *nominal) const {
+  if (auto *decl = dyn_cast<ClassDecl>(nominal)) {
+    if (!decl->isDistributedActor())
+      return false;
+
+    for (auto *member : decl->getMembers())
+      if (auto ctor = dyn_cast<ConstructorDecl>(member))
+        if (ctor->isDistributedActorLocalInit())
+          return true;
+  }
+
+  // areAllStoredPropertiesDefaultInitializable(evaluator, decl);
+
+  return false;
+}
+
 /// Synthesizer callback for a function body consisting of "return".
 static std::pair<BraceStmt *, bool>
 synthesizeSingleReturnFunctionBody(AbstractFunctionDecl *afd, void *) {
@@ -1410,16 +1491,20 @@ SynthesizeDefaultInitRequest::evaluate(Evaluator &evaluator,
                                   decl);
 
   // Create the default constructor.
-  auto ctor = createImplicitConstructor(decl,
+  if (auto ctor = createImplicitConstructor(decl,
                                         ImplicitConstructorKind::Default,
-                                        ctx);
+                                        ctx)) {
 
-  // Add the constructor.
-  decl->addMember(ctor);
+    // Add the constructor.
+    decl->addMember(ctor);
 
-  // Lazily synthesize an empty body for the default constructor.
-  ctor->setBodySynthesizer(synthesizeSingleReturnFunctionBody);
-  return ctor;
+    // Lazily synthesize an empty body for the default constructor.
+    ctor->setBodySynthesizer(synthesizeSingleReturnFunctionBody);
+    return ctor;
+  }
+
+  // no default init was synthesized
+  return nullptr;
 }
 
 ValueDecl *swift::getProtocolRequirement(ProtocolDecl *protocol,

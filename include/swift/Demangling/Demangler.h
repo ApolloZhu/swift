@@ -494,7 +494,7 @@ protected:
   NodePointer pushMultiSubstitutions(int RepeatCount, size_t SubstIdx);
   NodePointer createSwiftType(Node::Kind typeKind, const char *name);
   NodePointer demangleStandardSubstitution();
-  NodePointer createStandardSubstitution(char Subst);
+  NodePointer createStandardSubstitution(char Subst, bool SecondLevel);
   NodePointer demangleLocalIdentifier();
 
   NodePointer popModule();
@@ -569,12 +569,15 @@ protected:
 
   NodePointer demangleTypeMangling();
   NodePointer demangleSymbolicReference(unsigned char rawKind);
+  NodePointer demangleTypeAnnotation();
+
   NodePointer demangleAutoDiffFunctionOrSimpleThunk(Node::Kind nodeKind);
   NodePointer demangleAutoDiffFunctionKind();
   NodePointer demangleAutoDiffSubsetParametersThunk();
   NodePointer demangleAutoDiffSelfReorderingReabstractionThunk();
   NodePointer demangleDifferentiabilityWitness();
   NodePointer demangleIndexSubset();
+  NodePointer demangleDifferentiableFunctionType();
 
   bool demangleBoundGenerics(Vector<NodePointer> &TypeListList,
                              NodePointer &RetroactiveConformances);

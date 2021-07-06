@@ -44,7 +44,7 @@ class DefaultArgumentExpr;
 class ClosureExpr;
 class GenericParamList;
 class PrecedenceGroupDecl;
-struct PropertyWrapperBackingPropertyInfo;
+class PropertyWrapperInitializerInfo;
 struct PropertyWrapperLValueness;
 struct PropertyWrapperMutability;
 class RequirementRepr;
@@ -606,7 +606,7 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Request the nominal type declaration to which the given custom attribute
@@ -627,7 +627,7 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Request the raw (possibly unbound generic) type of the property wrapper
@@ -648,7 +648,7 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Request the nominal type declaration to which the given custom attribute
@@ -669,7 +669,7 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Request information about the mutability of composed property wrappers.
@@ -689,7 +689,7 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Request information about the l-valueness of composed property wrappers.
@@ -709,14 +709,13 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
-/// Request information about the backing property for properties that have
-/// attached property wrappers.
-class PropertyWrapperBackingPropertyInfoRequest :
-    public SimpleRequest<PropertyWrapperBackingPropertyInfoRequest,
-                         PropertyWrapperBackingPropertyInfo(VarDecl *),
+/// Request the synthesized auxiliary declarations for a wrapped property.
+class PropertyWrapperAuxiliaryVariablesRequest :
+    public SimpleRequest<PropertyWrapperAuxiliaryVariablesRequest,
+                         PropertyWrapperAuxiliaryVariables(VarDecl *),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -725,19 +724,19 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  PropertyWrapperBackingPropertyInfo
+  PropertyWrapperAuxiliaryVariables
   evaluate(Evaluator &evaluator, VarDecl *var) const;
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
-/// Request the synthesized local wrapped value var for a parameter
-/// that has an attached property wrapper.
-class PropertyWrapperWrappedValueVarRequest :
-    public SimpleRequest<PropertyWrapperWrappedValueVarRequest,
-                         VarDecl *(VarDecl *),
+/// Request information about initialization of the backing property
+/// for properties that have attached property wrappers.
+class PropertyWrapperInitializerInfoRequest :
+    public SimpleRequest<PropertyWrapperInitializerInfoRequest,
+                         PropertyWrapperInitializerInfo(VarDecl *),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -746,11 +745,12 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  VarDecl *evaluate(Evaluator &evaluator, VarDecl *var) const;
+  PropertyWrapperInitializerInfo
+  evaluate(Evaluator &evaluator, VarDecl *var) const;
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Retrieve the structural type of an alias type.
@@ -833,7 +833,7 @@ private:
 
 public:
   // Caching
-  bool isCached() const;
+  bool isCached() const { return true; }
 };
 
 /// Request the result builder type attached to the given declaration,
@@ -878,45 +878,6 @@ public:
   void cacheResult(SelfAccessKind value) const;
 };
 
-/// Determine whether the given function is an @asyncHandler.
-class IsAsyncHandlerRequest :
-    public SimpleRequest<IsAsyncHandlerRequest,
-                         bool(FuncDecl *),
-                         RequestFlags::SeparatelyCached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  bool evaluate(Evaluator &evaluator, FuncDecl *func) const;
-
-public:
-  // Separate caching.
-  bool isCached() const { return true; }
-  Optional<bool> getCachedResult() const;
-  void cacheResult(bool value) const;
-};
-
-/// Determine whether the given function can be an @asyncHandler, without
-/// producing any diagnostics.
-class CanBeAsyncHandlerRequest :
-    public SimpleRequest<CanBeAsyncHandlerRequest,
-                         bool(FuncDecl *),
-                         RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  bool evaluate(Evaluator &evaluator, FuncDecl *func) const;
-
-public:
-  // Caching
-  bool isCached() const { return true; }
-};
-
 /// Determine whether the given nominal type is an actor.
 class IsActorRequest :
     public SimpleRequest<IsActorRequest,
@@ -938,7 +899,7 @@ public:
 /// Determine whether the given class is a default actor.
 class IsDefaultActorRequest :
     public SimpleRequest<IsDefaultActorRequest,
-                         bool(ClassDecl *),
+                         bool(ClassDecl *, ModuleDecl *, ResilienceExpansion),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -946,11 +907,48 @@ public:
 private:
   friend SimpleRequest;
 
-  bool evaluate(Evaluator &evaluator, ClassDecl *classDecl) const;
+  bool evaluate(Evaluator &evaluator, ClassDecl *classDecl,
+                ModuleDecl *M, ResilienceExpansion expansion) const;
 
 public:
   // Caching
   bool isCached() const { return true; }
+};
+
+/// Determine whether the given class is a distributed actor.
+class IsDistributedActorRequest :
+    public SimpleRequest<IsDistributedActorRequest,
+        bool(NominalTypeDecl *),
+        RequestFlags::Cached> {
+public:
+    using SimpleRequest::SimpleRequest;
+
+private:
+    friend SimpleRequest;
+
+    bool evaluate(Evaluator &evaluator, NominalTypeDecl *nominal) const;
+
+public:
+    // Caching
+    bool isCached() const { return true; }
+};
+
+/// Determine whether the given func is distributed.
+class IsDistributedFuncRequest :
+    public SimpleRequest<IsDistributedFuncRequest,
+        bool(FuncDecl *),
+        RequestFlags::Cached> {
+public:
+    using SimpleRequest::SimpleRequest;
+
+private:
+    friend SimpleRequest;
+
+    bool evaluate(Evaluator &evaluator, FuncDecl *func) const;
+
+public:
+    // Caching
+    bool isCached() const { return true; }
 };
 
 /// Retrieve the static "shared" property within a global actor that provides
@@ -1020,6 +1018,20 @@ private:
 public:
   // Caching
   bool isCached() const { return true; }
+};
+
+/// Determine whether the given function should have an isolated 'self'.
+class HasIsolatedSelfRequest :
+    public SimpleRequest<HasIsolatedSelfRequest,
+                         bool(ValueDecl *),
+                         RequestFlags::Uncached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  bool evaluate(Evaluator &evaluator, ValueDecl *func) const;
 };
 
 /// Request whether the storage has a mutating getter.
@@ -1402,7 +1414,7 @@ private:
 
 public:
   // Separate caching.
-  bool isCached() const;
+  bool isCached() const { return true; }
 
   /// Abstract generic signature requests never have source-location info.
   SourceLoc getNearestLoc() const {
@@ -1437,7 +1449,7 @@ private:
 
 public:
   // Separate caching.
-  bool isCached() const;
+  bool isCached() const { return true; }
 
   /// Inferred generic signature requests don't have source-location info.
   SourceLoc getNearestLoc() const {
@@ -1943,6 +1955,24 @@ public:
   bool isCached() const { return true; }
 };
 
+/// Checks whether this type has a distributed actor "local" initializer.
+class HasDistributedActorLocalInitRequest
+    : public SimpleRequest<HasDistributedActorLocalInitRequest, bool(NominalTypeDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  bool evaluate(Evaluator &evaluator, NominalTypeDecl *decl) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
 /// Synthesizes a default initializer for a given type.
 class SynthesizeDefaultInitRequest
     : public SimpleRequest<SynthesizeDefaultInitRequest,
@@ -2033,6 +2063,8 @@ enum class ImplicitMemberAction : uint8_t {
   ResolveCodingKeys,
   ResolveEncodable,
   ResolveDecodable,
+  ResolveDistributedActor,
+  ResolveDistributedActorAddress,
 };
 
 class ResolveImplicitMemberRequest
@@ -2753,6 +2785,24 @@ public:
   bool isCached() const { return true; }
 };
 
+/// Get the library level of a module.
+class ModuleLibraryLevelRequest
+    : public SimpleRequest<ModuleLibraryLevelRequest,
+                           LibraryLevel(const ModuleDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  LibraryLevel evaluate(Evaluator &evaluator, const ModuleDecl *module) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
+};
+
 class ResolveTypeRequest
     : public SimpleRequest<ResolveTypeRequest,
                            Type(const TypeResolution *, TypeRepr *,
@@ -2898,9 +2948,9 @@ public:
 };
 
 /// Retrieve the implicit conformance for the given nominal type to
-/// the ConcurrentValue protocol.
-class GetImplicitConcurrentValueRequest :
-    public SimpleRequest<GetImplicitConcurrentValueRequest,
+/// the Sendable protocol.
+class GetImplicitSendableRequest :
+    public SimpleRequest<GetImplicitSendableRequest,
                          NormalProtocolConformance *(NominalTypeDecl *),
                          RequestFlags::Cached> {
 public:
@@ -2914,6 +2964,42 @@ private:
 
 public:
   // Caching
+  bool isCached() const { return true; }
+};
+
+class ConditionalRequirementsRequest
+    : public SimpleRequest<ConditionalRequirementsRequest,
+                           llvm::ArrayRef<Requirement>(
+                               NormalProtocolConformance *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  llvm::ArrayRef<Requirement> evaluate(Evaluator &evaluator,
+                                       NormalProtocolConformance *decl) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+class AsyncAlternativeRequest
+    : public SimpleRequest<AsyncAlternativeRequest,
+                           AbstractFunctionDecl *(AbstractFunctionDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  AbstractFunctionDecl *evaluate(
+      Evaluator &evaluator, AbstractFunctionDecl *attachedFunctionDecl) const;
+
+public:
   bool isCached() const { return true; }
 };
 

@@ -136,11 +136,6 @@ namespace swift {
   /// Type check a function body element which is at \p TagetLoc .
   bool typeCheckASTNodeAtLoc(DeclContext *DC, SourceLoc TargetLoc);
 
-  /// Typecheck top-level code parsed during code completion.
-  ///
-  /// \returns true on success, false on error.
-  bool typeCheckTopLevelCodeDecl(TopLevelCodeDecl *TLCD);
-
   LookupResult
   lookupSemanticMember(DeclContext *DC, Type ty, DeclName name);
 
@@ -210,6 +205,33 @@ namespace swift {
   /// Resolve a list of mangled names to accessible protocol decls from
   /// the decl context.
   ProtocolDecl *resolveProtocolName(DeclContext *dc, StringRef Name);
+
+  /// Reported type of a variable declaration.
+  struct VariableTypeInfo {
+    /// The start of the variable identifier.
+    uint32_t Offset;
+
+    /// The length of the variable identifier.
+    uint32_t Length;
+
+    /// Whether the variable has an explicit type annotation.
+    bool HasExplicitType;
+
+    /// The start of the printed type in a separate string buffer.
+    uint32_t TypeOffset;
+
+    VariableTypeInfo(uint32_t Offset, uint32_t Length, bool HasExplicitType,
+                     uint32_t TypeOffset);
+  };
+
+  /// Collect type information for every variable declaration in \c SF
+  /// within the given range into \c VariableTypeInfos.
+  /// All types will be printed to \c OS and the type offsets of the
+  /// \c VariableTypeInfos will index into the string that backs this
+  /// stream.
+  void collectVariableType(SourceFile &SF, SourceRange Range,
+                           std::vector<VariableTypeInfo> &VariableTypeInfos,
+                           llvm::raw_ostream &OS);
 
   /// FIXME: All of the below goes away once CallExpr directly stores its
   /// arguments.

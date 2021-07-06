@@ -74,6 +74,7 @@ namespace swift {
   class DerivativeAttr;
   class DifferentiableAttr;
   class ExtensionDecl;
+  struct ExternalSourceLocs;
   class ForeignRepresentationInfo;
   class FuncDecl;
   class GenericContext;
@@ -111,6 +112,7 @@ namespace swift {
   class TupleTypeElt;
   class EnumElementDecl;
   class ProtocolDecl;
+  class RequirementMachine;
   class SubstitutableType;
   class SourceManager;
   class ValueDecl;
@@ -347,7 +349,8 @@ private:
     DelayedPatternContexts;
 
   /// Cache of module names that fail the 'canImport' test in this context.
-  llvm::StringSet<> FailedModuleImportNames;
+  mutable llvm::StringSet<> FailedModuleImportNames;
+
 
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
@@ -483,7 +486,10 @@ public:
   
 #define KNOWN_STDLIB_TYPE_DECL(NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of Swift.NAME. */ \
-  DECL_CLASS *get##NAME##Decl() const;
+  DECL_CLASS *get##NAME##Decl() const; \
+\
+  /** Retrieve the type of Swift.NAME. */ \
+  Type get##NAME##Type() const;
 #include "swift/AST/KnownStdlibTypes.def"
 
   /// Retrieve the declaration of Swift.Optional<T>.Some.
@@ -492,14 +498,17 @@ public:
   /// Retrieve the declaration of Swift.Optional<T>.None.
   EnumElementDecl *getOptionalNoneDecl() const;
 
+  /// Retrieve the declaration of Swift.Void.
+  TypeAliasDecl *getVoidDecl() const;
+
+  /// Retrieve the type of Swift.Void.
+  Type getVoidType() const;
+
   /// Retrieve the declaration of the "pointee" property of a pointer type.
   VarDecl *getPointerPointeePropertyDecl(PointerTypeKind ptrKind) const;
 
   /// Retrieve the type Swift.AnyObject.
   CanType getAnyObjectType() const;
-
-  /// Retrieve the type Swift.Never.
-  CanType getNeverType() const;
 
 #define KNOWN_SDK_TYPE_DECL(MODULE, NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of MODULE.NAME. */ \
@@ -513,6 +522,11 @@ public:
 #define FUNC_DECL(Name, Id) \
   FuncDecl *get##Name() const;
 #include "swift/AST/KnownDecls.def"
+
+  // Declare accessors for the known declarations.
+#define KNOWN_SDK_FUNC_DECL(Module, Name, Id) \
+  FuncDecl *get##Name() const;
+#include "swift/AST/KnownSDKDecls.def"
 
   /// Get the '+' function on two RangeReplaceableCollection.
   FuncDecl *getPlusFunctionOnRangeReplaceableCollection() const;
@@ -584,6 +598,11 @@ public:
 
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
+
+  /// Look for the declaration with the given name within the
+  /// passed in module.
+  void lookupInModule(ModuleDecl *M, StringRef name,
+                      SmallVectorImpl<ValueDecl *> &results) const;
 
   /// Look for the declaration with the given name within the
   /// Swift module.
@@ -727,6 +746,10 @@ public:
   /// Get the runtime availability of support for differentiation.
   AvailabilityContext getDifferentiationAvailability();
 
+  /// Get the runtime availability of getters and setters of multi payload enum
+  /// tag single payloads.
+  AvailabilityContext getMultiPayloadEnumTagSinglePayload();
+
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
   AvailabilityContext getSwift52Availability();
@@ -738,6 +761,14 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.4
   /// compiler for the target platform.
   AvailabilityContext getSwift54Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.5
+  /// compiler for the target platform.
+  AvailabilityContext getSwift55Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.6
+  /// compiler for the target platform.
+  AvailabilityContext getSwift56Availability();
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
@@ -876,6 +907,16 @@ public:
   /// If there is no Clang module loader, returns a null pointer.
   /// The loader is owned by the AST context.
   ClangModuleLoader *getDWARFModuleLoader() const;
+
+  /// Check whether the module with a given name can be imported without
+  /// importing it.
+  ///
+  /// Note that even if this check succeeds, errors may still occur if the
+  /// module is loaded in full.
+  bool canImportModuleImpl(ImportPath::Module ModulePath,
+                           llvm::VersionTuple version,
+                           bool underlyingVersion,
+                           bool updateFailingList) const;
 public:
   namelookup::ImportCache &getImportCache() const;
 
@@ -904,7 +945,12 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(ImportPath::Module ModulePath);
+  bool canImportModule(ImportPath::Module ModulePath,
+                       llvm::VersionTuple version = llvm::VersionTuple(),
+                       bool underlyingVersion = false);
+  bool canImportModule(ImportPath::Module ModulePath,
+                       llvm::VersionTuple version = llvm::VersionTuple(),
+                       bool underlyingVersion = false) const;
 
   /// \returns a module with a given name that was already loaded.  If the
   /// module was not loaded, returns nullptr.
@@ -1107,6 +1153,11 @@ public:
   GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(
                                                      CanGenericSignature sig);
 
+  /// Retrieve or create a term rewriting system for answering queries on
+  /// type parameters written against the given generic signature.
+  RequirementMachine *getOrCreateRequirementMachine(
+      CanGenericSignature sig);
+
   /// Retrieve a generic signature with a single unconstrained type parameter,
   /// like `<T>`.
   CanGenericSignature getSingleGenericParameterSignature() const;
@@ -1167,8 +1218,12 @@ public:
 
 private:
   friend Decl;
-  Optional<RawComment> getRawComment(const Decl *D);
-  void setRawComment(const Decl *D, RawComment RC);
+
+  Optional<ExternalSourceLocs *> getExternalSourceLocs(const Decl *D);
+  void setExternalSourceLocs(const Decl *D, ExternalSourceLocs *Locs);
+
+  Optional<std::pair<RawComment, bool>> getRawComment(const Decl *D);
+  void setRawComment(const Decl *D, RawComment RC, bool FromSerialized);
 
   Optional<StringRef> getBriefComment(const Decl *D);
   void setBriefComment(const Decl *D, StringRef Comment);

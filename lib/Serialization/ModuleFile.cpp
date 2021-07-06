@@ -91,8 +91,7 @@ static bool isTargetTooNew(const llvm::Triple &moduleTarget,
 }
 
 ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
-    : Core(core),
-      DeserializedTypeCallback([](Type ty) {}) {
+    : Core(core) {
   assert(!core->hasError());
 
   DeclTypeCursor = core->DeclTypeCursor;
@@ -116,6 +115,10 @@ ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
   allocateBuffer(GenericSignatures, core->GenericSignatures);
   allocateBuffer(SubstitutionMaps, core->SubstitutionMaps);
   allocateBuffer(Identifiers, core->Identifiers);
+}
+
+bool ModuleFile::allowCompilerErrors() const {
+  return getContext().LangOpts.AllowModuleWithCompilerErrors;
 }
 
 Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
@@ -791,7 +794,13 @@ void ModuleFile::lookupClassMembers(ImportPath::Access accessPath,
   if (!accessPath.empty()) {
     for (const auto &list : Core->ClassMembersForDynamicLookup->data()) {
       for (auto item : list) {
-        auto vd = cast<ValueDecl>(getDecl(item.second));
+        auto decl = getDeclChecked(item.second);
+        if (!decl) {
+          llvm::consumeError(decl.takeError());
+          continue;
+        }
+
+        auto vd = cast<ValueDecl>(decl.get());
         auto dc = vd->getDeclContext();
         while (!dc->getParent()->isModuleScopeContext())
           dc = dc->getParent();
@@ -805,10 +814,17 @@ void ModuleFile::lookupClassMembers(ImportPath::Access accessPath,
   }
 
   for (const auto &list : Core->ClassMembersForDynamicLookup->data()) {
-    for (auto item : list)
-      consumer.foundDecl(cast<ValueDecl>(getDecl(item.second)),
+    for (auto item : list) {
+        auto decl = getDeclChecked(item.second);
+        if (!decl) {
+          llvm::consumeError(decl.takeError());
+          continue;
+        }
+
+      consumer.foundDecl(cast<ValueDecl>(decl.get()),
                          DeclVisibilityKind::DynamicLookup,
                          DynamicLookupInfo::AnyObject);
+    }
   }
 }
 
@@ -1021,16 +1037,36 @@ void ModuleFile::collectBasicSourceFileInfo(
   }
 }
 
-Optional<BasicDeclLocs>
-ModuleFile::getBasicDeclLocsForDecl(const Decl *D) const {
-  assert(D);
+static StringRef readLocString(const char *&Data, StringRef StringData) {
+  auto Str =
+      StringData.substr(endian::readNext<uint32_t, little, unaligned>(Data));
+  size_t TerminatorOffset = Str.find('\0');
+  assert(TerminatorOffset != StringRef::npos && "unterminated string data");
+  return Str.slice(0, TerminatorOffset);
+}
 
+static void readRawLoc(ExternalSourceLocs::RawLoc &Loc, const char *&Data,
+                       StringRef StringData) {
+  Loc.Offset = endian::readNext<uint32_t, little, unaligned>(Data);
+  Loc.Line = endian::readNext<uint32_t, little, unaligned>(Data);
+  Loc.Column = endian::readNext<uint32_t, little, unaligned>(Data);
+
+  Loc.Directive.Offset = endian::readNext<uint32_t, little, unaligned>(Data);
+  Loc.Directive.LineOffset = endian::readNext<int32_t, little, unaligned>(Data);
+  Loc.Directive.Length = endian::readNext<uint32_t, little, unaligned>(Data);
+  Loc.Directive.Name = readLocString(Data, StringData);
+}
+
+Optional<ExternalSourceLocs::RawLocs>
+ModuleFile::getExternalRawLocsForDecl(const Decl *D) const {
+  assert(D);
   // Keep these as assertions instead of early exits to ensure that we are not
   // doing extra work.  These cases should be handled by clients of this API.
   assert(!D->hasClangNode() &&
          "cannot find comments for Clang decls in Swift modules");
   assert(D->getDeclContext()->getModuleScopeContext() == FileContext &&
          "Decl is from a different serialized file");
+
   if (!Core->DeclUSRsTable)
     return None;
   // Future compilers may not provide BasicDeclLocsData anymore.
@@ -1038,6 +1074,7 @@ ModuleFile::getBasicDeclLocsForDecl(const Decl *D) const {
     return None;
   if (D->isImplicit())
     return None;
+
   // Compute the USR.
   llvm::SmallString<128> USRBuffer;
   llvm::raw_svector_ostream OS(USRBuffer);
@@ -1047,52 +1084,39 @@ ModuleFile::getBasicDeclLocsForDecl(const Decl *D) const {
   auto It = Core->DeclUSRsTable->find(OS.str());
   if (It == Core->DeclUSRsTable->end())
     return None;
+
   auto UsrId = *It;
-  uint32_t NumSize = 4;
-  // Size of BasicDeclLocs in the buffer.
-  // FilePathOffset + LocNum * LineColumn
-  uint32_t LineColumnCount = 3;
   uint32_t RecordSize =
-    NumSize + // Offset into source filename blob
-    NumSize + // Offset into doc ranges blob
-    NumSize * 2 * LineColumnCount; // Line/column of: Loc, StartLoc, EndLoc
+      4 +        // Source filename offset
+      4 +        // Doc ranges offset
+      4 * 3 * 7; // Loc/StartLoc/EndLoc each have 7 4-byte fields
   uint32_t RecordOffset = RecordSize * UsrId;
   assert(RecordOffset < Core->BasicDeclLocsData.size());
   assert(Core->BasicDeclLocsData.size() % RecordSize == 0);
-  BasicDeclLocs Result;
   auto *Record = Core->BasicDeclLocsData.data() + RecordOffset;
-  auto ReadNext = [&Record]() {
-    return endian::readNext<uint32_t, little, unaligned>(Record);
-  };
 
-  auto FilePath = Core->SourceLocsTextData.substr(ReadNext());
-  size_t TerminatorOffset = FilePath.find('\0');
-  assert(TerminatorOffset != StringRef::npos && "unterminated string data");
-  Result.SourceFilePath = FilePath.slice(0, TerminatorOffset);
+  ExternalSourceLocs::RawLocs Result;
+  Result.SourceFilePath = readLocString(Record, Core->SourceLocsTextData);
 
-  const auto DocRangesOffset = ReadNext();
+  const auto DocRangesOffset =
+      endian::readNext<uint32_t, little, unaligned>(Record);
   if (DocRangesOffset) {
     assert(!Core->DocRangesData.empty());
     const auto *Data = Core->DocRangesData.data() + DocRangesOffset;
     const auto NumLocs = endian::readNext<uint32_t, little, unaligned>(Data);
     assert(NumLocs);
 
-    for (uint32_t i = 0; i < NumLocs; ++i) {
-      LineColumn LC;
-      LC.Line = endian::readNext<uint32_t, little, unaligned>(Data);
-      LC.Column = endian::readNext<uint32_t, little, unaligned>(Data);
-      auto Length = endian::readNext<uint32_t, little, unaligned>(Data);
-      Result.DocRanges.push_back(std::make_pair(LC, Length));
+    for (uint32_t I = 0; I < NumLocs; ++I) {
+      auto &Range =
+          Result.DocRanges.emplace_back(ExternalSourceLocs::RawLoc(), 0);
+      readRawLoc(Range.first, Data, Core->SourceLocsTextData);
+      Range.second = endian::readNext<uint32_t, little, unaligned>(Data);
     }
   }
 
-#define READ_FIELD(X)                                                         \
-Result.X.Line = ReadNext();                                                   \
-Result.X.Column = ReadNext();
-  READ_FIELD(Loc)
-  READ_FIELD(StartLoc)
-  READ_FIELD(EndLoc)
-#undef READ_FIELD
+  readRawLoc(Result.Loc, Record, Core->SourceLocsTextData);
+  readRawLoc(Result.StartLoc, Record, Core->SourceLocsTextData);
+  readRawLoc(Result.EndLoc, Record, Core->SourceLocsTextData);
   return Result;
 }
 
@@ -1157,7 +1181,7 @@ ModuleFile::getSourceOrderForDecl(const Decl *D) const {
   return Triple.getValue().SourceOrder;
 }
 
-void ModuleFile::collectAllGroups(std::vector<StringRef> &Names) const {
+void ModuleFile::collectAllGroups(SmallVectorImpl<StringRef> &Names) const {
   if (!Core->GroupNamesMap)
     return;
   for (auto It = Core->GroupNamesMap->begin(); It != Core->GroupNamesMap->end();
@@ -1238,9 +1262,9 @@ bool SerializedASTFile::getAllGenericSignatures(
   return true;
 }
 
-Decl *SerializedASTFile::getMainDecl() const {
+ValueDecl *SerializedASTFile::getMainDecl() const {
   assert(hasEntryPoint());
-  return File.getDecl(File.getEntryPointDeclID());
+  return cast_or_null<ValueDecl>(File.getDecl(File.getEntryPointDeclID()));
 }
 
 const version::Version &SerializedASTFile::getLanguageVersionBuiltWith() const {

@@ -28,6 +28,7 @@
 #include "Explosion.h"
 #include "GenCall.h"
 #include "GenCast.h"
+#include "GenConcurrency.h"
 #include "GenPointerAuth.h"
 #include "GenIntegerLiteral.h"
 #include "IRGenFunction.h"
@@ -219,6 +220,49 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     return;
   }
 
+  // emitGetCurrentExecutor has no arguments.
+  if (Builtin.ID == BuiltinValueKind::GetCurrentExecutor) {
+    emitGetCurrentExecutor(IGF, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::StartAsyncLet) {
+    auto taskOptions = args.claimNext();
+    auto taskFunction = args.claimNext();
+    auto taskContext = args.claimNext();
+
+    auto asyncLet = emitBuiltinStartAsyncLet(
+        IGF,
+        taskOptions,
+        taskFunction,
+        taskContext,
+        substitutions
+        );
+
+    out.add(asyncLet);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::EndAsyncLet) {
+    emitEndAsyncLet(IGF, args.claimNext());
+    // Ignore a second operand which is inserted by ClosureLifetimeFixup and
+    // only used for dependency tracking.
+    (void)args.claimAll();
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::CreateTaskGroup) {
+    // Claim metadata pointer.
+    (void)args.claimAll();
+    out.add(emitCreateTaskGroup(IGF, substitutions));
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::DestroyTaskGroup) {
+    emitDestroyTaskGroup(IGF, args.claimNext());
+    return;
+  }
+
   // Everything else cares about the (rvalue) argument.
 
   if (Builtin.ID == BuiltinValueKind::CancelAsyncTask) {
@@ -226,25 +270,24 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     return;
   }
 
-  if (Builtin.ID == BuiltinValueKind::CreateAsyncTaskFuture ||
-      Builtin.ID == BuiltinValueKind::CreateAsyncTaskGroupFuture) {
+  if (Builtin.ID == BuiltinValueKind::CreateAsyncTask ||
+      Builtin.ID == BuiltinValueKind::CreateAsyncTaskInGroup) {
 
     auto flags = args.claimNext();
-    auto parentTask = args.claimNext();
     auto taskGroup =
-        (Builtin.ID == BuiltinValueKind::CreateAsyncTaskGroupFuture)
+        (Builtin.ID == BuiltinValueKind::CreateAsyncTaskInGroup)
         ? args.claimNext()
         : nullptr;
-    auto futureResultType =
-        ((Builtin.ID == BuiltinValueKind::CreateAsyncTaskFuture) ||
-         (Builtin.ID == BuiltinValueKind::CreateAsyncTaskGroupFuture))
-          ? args.claimNext()
-          : nullptr;
+    auto futureResultType = args.claimNext();
     auto taskFunction = args.claimNext();
     auto taskContext = args.claimNext();
 
     auto newTaskAndContext = emitTaskCreate(
-        IGF, flags, parentTask, taskGroup, futureResultType, taskFunction, taskContext,
+        IGF,
+        flags,
+        taskGroup,
+        futureResultType,
+        taskFunction, taskContext,
         substitutions);
 
     // Cast back to NativeObject/RawPointer.
@@ -278,7 +321,65 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     return;
   }
 
-  if (Builtin.ID == BuiltinValueKind::DestroyDefaultActor) {
+  if (Builtin.ID == BuiltinValueKind::ResumeThrowingContinuationReturning ||
+      Builtin.ID == BuiltinValueKind::ResumeNonThrowingContinuationReturning) {
+    auto continuation = args.claimNext();
+    auto valueTy = argTypes[1];
+    auto valuePtr = args.claimNext();
+    bool throwing =
+      (Builtin.ID == BuiltinValueKind::ResumeThrowingContinuationReturning);
+    IGF.emitResumeAsyncContinuationReturning(continuation, valuePtr, valueTy,
+                                             throwing);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::ResumeThrowingContinuationThrowing) {
+    auto continuation = args.claimNext();
+    auto error = args.claimNext();
+    IGF.emitResumeAsyncContinuationThrowing(continuation, error);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::BuildMainActorExecutorRef) {
+    emitBuildMainActorExecutorRef(IGF, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::BuildDefaultActorExecutorRef) {
+    auto actor = args.claimNext();
+    emitBuildDefaultActorExecutorRef(IGF, actor, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::BuildOrdinarySerialExecutorRef) {
+    auto actor = args.claimNext();
+    auto type = substitutions.getReplacementTypes()[0]->getCanonicalType();
+    auto conf = substitutions.getConformances()[0];
+    emitBuildOrdinarySerialExecutorRef(IGF, actor, type, conf, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::InitializeDistributedRemoteActor) {
+    auto fn = IGF.IGM.getDistributedActorInitializeRemoteFn();
+    auto actor = args.claimNext();
+    actor = IGF.Builder.CreateBitCast(actor, IGF.IGM.RefCountedPtrTy);
+    // init(resolve address, using transport)
+    auto call = IGF.Builder.CreateCall(fn, {
+      actor
+      // TODO: might have to carry `address, transport` depending on how we implement the resolve initializers
+    });
+    call->setCallingConv(IGF.IGM.SwiftCC);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::DestroyDistributedActor) {
+    auto fn = IGF.IGM.getDistributedActorDestroyFn();
+    auto actor = args.claimNext();
+    actor = IGF.Builder.CreateBitCast(actor, IGF.IGM.RefCountedPtrTy);
+    auto call = IGF.Builder.CreateCall(fn, {actor});
+    call->setCallingConv(IGF.IGM.SwiftCC);
+    call->setDoesNotThrow();
+    return;
   }
 
   // If this is an LLVM IR intrinsic, lower it to an intrinsic call.
@@ -800,6 +901,16 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     auto newValue = args.claimNext();
     auto index = args.claimNext();
     out.add(IGF.Builder.CreateInsertElement(vector, newValue, index));
+    return;
+  }
+  
+  if (Builtin.ID == BuiltinValueKind::ShuffleVector) {
+    using namespace llvm;
+
+    auto dict0 = args.claimNext();
+    auto dict1 = args.claimNext();
+    auto index = args.claimNext();
+    out.add(IGF.Builder.CreateShuffleVector(dict0, dict1, index));
     return;
   }
 

@@ -35,14 +35,14 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Allocator.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/SaveAndRestore.h"
+#include "llvm/Support/raw_ostream.h"
 #include <iterator>
 #include <map>
 #include <memory>
-#include <utility>
 #include <tuple>
+#include <utility>
 
 using namespace swift;
 using namespace constraints;
@@ -109,6 +109,10 @@ bool TypeVariableType::Implementation::isClosureResultType() const {
 
   return isExpr<ClosureExpr>(locator->getAnchor()) &&
          locator->isLastElement<LocatorPathElt::ClosureResult>();
+}
+
+bool TypeVariableType::Implementation::isKeyPathType() const {
+  return locator && locator->isKeyPathType();
 }
 
 void *operator new(size_t bytes, ConstraintSystem& cs,
@@ -216,7 +220,7 @@ void ParentConditionalConformance::diagnoseConformanceStack(
     ArrayRef<ParentConditionalConformance> conformances) {
   for (auto history : llvm::reverse(conformances)) {
     diags.diagnose(loc, diag::requirement_implied_by_conditional_conformance,
-                   history.ConformingType, history.Protocol);
+                   history.ConformingType, history.Protocol->getDeclaredInterfaceType());
   }
 }
 
@@ -350,9 +354,6 @@ TypeChecker::typeCheckExpression(
   if (DiagnosticSuppression::isEnabled(Context.Diags))
     csOptions |= ConstraintSystemFlags::SuppressDiagnostics;
 
-  if (options.contains(TypeCheckExprFlags::AllowUnresolvedTypeVariables))
-    csOptions |= ConstraintSystemFlags::AllowUnresolvedTypeVariables;
-
   if (options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))
     csOptions |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
 
@@ -374,24 +375,12 @@ TypeChecker::typeCheckExpression(
   // If the client can handle unresolved type variables, leave them in the
   // system.
   auto allowFreeTypeVariables = FreeTypeVariableBinding::Disallow;
-  if (options.contains(TypeCheckExprFlags::AllowUnresolvedTypeVariables))
-    allowFreeTypeVariables = FreeTypeVariableBinding::UnresolvedType;
 
   // Attempt to solve the constraint system.
   auto viable = cs.solve(target, allowFreeTypeVariables);
   if (!viable) {
     target.setExpr(expr);
     return None;
-  }
-
-  // If the client allows the solution to have unresolved type expressions,
-  // check for them now. We cannot apply the solution with unresolved TypeVars,
-  // because they will leak out into arbitrary places in the resultant AST.
-  if (options.contains(TypeCheckExprFlags::AllowUnresolvedTypeVariables) &&
-       (viable->size() != 1 ||
-        (target.getExprConversionType() &&
-         target.getExprConversionType()->hasUnresolvedType()))) {
-    return target;
   }
 
   // Apply this solution to the constraint system.
@@ -538,12 +527,14 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
       }
     }
   }
-  
+
   if (hadError)
     PBD->setInvalid();
 
   PBD->setInitializerChecked(patternNumber);
-  
+
+  checkPatternBindingDeclAsyncUsage(PBD);
+
   return hadError;
 }
 
@@ -601,7 +592,7 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
     if (conformanceRef.hasEffect(EffectKind::Throws) &&
         stmt->getTryLoc().isInvalid()) {
       auto &diags = dc->getASTContext().Diags;
-      diags.diagnose(stmt->getAwaitLoc(), diag::throwing_call_unhandled)
+      diags.diagnose(stmt->getAwaitLoc(), diag::throwing_call_unhandled, "call")
         .fixItInsert(stmt->getAwaitLoc(), "try");
 
       return failed();
@@ -676,20 +667,14 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
   auto *matchOp =
       TypeChecker::buildRefExpr(choices, DC, DeclNameLoc(EP->getLoc()),
                                 /*Implicit=*/true, FunctionRefKind::Compound);
-  auto *matchVarRef = new (Context) DeclRefExpr(matchVar,
-                                                DeclNameLoc(EP->getLoc()),
-                                                /*Implicit=*/true);
-  
-  Expr *matchArgElts[] = {EP->getSubExpr(), matchVarRef};
-  auto *matchArgs
-    = TupleExpr::create(Context, EP->getSubExpr()->getSourceRange().Start,
-                        matchArgElts, { }, { },
-                        EP->getSubExpr()->getSourceRange().End,
-                        /*HasTrailingClosure=*/false, /*Implicit=*/true);
-  
-  Expr *matchCall = new (Context) BinaryExpr(matchOp, matchArgs,
-                                             /*Implicit=*/true);
 
+  // Note we use getEndLoc here to have the BinaryExpr source range be the same
+  // as the expr pattern source range.
+  auto *matchVarRef = new (Context) DeclRefExpr(matchVar,
+                                                DeclNameLoc(EP->getEndLoc()),
+                                                /*Implicit=*/true);
+  Expr *matchCall = BinaryExpr::create(Context, EP->getSubExpr(), matchOp,
+                                       matchVarRef, /*implicit*/ true);
   // Check the expression as a condition.
   bool hadError = typeCheckCondition(matchCall, DC);
   // Save the type-checked expression in the pattern.
@@ -1029,14 +1014,13 @@ void Solution::dump(raw_ostream &out) const {
 
   out << "\n";
   out << "Trailing closure matching:\n";
-  for (auto &trailingClosureMatching : trailingClosureMatchingChoices) {
+  for (auto &argumentMatching : argumentMatchingChoices) {
     out.indent(2);
-    trailingClosureMatching.first->dump(sm, out);
-    switch (trailingClosureMatching.second) {
+    argumentMatching.first->dump(sm, out);
+    switch (argumentMatching.second.trailingClosureMatching) {
     case TrailingClosureMatching::Forward:
       out << ": forward\n";
       break;
-
     case TrailingClosureMatching::Backward:
       out << ": backward\n";
       break;
@@ -1338,6 +1322,8 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
 
   Type origFromType = fromType;
   Type origToType = toType;
+
+  auto *module = dc->getParentModule();
 
   auto &diags = dc->getASTContext().Diags;
   bool optionalToOptionalCast = false;
@@ -1727,7 +1713,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
     //
     if (auto *protocolDecl =
           dyn_cast_or_null<ProtocolDecl>(fromType->getAnyNominal())) {
-      if (!couldDynamicallyConformToProtocol(toType, protocolDecl, dc)) {
+      if (!couldDynamicallyConformToProtocol(toType, protocolDecl, module)) {
         return failed();
       }
     } else if (auto protocolComposition =
@@ -1737,7 +1723,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
                          if (auto protocolDecl = dyn_cast_or_null<ProtocolDecl>(
                                  protocolType->getAnyNominal())) {
                            return !couldDynamicallyConformToProtocol(
-                               toType, protocolDecl, dc);
+                               toType, protocolDecl, module);
                          }
                          return false;
                        })) {
@@ -1799,8 +1785,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
     }
   }
 
-  if (ConstraintSystem::isAnyHashableType(toType) ||
-      ConstraintSystem::isAnyHashableType(fromType)) {
+  if (toType->isAnyHashable() || fromType->isAnyHashable()) {
     return CheckedCastKind::ValueCast;
   }
 
@@ -1834,7 +1819,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
     auto nsErrorTy = Context.getNSErrorType();
 
     if (auto errorTypeProto = Context.getProtocol(KnownProtocolKind::Error)) {
-      if (!conformsToProtocol(toType, errorTypeProto, dc).isInvalid()) {
+      if (conformsToProtocol(toType, errorTypeProto, module)) {
         if (nsErrorTy) {
           if (isSubtypeOf(fromType, nsErrorTy, dc)
               // Don't mask "always true" warnings if NSError is cast to
@@ -1844,7 +1829,7 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
         }
       }
 
-      if (!conformsToProtocol(fromType, errorTypeProto, dc).isInvalid()) {
+      if (conformsToProtocol(fromType, errorTypeProto, module)) {
         // Cast of an error-conforming type to NSError or NSObject.
         if ((nsObject && toType->isEqual(nsObject)) ||
              (nsErrorTy && toType->isEqual(nsErrorTy)))

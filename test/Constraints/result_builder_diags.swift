@@ -142,6 +142,12 @@ func testOverloading(name: String) {
     }
   }
 
+  _ = overloadedTuplify(true) { cond in
+    if cond {
+      print(\"hello") // expected-error {{invalid component of Swift key path}}
+    }
+  }
+
   let _: A = a1
 
   _ = overloadedTuplify(true) { b in // expected-error {{ambiguous use of 'overloadedTuplify(_:body:)'}}
@@ -249,7 +255,7 @@ func erroneousSR11350(x: Int) {
       if b {
         acceptInt(0) { }
       }
-    }).domap(0) // expected-error{{value of type 'Optional<()>' has no member 'domap'}}
+    }).domap(0) // expected-error{{value of type '()?' has no member 'domap'}}
   }
 }
 
@@ -461,7 +467,7 @@ struct TestConstraintGenerationErrors {
   func buildTupleClosure() {
     tuplify(true) { _ in
       let a = nothing // expected-error {{cannot find 'nothing' in scope}}
-      String(nothing) // expected-error {{cannot find 'nothing' in scope}}
+      String(nothing)
     }
   }
 }
@@ -673,5 +679,90 @@ do {
     tuplify(true) { c in // expected-error{{invalid conversion from throwing function of type '(Bool) throws -> String' to non-throwing function type '(Bool) -> String'}}
     "testThrow"
     throw MyError.boom
+  }
+}
+
+struct TuplifiedStructWithInvalidClosure {
+  var condition: Bool
+
+  @TupleBuilder var unknownParameter: some Any {
+    if let cond = condition {
+      let _ = { (arg: UnknownType) in // expected-error {{cannot find type 'UnknownType' in scope}}
+      }
+      42
+    } else {
+      0
+    }
+  }
+
+  @TupleBuilder var unknownResult: some Any {
+    if let cond = condition {
+      let _ = { () -> UnknownType in // expected-error {{cannot find type 'UnknownType' in scope}}
+      }
+      42
+    } else {
+      0
+    }
+  }
+
+  @TupleBuilder var multipleLevelsDeep: some Any {
+    if let cond = condition {
+      switch MyError.boom {
+      case .boom:
+        let _ = { () -> UnknownType in // expected-error {{cannot find type 'UnknownType' in scope}}
+        }
+      }
+
+      42
+    } else {
+      0
+    }
+  }
+
+  @TupleBuilder var errorsDiagnosedByParser: some Any {
+    if let cond = condition {
+      tuplify { _ in
+        self. // expected-error {{expected member name following '.'}}
+      }
+      42
+    }
+  }
+
+  @TupleBuilder var nestedErrorsDiagnosedByParser: some Any {
+    tuplify(true) { _ in
+      tuplify { _ in
+        self. // expected-error {{expected member name following '.'}}
+      }
+      42
+    }
+  }
+}
+
+// rdar://65667992 - invalid case in enum causes fallback diagnostic
+func test_rdar65667992() {
+  @resultBuilder
+  struct Builder {
+    static func buildBlock<T>(_ t: T) -> T { t }
+    static func buildEither<T>(first: T) -> T { first }
+    static func buildEither<T>(second: T) -> T { second }
+  }
+
+  struct S {}
+
+  enum E {
+    case set(v: Int, choices: [Int])
+    case notSet(choices: [Int])
+  }
+
+  struct MyView {
+    var entry: E
+
+    @Builder var body: S {
+      switch entry { // expected-error {{type 'E' has no member 'unset'}}
+      case .set(_, _): S()
+      case .unset(_): S()
+      default: S()
+      }
+    }
   }
 }

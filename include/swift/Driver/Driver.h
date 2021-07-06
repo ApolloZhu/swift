@@ -167,7 +167,8 @@ public:
     AutolinkExtract, // swift-autolink-extract
     SwiftIndent,     // swift-indent
     SymbolGraph,     // swift-symbolgraph
-    APIExtract       // swift-api-extract
+    APIExtract,      // swift-api-extract
+    APIDigester      // swift-api-digester
   };
 
   class InputInfoMap;
@@ -200,6 +201,11 @@ private:
   /// Indicates whether the driver should check that the input files exist.
   bool CheckInputFilesExist = true;
 
+  /// Indicates that this driver never actually executes any commands but is
+  /// just set up to retrieve the swift-frontend invocation that would be
+  /// executed during compilation.
+  bool IsDummyDriverForFrontendInvocation = false;
+
 public:
   Driver(StringRef DriverExecutable, StringRef Name,
          ArrayRef<const char *> Args, DiagnosticEngine &Diags);
@@ -226,6 +232,14 @@ public:
 
   void setCheckInputFilesExist(bool Value) { CheckInputFilesExist = Value; }
 
+  bool isDummyDriverForFrontendInvocation() const {
+    return IsDummyDriverForFrontendInvocation;
+  }
+
+  void setIsDummyDriverForFrontendInvocation(bool Value) {
+    IsDummyDriverForFrontendInvocation = Value;
+  }
+
   /// Creates an appropriate ToolChain for a given driver, given the target
   /// specified in \p Args (or the default target). Sets the value of \c
   /// DefaultTargetTriple from \p Args as a side effect.
@@ -248,13 +262,17 @@ public:
   /// Construct a compilation object for a given ToolChain and command line
   /// argument vector.
   ///
+  /// If \p AllowErrors is set to \c true, this method tries to build a
+  /// compilation even if there were errors.
+  ///
   /// \return A Compilation, or nullptr if none was built for the given argument
   /// vector. A null return value does not necessarily indicate an error
   /// condition; the diagnostics should be queried to determine if an error
   /// occurred.
   std::unique_ptr<Compilation>
   buildCompilation(const ToolChain &TC,
-                   std::unique_ptr<llvm::opt::InputArgList> ArgList);
+                   std::unique_ptr<llvm::opt::InputArgList> ArgList,
+                   bool AllowErrors = false);
 
   /// Parse the given list of strings into an InputArgList.
   std::unique_ptr<llvm::opt::InputArgList>

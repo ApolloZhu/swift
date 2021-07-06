@@ -21,7 +21,7 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/TerminatorUtils.h"
-#include "swift/SIL/BasicBlockBits.h"
+#include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProgramTerminationAnalysis.h"
 #include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
@@ -57,7 +57,7 @@ STATISTIC(NumSROAArguments, "Number of aggregate argument levels split by "
 //===----------------------------------------------------------------------===//
 
 /// dominatorBasedSimplify iterates between dominator based simplification of
-/// terminator branch condition values and cfg simplification. This is the
+/// terminator branch condition values and CFG simplification. This is the
 /// maximum number of iterations we run. The number is the maximum number of
 /// iterations encountered when compiling the stdlib on April 2 2015.
 ///
@@ -382,12 +382,12 @@ bool SimplifyCFG::threadEdge(const ThreadInfo &ti) {
           dyn_cast<BranchInst>(ThreadedSuccessorBlock->getTerminator())) {
     simplifyBranchBlock(branchInst);
   }
-  Cloner.updateSSAAfterCloning();
+  Cloner.updateOSSAAfterCloning();
   return true;
 }
 
-/// Give a cond_br or switch_enum instruction and one successor block return
-/// true if we can infer the value of the condition/enum along the edge to this
+/// Give a cond_br or switch_enum instruction and one successor block returns
+/// true if we can infer the value of the condition/enum along the edge to these
 /// successor blocks.
 static bool isKnownEdgeValue(TermInst *Term, SILBasicBlock *SuccBB,
                              EnumElementDecl *&EnumCase) {
@@ -1045,7 +1045,7 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
 
   // Jump threading only makes sense if there is an argument on the branch
   // (which is reacted on in the DestBB), or if this goes through a memory
-  // location (switch_enum_addr is the only adress-instruction which we
+  // location (switch_enum_addr is the only address-instruction which we
   // currently handle).
   if (BI->getArgs().empty() && !isa<SwitchEnumAddrInst>(destTerminator))
     return false;
@@ -1058,10 +1058,13 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
   // given the duplication.
   int ThreadingBudget = 0;
 
-  for (unsigned i = 0, e = BI->getArgs().size(); i != e; ++i) {
+  for (unsigned i : indices(BI->getArgs())) {
+    SILValue Arg = BI->getArg(i);
+
     // If the value being substituted on is release there is a chance we could
     // remove the release after jump threading.
-    if (couldRemoveRelease(SrcBB, BI->getArg(i), DestBB,
+    if (!Arg->getType().isTrivial(*SrcBB->getParent()) &&
+        couldRemoveRelease(SrcBB, Arg, DestBB,
                            DestBB->getArgument(i))) {
         ThreadingBudget = 8;
         break;
@@ -1069,7 +1072,6 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
 
     // If the value being substituted is an enum, check to see if there are any
     // switches on it.
-    SILValue Arg = BI->getArg(i);
     if (!getEnumCase(Arg, BI->getParent()) &&
         !isa<IntegerLiteralInst>(Arg))
       continue;
@@ -1147,7 +1149,7 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
   // Duplicate the destination block into this one, rewriting uses of the BBArgs
   // to use the branch arguments as we go.
   Cloner.cloneBranchTarget(BI);
-  Cloner.updateSSAAfterCloning();
+  Cloner.updateOSSAAfterCloning();
 
   // Once all the instructions are copied, we can nuke BI itself.  We also add
   // the threaded and edge block to the worklist now that they (likely) can be
@@ -1283,7 +1285,7 @@ TrampolineDest::TrampolineDest(SILBasicBlock *sourceBB,
 #ifndef NDEBUG
 /// Is the block reachable from the entry.
 static bool isReachable(SILBasicBlock *Block) {
-  BasicBlockWorklist<16> Worklist(Block->getParent()->getEntryBlock());
+  BasicBlockWorklist Worklist(Block->getParent()->getEntryBlock());
 
   while (SILBasicBlock *CurBB = Worklist.pop()) {
     if (CurBB == Block)
@@ -1974,7 +1976,7 @@ static bool containsOnlyObjMethodCallOnOptional(SILValue optionalValue,
 }
 
 /// Check that all that noneBB does is forwarding none.
-/// The only other allowed operation are ref count operations.
+/// The only other allowed operations are ref count operations.
 static bool onlyForwardsNone(SILBasicBlock *noneBB, SILBasicBlock *someBB,
                              SwitchEnumInst *SEI) {
   // It all the basic blocks leading up to the ultimate block we only expect
@@ -2052,7 +2054,7 @@ static bool hasSameUltimateSuccessor(SILBasicBlock *noneBB, SILBasicBlock *someB
 
   // Otherwise, lets begin a traversal along the successors of noneSuccessorBB,
   // searching for someSuccessorBB, being careful to only allow for blocks to be
-  // visited once. This enables us to guarantee that there are not any loops or
+  // visited once. This enables us to guarantee that there no loops or
   // any sub-diamonds in the part of the CFG we are traversing. This /does/
   // allow for side-entrances to the region from blocks not reachable from
   // noneSuccessorBB. See function level comment above.
@@ -3025,7 +3027,7 @@ bool SimplifyCFG::tailDuplicateObjCMethodCallSuccessorBlocks() {
       continue;
 
     Cloner.cloneBranchTarget(Branch);
-    Cloner.updateSSAAfterCloning();
+    Cloner.updateOSSAAfterCloning();
 
     Changed = true;
     // Simplify the cloned block and continue tail duplicating through its new
@@ -4046,13 +4048,13 @@ bool SimplifyCFG::simplifyProgramTerminationBlock(SILBasicBlock *BB) {
   //
   // TODO: should we use ProgramTerminationAnalysis ?. The reason we do not
   // use the analysis is because the CFG is likely to be invalidated right
-  // after this pass, o we do not really get the benefit of reusing the
+  // after this pass, that's why we do not really get the benefit of reusing the
   // computation for the next iteration of the pass.
   if (!isARCInertTrapBB(BB))
     return false;
 
   // This is going to be the last basic block this program is going to execute
-  // and this block is inert from the ARC's prospective, no point to do any
+  // and this block is inert from the ARC's prospective,so there's no point to do any
   // releases at this point.
   bool Changed = false;
   llvm::SmallPtrSet<SILInstruction *, 4> InstsToRemove;

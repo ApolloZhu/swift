@@ -28,11 +28,18 @@
 @frozen
 public enum Never {}
 
-extension Never: ConcurrentValue { }
+extension Never: Sendable { }
 
 extension Never: Error {}
 
 extension Never: Equatable, Comparable, Hashable {}
+
+@available(macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0, *)
+extension Never: Identifiable {
+  public var id: Never {
+    switch self {}
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Standardized aliases

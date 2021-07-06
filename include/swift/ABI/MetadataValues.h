@@ -45,10 +45,16 @@ enum {
 
   /// The number of words (in addition to the heap-object header)
   /// in a default actor.
-  NumWords_DefaultActor = 10,
+  NumWords_DefaultActor = 12,
+
+  /// The number of words in a task.
+  NumWords_AsyncTask = 16,
 
   /// The number of words in a task group.
   NumWords_TaskGroup = 32,
+
+  /// The number of words in an AsyncLet (flags + task pointer)
+  NumWords_AsyncLet = 8, // TODO: not sure how much is enough, these likely could be pretty small
 };
 
 struct InProcess;
@@ -126,6 +132,9 @@ const size_t Alignment_DefaultActor = MaximumAlignment;
 
 /// The alignment of a TaskGroup.
 const size_t Alignment_TaskGroup = MaximumAlignment;
+
+/// The alignment of an AsyncLet.
+const size_t Alignment_AsyncLet = MaximumAlignment;
 
 /// Flags stored in the value-witness table.
 template <typename int_type>
@@ -317,6 +326,7 @@ private:
     KindMask = 0x0F,                // 16 kinds should be enough for anybody
     IsInstanceMask = 0x10,
     IsDynamicMask = 0x20,
+    IsAsyncMask = 0x40,
     ExtraDiscriminatorShift = 16,
     ExtraDiscriminatorMask = 0xFFFF0000,
   };
@@ -345,6 +355,15 @@ public:
     return copy;
   }
 
+  MethodDescriptorFlags withIsAsync(bool isAsync) const {
+    auto copy = *this;
+    if (isAsync)
+      copy.Value |= IsAsyncMask;
+    else
+      copy.Value &= ~IsAsyncMask;
+    return copy;
+  }
+
   MethodDescriptorFlags withExtraDiscriminator(uint16_t value) const {
     auto copy = *this;
     copy.Value = (copy.Value & ~ExtraDiscriminatorMask)
@@ -361,6 +380,8 @@ public:
   ///
   /// Note that 'init' is not considered an instance member.
   bool isInstance() const { return Value & IsInstanceMask; }
+
+  bool isAsync() const { return Value & IsAsyncMask; }
 
   uint16_t getExtraDiscriminator() const {
     return (Value >> ExtraDiscriminatorShift);
@@ -527,6 +548,7 @@ private:
   enum : int_type {
     KindMask = 0x0F,                // 16 kinds should be enough for anybody
     IsInstanceMask = 0x10,
+    IsAsyncMask = 0x20,
     ExtraDiscriminatorShift = 16,
     ExtraDiscriminatorMask = 0xFFFF0000,
   };
@@ -546,6 +568,15 @@ public:
     return copy;
   }
 
+  ProtocolRequirementFlags withIsAsync(bool isAsync) const {
+    auto copy = *this;
+    if (isAsync)
+      copy.Value |= IsAsyncMask;
+    else
+      copy.Value &= ~IsAsyncMask;
+    return copy;
+  }
+
   ProtocolRequirementFlags withExtraDiscriminator(uint16_t value) const {
     auto copy = *this;
     copy.Value = (copy.Value & ~ExtraDiscriminatorMask)
@@ -559,6 +590,8 @@ public:
   ///
   /// Note that 'init' is not considered an instance member.
   bool isInstance() const { return Value & IsInstanceMask; }
+
+  bool isAsync() const { return Value & IsAsyncMask; }
 
   bool isSignedWithAddress() const {
     return getKind() != Kind::BaseProtocol;
@@ -763,13 +796,29 @@ enum class FunctionMetadataConvention: uint8_t {
 
 /// Differentiability kind for function type metadata.
 /// Duplicates `DifferentiabilityKind` in AST/AutoDiff.h.
-enum class FunctionMetadataDifferentiabilityKind: uint8_t {
-  NonDifferentiable = 0b00000,
-  Forward           = 0b00001,
-  Reverse           = 0b00010,
-  Normal            = 0b00011,
-  Linear            = 0b10000,
+template <typename int_type>
+struct TargetFunctionMetadataDifferentiabilityKind {
+  enum Value : int_type {
+    NonDifferentiable = 0,
+    Forward           = 1,
+    Reverse           = 2,
+    Normal            = 3,
+    Linear            = 4,
+  } Value;
+
+  constexpr TargetFunctionMetadataDifferentiabilityKind(
+      enum Value value = NonDifferentiable) : Value(value) {}
+
+  int_type getIntValue() const {
+    return (int_type)Value;
+  }
+
+  bool isDifferentiable() const {
+    return Value != NonDifferentiable;
+  }
 };
+using FunctionMetadataDifferentiabilityKind =
+    TargetFunctionMetadataDifferentiabilityKind<size_t>;
 
 /// Flags in a function type metadata record.
 template <typename int_type>
@@ -784,10 +833,11 @@ class TargetFunctionTypeFlags {
     ThrowsMask             = 0x01000000U,
     ParamFlagsMask         = 0x02000000U,
     EscapingMask           = 0x04000000U,
-    DifferentiabilityMask  = 0x98000000U,
-    DifferentiabilityShift = 27U,
+    DifferentiableMask     = 0x08000000U,
+    GlobalActorMask        = 0x10000000U,
     AsyncMask              = 0x20000000U,
-    ConcurrentMask         = 0x40000000U,
+    SendableMask           = 0x40000000U,
+    // NOTE: The next bit will need to introduce a separate flags word.
   };
   int_type Data;
   
@@ -818,10 +868,10 @@ public:
                                              (throws ? ThrowsMask : 0));
   }
 
-  constexpr TargetFunctionTypeFlags<int_type> withDifferentiabilityKind(
-      FunctionMetadataDifferentiabilityKind differentiabilityKind) const {
-    return TargetFunctionTypeFlags((Data & ~DifferentiabilityMask)
-        | (int_type(differentiabilityKind) << DifferentiabilityShift));
+  constexpr TargetFunctionTypeFlags<int_type>
+  withDifferentiable(bool differentiable) const {
+    return TargetFunctionTypeFlags<int_type>((Data & ~DifferentiableMask) |
+                                     (differentiable ? DifferentiableMask : 0));
   }
 
   constexpr TargetFunctionTypeFlags<int_type>
@@ -837,10 +887,16 @@ public:
   }
 
   constexpr TargetFunctionTypeFlags<int_type>
-  withConcurrent(bool isConcurrent) const {
+  withConcurrent(bool isSendable) const {
     return TargetFunctionTypeFlags<int_type>(
-        (Data & ~ConcurrentMask) |
-        (isConcurrent ? ConcurrentMask : 0));
+        (Data & ~SendableMask) |
+        (isSendable ? SendableMask : 0));
+  }
+
+  constexpr TargetFunctionTypeFlags<int_type>
+  withGlobalActor(bool globalActor) const {
+    return TargetFunctionTypeFlags<int_type>(
+        (Data & ~GlobalActorMask) | (globalActor ? GlobalActorMask : 0));
   }
 
   unsigned getNumParameters() const { return Data & NumParametersMask; }
@@ -857,20 +913,18 @@ public:
     return bool (Data & EscapingMask);
   }
 
-  bool isConcurrent() const {
-    return bool (Data & ConcurrentMask);
+  bool isSendable() const {
+    return bool (Data & SendableMask);
   }
 
   bool hasParameterFlags() const { return bool(Data & ParamFlagsMask); }
 
   bool isDifferentiable() const {
-    return getDifferentiabilityKind() !=
-        FunctionMetadataDifferentiabilityKind::NonDifferentiable;
+    return bool (Data & DifferentiableMask);
   }
 
-  FunctionMetadataDifferentiabilityKind getDifferentiabilityKind() const {
-    return FunctionMetadataDifferentiabilityKind(
-        (Data & DifferentiabilityMask) >> DifferentiabilityShift);
+  bool hasGlobalActor() const {
+    return bool (Data & GlobalActorMask);
   }
 
   int_type getIntValue() const {
@@ -896,7 +950,8 @@ class TargetParameterTypeFlags {
     ValueOwnershipMask    = 0x7F,
     VariadicMask          = 0x80,
     AutoClosureMask       = 0x100,
-    NoDerivativeMask      = 0x200
+    NoDerivativeMask      = 0x200,
+    IsolatedMask          = 0x400,
   };
   int_type Data;
 
@@ -923,10 +978,23 @@ public:
         (Data & ~AutoClosureMask) | (isAutoClosure ? AutoClosureMask : 0));
   }
 
+  constexpr TargetParameterTypeFlags<int_type>
+  withNoDerivative(bool isNoDerivative) const {
+    return TargetParameterTypeFlags<int_type>(
+        (Data & ~NoDerivativeMask) | (isNoDerivative ? NoDerivativeMask : 0));
+  }
+
+  constexpr TargetParameterTypeFlags<int_type>
+  withIsolated(bool isIsolated) const {
+    return TargetParameterTypeFlags<int_type>(
+        (Data & ~IsolatedMask) | (isIsolated ? IsolatedMask : 0));
+  }
+
   bool isNone() const { return Data == 0; }
   bool isVariadic() const { return Data & VariadicMask; }
   bool isAutoClosure() const { return Data & AutoClosureMask; }
   bool isNoDerivative() const { return Data & NoDerivativeMask; }
+  bool isIsolated() const { return Data & IsolatedMask; }
 
   ValueOwnership getValueOwnership() const {
     return (ValueOwnership)(Data & ValueOwnershipMask);
@@ -1170,6 +1238,10 @@ namespace SpecialPointerAuthDiscriminators {
   const uint16_t OpaqueReadResumeFunction = 56769;
   const uint16_t OpaqueModifyResumeFunction = 3909;
 
+  /// ObjC class pointers.
+  const uint16_t ObjCISA = 0x6AE1;
+  const uint16_t ObjCSuperclass = 0xB5AB;
+
   /// Resilient class stub initializer callback
   const uint16_t ResilientClassStubInitCallback = 0xC671;
 
@@ -1188,6 +1260,9 @@ namespace SpecialPointerAuthDiscriminators {
 
   /// Swift async context parameter stored in the extended frame info.
   const uint16_t SwiftAsyncContextExtendedFrameEntry = 0xc31a; // = 49946
+
+  /// Dispatch integration.
+  const uint16_t DispatchInvokeFunction = 0xf493; // = 62611
 }
 
 /// The number of arguments that will be passed directly to a generic
@@ -1343,6 +1418,19 @@ class TypeContextDescriptorFlags : public FlagSet<uint16_t> {
 
     // Type-specific flags:
 
+    /// Set if the class is an actor.
+    ///
+    /// Only meaningful for class descriptors.
+    Class_IsActor = 7,
+
+    /// Set if the class is a default actor class.  Note that this is
+    /// based on the best knowledge available to the class; actor
+    /// classes with resilient superclassess might be default actors
+    /// without knowing it.
+    ///
+    /// Only meaningful for class descriptors.
+    Class_IsDefaultActor = 8,
+
     /// The kind of reference that this class makes to its resilient superclass
     /// descriptor.  A TypeReferenceKind.
     ///
@@ -1422,6 +1510,12 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(Class_AreImmediateMembersNegative,
                                 class_areImmediateMembersNegative,
                                 class_setAreImmediateMembersNegative)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_IsDefaultActor,
+                                class_isDefaultActor,
+                                class_setIsDefaultActor)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_IsActor,
+                                class_isActor,
+                                class_setIsActor)
 
   FLAGSET_DEFINE_FIELD_ACCESSORS(Class_ResilientSuperclassReferenceKind,
                                  Class_ResilientSuperclassReferenceKind_width,
@@ -1912,7 +2006,8 @@ enum class JobKind : size_t {
 
   DefaultActorInline = First_Reserved,
   DefaultActorSeparate,
-  DefaultActorOverride
+  DefaultActorOverride,
+  NullaryContinuation
 };
 
 /// The priority of a job.  Higher priorities are larger values.
@@ -1927,8 +2022,45 @@ enum class JobPriority : size_t {
   Unspecified     = 0x00,
 };
 
+/// Flags for task creation.
+class TaskCreateFlags : public FlagSet<size_t> {
+public:
+  enum {
+    Priority       = 0,
+    Priority_width = 8,
+
+    Task_IsChildTask                              = 8,
+    // bit 9 is unused
+    Task_CopyTaskLocals                           = 10,
+    Task_InheritContext                           = 11,
+    Task_EnqueueJob                               = 12,
+    Task_AddPendingGroupTaskUnconditionally       = 13,
+  };
+
+  explicit constexpr TaskCreateFlags(size_t bits) : FlagSet(bits) {}
+  constexpr TaskCreateFlags() {}
+
+  FLAGSET_DEFINE_FIELD_ACCESSORS(Priority, Priority_width, JobPriority,
+                                 getPriority, setPriority)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_IsChildTask,
+                                isChildTask,
+                                setIsChildTask)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_CopyTaskLocals,
+                                copyTaskLocals,
+                                setCopyTaskLocals)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_InheritContext,
+                                inheritContext,
+                                setInheritContext)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_EnqueueJob,
+                                enqueueJob,
+                                setEnqueueJob)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_AddPendingGroupTaskUnconditionally,
+                                addPendingGroupTaskUnconditionally,
+                                setAddPendingGroupTaskUnconditionally)
+};
+
 /// Flags for schedulable jobs.
-class JobFlags : public FlagSet<size_t> {
+class JobFlags : public FlagSet<uint32_t> {
 public:
   enum {
     Kind           = 0,
@@ -1941,12 +2073,14 @@ public:
 
     // Kind-specific flags.
 
-    Task_IsChildTask      = 24,
-    Task_IsFuture         = 25,
-    Task_IsGroupChildTask = 26,
+    Task_IsChildTask           = 24,
+    Task_IsFuture              = 25,
+    Task_IsGroupChildTask      = 26,
+    // 27 is currently unused
+    Task_IsAsyncLetTask        = 28,
   };
 
-  explicit JobFlags(size_t bits) : FlagSet(bits) {}
+  explicit JobFlags(uint32_t bits) : FlagSet(bits) {}
   JobFlags(JobKind kind) { setKind(kind); }
   JobFlags(JobKind kind, JobPriority priority) {
     setKind(kind);
@@ -1973,6 +2107,9 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(Task_IsGroupChildTask,
                                 task_isGroupChildTask,
                                 task_setIsGroupChildTask)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_IsAsyncLetTask,
+                                task_isAsyncLetTask,
+                                task_setIsAsyncLetTask)
 };
 
 /// Kinds of task status record.
@@ -2002,6 +2139,16 @@ enum class TaskStatusRecordKind : uint8_t {
   Private_RecordLock = 192
 };
 
+/// Kinds of option records that can be passed to creating asynchronous tasks.
+enum class TaskOptionRecordKind : uint8_t {
+  /// Request a task to be kicked off, or resumed, on a specific executor.
+  Executor  = 0,
+  /// Request a child task to be part of a specific task group.
+  TaskGroup = 1,
+  /// Request a child task for an 'async let'.
+  AsyncLet  = 2,
+};
+
 /// Flags for cancellation records.
 class TaskStatusRecordFlags : public FlagSet<size_t> {
 public:
@@ -2020,6 +2167,24 @@ public:
                                  getKind, setKind)
 };
 
+/// Flags for task option records.
+class TaskOptionRecordFlags : public FlagSet<size_t> {
+public:
+  enum {
+    Kind           = 0,
+    Kind_width     = 8,
+  };
+
+  explicit TaskOptionRecordFlags(size_t bits) : FlagSet(bits) {}
+  constexpr TaskOptionRecordFlags() {}
+  TaskOptionRecordFlags(TaskOptionRecordKind kind) {
+    setKind(kind);
+  }
+
+  FLAGSET_DEFINE_FIELD_ACCESSORS(Kind, Kind_width, TaskOptionRecordKind,
+                                 getKind, setKind)
+};
+
 /// Kinds of async context.
 enum class AsyncContextKind {
   /// An ordinary asynchronous function.
@@ -2027,6 +2192,9 @@ enum class AsyncContextKind {
 
   /// A context which can yield to its caller.
   Yielding         = 1,
+
+  /// A continuation context.
+  Continuation     = 2,
 
   // Other kinds are reserved for interesting special
   // intermediate contexts.
@@ -2070,6 +2238,55 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(ShouldNotDeallocate,
                                 shouldNotDeallocateInCallee,
                                 setShouldNotDeallocateInCallee)
+};
+
+/// Flags passed to swift_continuation_init.
+class AsyncContinuationFlags : public FlagSet<size_t> {
+public:
+  enum {
+    CanThrow            = 0,
+    HasExecutorOverride = 1,
+    IsPreawaited        = 2,
+  };
+
+  explicit AsyncContinuationFlags(size_t bits) : FlagSet(bits) {}
+  constexpr AsyncContinuationFlags() {}
+
+  /// Whether the continuation is permitted to throw.
+  FLAGSET_DEFINE_FLAG_ACCESSORS(CanThrow, canThrow, setCanThrow)
+
+  /// Whether the continuation should be resumed on a different
+  /// executor than the current one.  swift_continuation_init
+  /// will not initialize ResumeToExecutor if this is set.
+  FLAGSET_DEFINE_FLAG_ACCESSORS(HasExecutorOverride,
+                                hasExecutorOverride,
+                                setHasExecutorOverride)
+
+  /// Whether the continuation is "pre-awaited".  If so, it should
+  /// be set up in the already-awaited state, and so resumptions
+  /// will immediately schedule the continuation to begin
+  /// asynchronously.
+  FLAGSET_DEFINE_FLAG_ACCESSORS(IsPreawaited,
+                                isPreawaited,
+                                setIsPreawaited)
+};
+
+/// Status values for a continuation.  Note that the "not yet"s in
+/// the description below aren't quite right because the system
+/// does not actually promise to update the status before scheduling
+/// the task.  This is because the continuation context is immediately
+/// invalidated once the task starts running again, so the window in
+/// which we can usefully protect against (say) double-resumption may
+/// be very small.
+enum class ContinuationStatus : size_t {
+  /// The continuation has not yet been awaited or resumed.
+  Pending = 0,
+
+  /// The continuation has already been awaited, but not yet resumed.
+  Awaited = 1,
+
+  /// The continuation has already been resumed, but not yet awaited.
+  Resumed = 2
 };
 
 } // end namespace swift

@@ -414,8 +414,11 @@ public:
 
   const FunctionTypeRef *createFunctionType(
       llvm::ArrayRef<remote::FunctionParam<const TypeRef *>> params,
-      const TypeRef *result, FunctionTypeFlags flags) {
-    return FunctionTypeRef::create(*this, params, result, flags);
+      const TypeRef *result, FunctionTypeFlags flags,
+      FunctionMetadataDifferentiabilityKind diffKind,
+      const TypeRef *globalActor) {
+    return FunctionTypeRef::create(
+        *this, params, result, flags, diffKind, globalActor);
   }
 
   const FunctionTypeRef *createImplFunctionType(
@@ -447,11 +450,32 @@ public:
       break;
     }
 
-    funcFlags = funcFlags.withConcurrent(flags.isConcurrent());
+    funcFlags = funcFlags.withConcurrent(flags.isSendable());
     funcFlags = funcFlags.withAsync(flags.isAsync());
+    funcFlags = funcFlags.withDifferentiable(flags.isDifferentiable());
+
+    FunctionMetadataDifferentiabilityKind diffKind;
+    switch (flags.getDifferentiabilityKind()) {
+    case ImplFunctionDifferentiabilityKind::NonDifferentiable:
+      diffKind = FunctionMetadataDifferentiabilityKind::NonDifferentiable;
+      break;
+    case ImplFunctionDifferentiabilityKind::Forward:
+      diffKind = FunctionMetadataDifferentiabilityKind::Forward;
+      break;
+    case ImplFunctionDifferentiabilityKind::Reverse:
+      diffKind = FunctionMetadataDifferentiabilityKind::Reverse;
+      break;
+    case ImplFunctionDifferentiabilityKind::Normal:
+      diffKind = FunctionMetadataDifferentiabilityKind::Normal;
+      break;
+    case ImplFunctionDifferentiabilityKind::Linear:
+      diffKind = FunctionMetadataDifferentiabilityKind::Linear;
+      break;
+    }
 
     auto result = createTupleType({}, "");
-    return FunctionTypeRef::create(*this, {}, result, funcFlags);
+    return FunctionTypeRef::create(
+        *this, {}, result, funcFlags, diffKind, nullptr);
   }
 
   const ProtocolCompositionTypeRef *
@@ -609,7 +633,7 @@ public:
 private:
   std::vector<ReflectionInfo> ReflectionInfos;
     
-  std::string normalizeReflectionName(RemoteRef<char> name);
+  llvm::Optional<std::string> normalizeReflectionName(RemoteRef<char> name);
   bool reflectionNameMatches(RemoteRef<char> reflectionName,
                              StringRef searchName);
 
@@ -633,7 +657,7 @@ private:
   // TypeRefBuilder struct, to isolate its template-ness from the rest of
   // TypeRefBuilder.
   unsigned PointerSize;
-  std::function<Demangle::Node * (RemoteRef<char>)>
+  std::function<Demangle::Node * (RemoteRef<char>, bool)>
     TypeRefDemangler;
   std::function<const TypeRef* (uint64_t, unsigned)>
     OpaqueUnderlyingTypeReader;
@@ -644,10 +668,10 @@ public:
     : TC(*this),
       PointerSize(sizeof(typename Runtime::StoredPointer)),
       TypeRefDemangler(
-      [this, &reader](RemoteRef<char> string) -> Demangle::Node * {
+      [this, &reader](RemoteRef<char> string, bool useOpaqueTypeSymbolicReferences) -> Demangle::Node * {
         return reader.demangle(string,
                                remote::MangledNameKind::Type,
-                               Dem, /*useOpaqueTypeSymbolicReferences*/ true);
+                               Dem, useOpaqueTypeSymbolicReferences);
       }),
       OpaqueUnderlyingTypeReader(
       [&reader](uint64_t descriptorAddr, unsigned ordinal) -> const TypeRef* {
@@ -656,8 +680,9 @@ public:
       })
   {}
 
-  Demangle::Node *demangleTypeRef(RemoteRef<char> string) {
-    return TypeRefDemangler(string);
+  Demangle::Node *demangleTypeRef(RemoteRef<char> string,
+                                  bool useOpaqueTypeSymbolicReferences = true) {
+    return TypeRefDemangler(string, useOpaqueTypeSymbolicReferences);
   }
 
   TypeConverter &getTypeConverter() { return TC; }

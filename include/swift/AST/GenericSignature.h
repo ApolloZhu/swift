@@ -33,6 +33,7 @@ namespace swift {
 class GenericSignatureBuilder;
 class ProtocolConformanceRef;
 class ProtocolType;
+class RequirementMachine;
 class SubstitutionMap;
 class GenericEnvironment;
 
@@ -80,6 +81,7 @@ private:
   ConformanceAccessPath(ArrayRef<Entry> path) : path(path) {}
 
   friend class GenericSignatureImpl;
+  friend class GenericSignatureBuilder;
 
 public:
   typedef const Entry *const_iterator;
@@ -87,6 +89,8 @@ public:
 
   const_iterator begin() const { return path.begin(); }
   const_iterator end() const { return path.end(); }
+
+  const Entry &back() const { return path.back(); }
 
   void print(raw_ostream &OS) const;
 
@@ -175,7 +179,7 @@ public:
   /// requirements, first canonicalizing the types.
   static CanGenericSignature
   getCanonical(TypeArrayView<GenericTypeParamType> params,
-               ArrayRef<Requirement> requirements, bool skipValidation = false);
+               ArrayRef<Requirement> requirements);
 
 public:
   CanGenericSignature(std::nullptr_t) : GenericSignature(nullptr) {}
@@ -300,6 +304,9 @@ public:
   /// Retrieve the generic signature builder for the given generic signature.
   GenericSignatureBuilder *getGenericSignatureBuilder() const;
 
+  /// Retrieve the requirement machine for the given generic signature.
+  RequirementMachine *getRequirementMachine() const;
+
   /// Returns the generic environment that provides fresh contextual types
   /// (archetypes) that correspond to the interface types in this generic
   /// signature.
@@ -342,6 +349,8 @@ public:
   ///
   /// The type parameters must be known to not be concrete within the context.
   bool areSameTypeParameterInContext(Type type1, Type type2) const;
+  bool areSameTypeParameterInContext(Type type1, Type type2,
+                                     GenericSignatureBuilder &builder) const;
 
   /// Determine if \c sig can prove \c requirement, meaning that it can deduce
   /// T: Foo or T == U (etc.) with the information it knows. This includes
@@ -360,12 +369,8 @@ public:
   /// Return the canonical version of the given type under this generic
   /// signature.
   CanType getCanonicalTypeInContext(Type type) const;
-  bool isCanonicalTypeInContext(Type type) const;
 
-  /// Return the canonical version of the given type under this generic
-  /// signature.
-  CanType getCanonicalTypeInContext(Type type,
-                                    GenericSignatureBuilder &builder) const;
+  bool isCanonicalTypeInContext(Type type) const;
   bool isCanonicalTypeInContext(Type type,
                                 GenericSignatureBuilder &builder) const;
 

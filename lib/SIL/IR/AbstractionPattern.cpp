@@ -317,7 +317,7 @@ bool AbstractionPattern::matchesTuple(CanTupleType substType) {
   case Kind::ClangType:
   case Kind::Type:
   case Kind::Discard: {
-    if (isTypeParameter())
+    if (isTypeParameterOrOpaqueArchetype())
       return true;
     auto type = getType();
     if (auto tuple = dyn_cast<TupleType>(type))
@@ -661,6 +661,7 @@ AbstractionPattern::getObjCMethodAsyncCompletionHandlerType(
   case Kind::ObjCCompletionHandlerArgumentsType:
     swift_unreachable("not appropriate for this kind");
   }
+  llvm_unreachable("covered switch");
 }
 
 AbstractionPattern

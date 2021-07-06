@@ -377,6 +377,7 @@ public:
     case SILArgumentConvention::Indirect_Out:
       llvm_unreachable("partial_apply cannot have an @out operand");
     }
+    llvm_unreachable("covered switch");
   }
 
   /// Return true if 'self' is an applied argument.
@@ -452,9 +453,11 @@ public:
     case ApplySiteKind::TryApplyInst:
       return cast<TryApplyInst>(Inst)->getApplyOptions();
     case ApplySiteKind::PartialApplyInst:
-      llvm_unreachable("Unhandled case");
+      return ApplyOptions();
     }
+    llvm_unreachable("covered switch");
   }
+
   /// Return whether the given apply is of a formally-throwing function
   /// which is statically known not to throw.
   bool isNonThrowing() const {

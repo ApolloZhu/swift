@@ -2,20 +2,28 @@
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
+
+// rdar://76038845
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: back_deployment_runtime
+
 // UNSUPPORTED: OS=windows-msvc
 
 struct Boom: Error {}
 struct IgnoredBoom: Error {}
 
+@available(SwiftStdlib 5.5, *)
 func one() async -> Int { 1 }
 
+@available(SwiftStdlib 5.5, *)
 func boom() async throws -> Int {
   throw Boom()
 }
 
+@available(SwiftStdlib 5.5, *)
 func test_taskGroup_throws() async {
-  let got: Int = await Task.withGroup(resultType: Int.self) { group in
-    await group.add { try await boom()  }
+  let got: Int = try await withThrowingTaskGroup(of: Int.self) { group in
+    group.spawn { try await boom()  }
 
     do {
       while let r = try await group.next() {
@@ -27,7 +35,7 @@ func test_taskGroup_throws() async {
       let gc = group.isCancelled
       print("group cancelled: \(gc)")
 
-      await group.add { () async -> Int in
+      group.spawn { () async -> Int in
         let c = Task.isCancelled
         print("task 3 (cancelled: \(c))")
         return 3
@@ -55,6 +63,7 @@ func test_taskGroup_throws() async {
 }
 
 
+@available(SwiftStdlib 5.5, *)
 @main struct Main {
   static func main() async {
     await test_taskGroup_throws()

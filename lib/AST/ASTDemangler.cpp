@@ -343,7 +343,8 @@ Type ASTBuilder::createTupleType(ArrayRef<Type> eltTypes, StringRef labels) {
 
 Type ASTBuilder::createFunctionType(
     ArrayRef<Demangle::FunctionParam<Type>> params,
-    Type output, FunctionTypeFlags flags) {
+    Type output, FunctionTypeFlags flags,
+    FunctionMetadataDifferentiabilityKind diffKind, Type globalActor) {
   // The result type must be materializable.
   if (!output->isMaterializable()) return Type();
 
@@ -383,11 +384,11 @@ Type ASTBuilder::createFunctionType(
     break;
   }
 
-  DifferentiabilityKind diffKind;
-  switch (flags.getDifferentiabilityKind()) {
+  DifferentiabilityKind resultDiffKind;
+  switch (diffKind.Value) {
   #define SIMPLE_CASE(CASE) \
       case FunctionMetadataDifferentiabilityKind::CASE: \
-        diffKind = DifferentiabilityKind::CASE; break;
+        resultDiffKind = DifferentiabilityKind::CASE; break;
   SIMPLE_CASE(NonDifferentiable)
   SIMPLE_CASE(Forward)
   SIMPLE_CASE(Reverse)
@@ -408,8 +409,10 @@ Type ASTBuilder::createFunctionType(
 
   auto einfo =
       FunctionType::ExtInfoBuilder(representation, noescape, flags.isThrowing(),
-                                   diffKind, clangFunctionType)
+                                   resultDiffKind, clangFunctionType,
+                                   globalActor)
           .withAsync(flags.isAsync())
+          .withConcurrent(flags.isSendable())
           .build();
 
   return FunctionType::get(funcParams, output, einfo);
@@ -565,7 +568,7 @@ Type ASTBuilder::createImplFunctionType(
   }
   auto einfo = SILFunctionType::ExtInfoBuilder(
                    representation, flags.isPseudogeneric(), !flags.isEscaping(),
-                   flags.isConcurrent(), flags.isAsync(), diffKind, clangFnType)
+                   flags.isSendable(), flags.isAsync(), diffKind, clangFnType)
                    .build();
 
   return SILFunctionType::get(genericSig, einfo, funcCoroutineKind,
@@ -1053,6 +1056,15 @@ ASTBuilder::findTypeDecl(DeclContext *dc,
     // If we already have a viable result, it's ambiguous, so give up.
     if (result) return nullptr;
     result = candidate;
+  }
+
+  // If we looked into the standard library module, but didn't find anything,
+  // try the _Concurrency module, which is also mangled into the Swift module.
+  if (!result && !dc->getParent() && module->isStdlibModule()) {
+    ASTContext &ctx = module->getASTContext();
+    if (auto concurrencyModule = ctx.getLoadedModule(ctx.Id_Concurrency)) {
+      return findTypeDecl(concurrencyModule, name, privateDiscriminator, kind);
+    }
   }
 
   return result;

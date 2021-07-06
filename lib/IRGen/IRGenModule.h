@@ -732,14 +732,19 @@ public:
   llvm::PointerType *AsyncFunctionPointerPtrTy;
   llvm::PointerType *SwiftContextPtrTy;
   llvm::PointerType *SwiftTaskPtrTy;
+  llvm::PointerType *SwiftAsyncLetPtrTy;
+  llvm::IntegerType *SwiftTaskOptionRecordPtrTy;
   llvm::PointerType *SwiftTaskGroupPtrTy;
+  llvm::StructType  *SwiftTaskOptionRecordTy;
+  llvm::StructType  *SwiftTaskGroupTaskOptionRecordTy;
   llvm::PointerType *SwiftJobPtrTy;
-  llvm::PointerType *SwiftExecutorPtrTy;
+  llvm::IntegerType *ExecutorFirstTy;
+  llvm::IntegerType *ExecutorSecondTy;
   llvm::FunctionType *TaskContinuationFunctionTy;
   llvm::PointerType *TaskContinuationFunctionPtrTy;
   llvm::StructType *AsyncTaskAndContextTy;
-  llvm::StructType *AsyncContinuationContextTy;
-  llvm::PointerType *AsyncContinuationContextPtrTy;
+  llvm::StructType *ContinuationAsyncContextTy;
+  llvm::PointerType *ContinuationAsyncContextPtrTy;
   llvm::StructType *DifferentiabilityWitnessTy; // { i8*, i8* }
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
@@ -777,6 +782,7 @@ public:
   Alignment getTypeMetadataAlignment() const {
     return getPointerAlignment();
   }
+  Alignment getAsyncContextAlignment() const;
 
   /// Return the offset, relative to the address point, of the start of the
   /// type-specific members of an enum metadata.
@@ -907,7 +913,7 @@ public:
   const TypeInfo &getTypeMetadataPtrTypeInfo();
   const TypeInfo &getSwiftContextPtrTypeInfo();
   const TypeInfo &getTaskContinuationFunctionPtrTypeInfo();
-  const TypeInfo &getSwiftExecutorPtrTypeInfo();
+  const LoadableTypeInfo &getExecutorTypeInfo();
   const TypeInfo &getObjCClassPtrTypeInfo();
   const LoadableTypeInfo &getOpaqueStorageTypeInfo(Size size, Alignment align);
   const LoadableTypeInfo &
@@ -1040,7 +1046,8 @@ public:
                                             llvm::Type *resultType,
                                             ArrayRef<llvm::Type*> paramTypes,
                         llvm::function_ref<void(IRGenFunction &IGF)> generate,
-                        bool setIsNoInline = false);
+                        bool setIsNoInline = false,
+                        bool forPrologue = false);
 
   llvm::Constant *getOrCreateRetainFunction(const TypeInfo &objectTI, SILType t,
                               llvm::Type *llvmType, Atomicity atomicity);
@@ -1147,9 +1154,6 @@ private:
   /// List of ExtensionDecls corresponding to the generated
   /// categories.
   SmallVector<ExtensionDecl*, 4> ObjCCategoryDecls;
-
-  /// List of fields descriptors to register in runtime.
-  SmallVector<llvm::GlobalVariable *, 4> FieldDescriptors;
 
   /// Map of Objective-C protocols and protocol references, bitcast to i8*.
   /// The interesting global variables relating to an ObjC protocol.
@@ -1294,7 +1298,7 @@ public:
   ClassDecl *getSwiftNativeNSObjectDecl();
   llvm::Module *getModule() const;
   llvm::AttributeList getAllocAttrs();
-
+  llvm::Constant *getDeletedAsyncMethodErrorAsyncFunctionPointer();
   bool isStandardLibrary() const;
 
 private:
@@ -1389,7 +1393,7 @@ public:
   void finishEmitAfterTopLevel();
 
   Signature getSignature(CanSILFunctionType fnType,
-                         bool suppressGenerics = false);
+                         bool useSpecialConvention = false);
   llvm::FunctionType *getFunctionType(CanSILFunctionType type,
                                       llvm::AttributeList &attrs,
                                       ForeignFunctionInfo *foreignInfo=nullptr);

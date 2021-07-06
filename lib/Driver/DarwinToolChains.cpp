@@ -255,8 +255,11 @@ toolchains::Darwin::addLinkerInputArgs(InvocationInfo &II,
     addPrimaryInputsOfType(Arguments, context.Inputs, context.Args,
                            file_types::TY_Object);
     addPrimaryInputsOfType(Arguments, context.Inputs, context.Args,
+                           file_types::TY_TBD);
+    addPrimaryInputsOfType(Arguments, context.Inputs, context.Args,
                            file_types::TY_LLVM_BC);
     addInputsOfType(Arguments, context.InputActions, file_types::TY_Object);
+    addInputsOfType(Arguments, context.InputActions, file_types::TY_TBD);
     addInputsOfType(Arguments, context.InputActions, file_types::TY_LLVM_BC);
   }
 
@@ -901,9 +904,15 @@ void
 toolchains::Darwin::validateArguments(DiagnosticEngine &diags,
                                       const llvm::opt::ArgList &args,
                                       StringRef defaultTarget) const {
-  // Validating arclite library path when link-objc-runtime.
-  validateLinkObjcRuntimeARCLiteLib(*this, diags, args);
-  
+  if (!getDriver().isDummyDriverForFrontendInvocation()) {
+    // Validating arclite library path when link-objc-runtime.
+    // If the driver is just set up to retrieve the swift-frontend invocation,
+    // we don't care about link-time, so we can skip this step, which may be
+    // expensive since it might call to `xcrun` to find `clang` and `arclite`
+    // relative to `clang`.
+    validateLinkObjcRuntimeARCLiteLib(*this, diags, args);
+  }
+
   // Validating apple platforms deployment targets.
   validateDeploymentTarget(*this, diags, args);
   validateTargetVariant(*this, diags, args, defaultTarget);

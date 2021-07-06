@@ -84,7 +84,7 @@ getStoredPropertiesForDifferentiation(
       continue;
     auto varType = DC->mapTypeIntoContext(vd->getValueInterfaceType());
     auto conformance = TypeChecker::conformsToProtocol(
-        varType, diffableProto, nominal);
+        varType, diffableProto, DC->getParentModule());
     if (!conformance)
       continue;
     // Skip `let` stored properties with a mutating `move(by:)` if requested.
@@ -113,11 +113,12 @@ static StructDecl *convertToStructDecl(ValueDecl *v) {
 /// for the given interface type and declaration context.
 static Type getTangentVectorInterfaceType(Type contextualType,
                                           DeclContext *DC) {
-  auto &C = contextualType->getASTContext();
+  auto &C = DC->getASTContext();
   auto *diffableProto = C.getProtocol(KnownProtocolKind::Differentiable);
   assert(diffableProto && "`Differentiable` protocol not found");
   auto conf =
-      TypeChecker::conformsToProtocol(contextualType, diffableProto, DC);
+      TypeChecker::conformsToProtocol(contextualType, diffableProto,
+                                      DC->getParentModule());
   assert(conf && "Contextual type must conform to `Differentiable`");
   if (!conf)
     return nullptr;
@@ -139,7 +140,8 @@ static bool canDeriveTangentVectorAsSelf(NominalTypeDecl *nominal,
   auto *diffableProto = C.getProtocol(KnownProtocolKind::Differentiable);
   auto *addArithProto = C.getProtocol(KnownProtocolKind::AdditiveArithmetic);
   // `Self` must conform to `AdditiveArithmetic`.
-  if (!TypeChecker::conformsToProtocol(nominalTypeInContext, addArithProto, DC))
+  if (!TypeChecker::conformsToProtocol(nominalTypeInContext, addArithProto,
+                                       DC->getParentModule()))
     return false;
   for (auto *field : nominal->getStoredProperties()) {
     // `Self` must not have any `@noDerivative` stored properties.
@@ -147,7 +149,8 @@ static bool canDeriveTangentVectorAsSelf(NominalTypeDecl *nominal,
       return false;
     // `Self` must have all stored properties satisfy `Self == TangentVector`.
     auto fieldType = DC->mapTypeIntoContext(field->getValueInterfaceType());
-    auto conf = TypeChecker::conformsToProtocol(fieldType, diffableProto, DC);
+    auto conf = TypeChecker::conformsToProtocol(fieldType, diffableProto,
+                                                DC->getParentModule());
     if (!conf)
       return false;
     auto tangentType = conf.getTypeWitnessByName(fieldType, C.Id_TangentVector);
@@ -210,7 +213,8 @@ bool DerivedConformance::canDeriveDifferentiable(NominalTypeDecl *nominal,
     if (v->getInterfaceType()->hasError())
       return false;
     auto varType = DC->mapTypeIntoContext(v->getValueInterfaceType());
-    return (bool)TypeChecker::conformsToProtocol(varType, diffableProto, DC);
+    return (bool)TypeChecker::conformsToProtocol(varType, diffableProto,
+                                                 DC->getParentModule());
   });
 }
 
@@ -337,51 +341,6 @@ static ValueDecl *deriveDifferentiable_move(DerivedConformance &derived) {
       C.TheEmptyTupleType, {deriveBodyDifferentiable_move, nullptr});
 }
 
-/// Pushes all the protocols inherited, directly or transitively, by `decl` to `protos`.
-///
-/// Precondition: `decl` is a nominal type decl or an extension decl.
-void getInheritedProtocols(Decl *decl, SmallPtrSetImpl<ProtocolDecl *> &protos) {
-  ArrayRef<TypeLoc> inheritedTypeLocs;
-  if (auto *nominalDecl = dyn_cast<NominalTypeDecl>(decl))
-    inheritedTypeLocs = nominalDecl->getInherited();
-  else if (auto *extDecl = dyn_cast<ExtensionDecl>(decl))
-    inheritedTypeLocs = extDecl->getInherited();
-  else
-    llvm_unreachable("conformance is not a nominal or an extension");
-
-  std::function<void(Type)> handleInheritedType;
-
-  auto handleProto = [&](ProtocolType *proto) -> void {
-    proto->getDecl()->walkInheritedProtocols([&](ProtocolDecl *p) -> TypeWalker::Action {
-      protos.insert(p);
-      return TypeWalker::Action::Continue;
-    });
-  };
-
-  auto handleProtoComp = [&](ProtocolCompositionType *comp) -> void {
-    for (auto ty : comp->getMembers())
-      handleInheritedType(ty);
-  };
-
-  handleInheritedType = [&](Type ty) -> void {
-    if (auto *proto = ty->getAs<ProtocolType>())
-      handleProto(proto);
-    else if (auto *comp = ty->getAs<ProtocolCompositionType>())
-      handleProtoComp(comp);
-  };
-
-  for (auto loc : inheritedTypeLocs) {
-    if (loc.getTypeRepr())
-      handleInheritedType(
-          TypeResolution::forStructural(cast<DeclContext>(decl), None,
-                                        /*unboundTyOpener*/ nullptr,
-                                        /*placeholderHandler*/ nullptr)
-              .resolveType(loc.getTypeRepr()));
-    else
-      handleInheritedType(loc.getType());
-  }
-}
-
 /// Return associated `TangentVector` struct for a nominal type, if it exists.
 /// If not, synthesize the struct.
 static StructDecl *
@@ -409,12 +368,14 @@ getOrSynthesizeTangentVectorStruct(DerivedConformance &derived, Identifier id) {
   // Note that, for example, this will always find `AdditiveArithmetic` and `Differentiable` because
   // the `Differentiable` protocol itself requires that its `TangentVector` conforms to
   // `AdditiveArithmetic` and `Differentiable`.
-  llvm::SmallPtrSet<ProtocolDecl *, 4> tvDesiredProtos;
-  llvm::SmallPtrSet<ProtocolDecl *, 4> conformanceInheritedProtos;
-  getInheritedProtocols(derived.ConformanceDecl, conformanceInheritedProtos);
+  llvm::SmallSetVector<ProtocolDecl *, 4> tvDesiredProtos;
+
   auto *diffableProto = C.getProtocol(KnownProtocolKind::Differentiable);
   auto *tvAssocType = diffableProto->getAssociatedType(C.Id_TangentVector);
-  for (auto proto : conformanceInheritedProtos) {
+
+  auto localProtos = cast<IterableDeclContext>(derived.ConformanceDecl)
+      ->getLocalProtocols();
+  for (auto proto : localProtos) {
     for (auto req : proto->getRequirementSignature()) {
       if (req.getKind() != RequirementKind::Conformance)
         continue;
@@ -516,18 +477,12 @@ getOrSynthesizeTangentVectorStruct(DerivedConformance &derived, Identifier id) {
   auto *tangentEqualsSelfAlias = new (C) TypeAliasDecl(
       SourceLoc(), SourceLoc(), C.Id_TangentVector, SourceLoc(),
       /*GenericParams*/ nullptr, structDecl);
-  tangentEqualsSelfAlias->setUnderlyingType(structDecl->getSelfTypeInContext());
-  tangentEqualsSelfAlias->setAccess(structDecl->getFormalAccess());
+  tangentEqualsSelfAlias->setUnderlyingType(structDecl->getDeclaredInterfaceType());
+  tangentEqualsSelfAlias->copyFormalAccessFrom(structDecl,
+                                               /*sourceIsParentContext*/ true);
   tangentEqualsSelfAlias->setImplicit();
   tangentEqualsSelfAlias->setSynthesized();
   structDecl->addMember(tangentEqualsSelfAlias);
-
-  // If nominal type is `@usableFromInline`, also mark `TangentVector` struct.
-  if (nominal->getAttrs().hasAttribute<UsableFromInlineAttr>()) {
-    structDecl->getAttrs().add(new (C) UsableFromInlineAttr(/*implicit*/ true));
-    tangentEqualsSelfAlias->getAttrs().add(
-        new (C) UsableFromInlineAttr(/*implicit*/ true));
-  }
 
   // The implicit memberwise constructor must be explicitly created so that it
   // can called in `AdditiveArithmetic` and `Differentiable` methods. Normally,
@@ -539,6 +494,9 @@ getOrSynthesizeTangentVectorStruct(DerivedConformance &derived, Identifier id) {
     member->setImplicit();
 
   derived.addMembersToConformanceContext({structDecl});
+
+  TypeChecker::checkConformancesInContext(structDecl);
+
   return structDecl;
 }
 
@@ -597,7 +555,8 @@ static void checkAndDiagnoseImplicitNoDerivative(ASTContext &Context,
     // Check whether to diagnose stored property.
     auto varType = DC->mapTypeIntoContext(vd->getValueInterfaceType());
     auto diffableConformance =
-        TypeChecker::conformsToProtocol(varType, diffableProto, nominal);
+        TypeChecker::conformsToProtocol(varType, diffableProto,
+                                        DC->getParentModule());
     // If stored property should not be diagnosed, continue.
     if (diffableConformance && 
         canInvokeMoveByOnProperty(vd, diffableConformance))

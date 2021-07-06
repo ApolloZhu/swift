@@ -446,6 +446,8 @@ namespace {
     RValue visitConditionalBridgeFromObjCExpr(ConditionalBridgeFromObjCExpr *E,
                                               SGFContext C);
     RValue visitArchetypeToSuperExpr(ArchetypeToSuperExpr *E, SGFContext C);
+    RValue visitUnresolvedTypeConversionExpr(UnresolvedTypeConversionExpr *E,
+                                             SGFContext C);
     RValue visitFunctionConversionExpr(FunctionConversionExpr *E,
                                        SGFContext C);
     RValue visitCovariantFunctionConversionExpr(
@@ -956,6 +958,12 @@ RValue RValueEmitter::visitSuperRefExpr(SuperRefExpr *E, SGFContext C) {
   return RValue(SGF, E, result);
 }
 
+RValue RValueEmitter::
+visitUnresolvedTypeConversionExpr(UnresolvedTypeConversionExpr *E,
+                                  SGFContext C) {
+  llvm_unreachable("invalid code made its way into SILGen");
+}
+
 RValue RValueEmitter::visitOtherConstructorDeclRefExpr(
                                 OtherConstructorDeclRefExpr *E, SGFContext C) {
   // This should always be a child of an ApplyExpr and so will be emitted by
@@ -1381,13 +1389,12 @@ visitCollectionUpcastConversionExpr(CollectionUpcastConversionExpr *E,
   auto toCollection = E->getType()->getCanonicalType();
 
   // Get the intrinsic function.
-  auto &ctx = SGF.getASTContext();
   FuncDecl *fn = nullptr;
-  if (fromCollection->getAnyNominal() == ctx.getArrayDecl()) {
+  if (fromCollection->isArray()) {
     fn = SGF.SGM.getArrayForceCast(loc);
-  } else if (fromCollection->getAnyNominal() == ctx.getDictionaryDecl()) {
+  } else if (fromCollection->isDictionary()) {
     fn = SGF.SGM.getDictionaryUpCast(loc);
-  } else if (fromCollection->getAnyNominal() == ctx.getSetDecl()) {
+  } else if (fromCollection->isSet()) {
     fn = SGF.SGM.getSetUpCast(loc);
   } else {
     llvm_unreachable("unsupported collection upcast kind");
@@ -1561,10 +1568,8 @@ ManagedValue emitCFunctionPointer(SILGenFunction &SGF,
     // Ensure that weak captures are in a separate scope.
     DebugScope scope(SGF, CleanupLocation(captureList));
     // CaptureListExprs evaluate their bound variables.
-    for (auto capture : captureList->getCaptureList()) {
-      SGF.visit(capture.Var);
-      SGF.visit(capture.Init);
-    }
+    for (auto capture : captureList->getCaptureList())
+      SGF.visit(capture.PBD);
 
     // Emit the closure body.
     auto *closure = captureList->getClosureBody();
@@ -1860,8 +1865,7 @@ RValue SILGenFunction::emitAnyHashableErasure(SILLocation loc,
   // Ensure that the intrinsic function exists.
   auto convertFn = SGM.getConvertToAnyHashable(loc);
   if (!convertFn)
-    return emitUndefRValue(
-        loc, getASTContext().getAnyHashableDecl()->getDeclaredInterfaceType());
+    return emitUndefRValue(loc, getASTContext().getAnyHashableType());
 
   // Construct the substitution for T: Hashable.
   auto subMap = SubstitutionMap::getProtocolSubstitutions(
@@ -2199,6 +2203,7 @@ RValue RValueEmitter::visitMemberRefExpr(MemberRefExpr *e,
 RValue RValueEmitter::visitDynamicMemberRefExpr(DynamicMemberRefExpr *E,
                                                 SGFContext C) {
   assert(!E->isImplicitlyAsync() && "an actor-isolated @objc member?");
+  assert(!E->isImplicitlyThrows() && "an distributed-actor-isolated @objc member?");
   return SGF.emitDynamicMemberRefExpr(E, C);
 }
 
@@ -2221,6 +2226,7 @@ RValue RValueEmitter::visitSubscriptExpr(SubscriptExpr *E, SGFContext C) {
 RValue RValueEmitter::visitDynamicSubscriptExpr(
                                       DynamicSubscriptExpr *E, SGFContext C) {
   assert(!E->isImplicitlyAsync() && "an actor-isolated @objc member?");
+  assert(!E->isImplicitlyThrows() && "an distributed-actor-isolated @objc member?");
   return SGF.emitDynamicSubscriptExpr(E, C);
 }
 
@@ -2410,10 +2416,8 @@ RValue RValueEmitter::visitCaptureListExpr(CaptureListExpr *E, SGFContext C) {
   // Ensure that weak captures are in a separate scope.
   DebugScope scope(SGF, CleanupLocation(E));
   // CaptureListExprs evaluate their bound variables.
-  for (auto capture : E->getCaptureList()) {
-    SGF.visit(capture.Var);
-    SGF.visit(capture.Init);
-  }
+  for (auto capture : E->getCaptureList())
+    SGF.visit(capture.PBD);
 
   // Then they evaluate to their body.
   return visit(E->getClosureBody(), C);
@@ -2737,8 +2741,7 @@ static SILFunction *getOrCreateKeyPathGetter(SILGenModule &SGM,
     params.push_back({loweredBaseTy, paramConvention});
     auto &C = SGM.getASTContext();
     if (!indexes.empty())
-      params.push_back({C.getUnsafeRawPointerDecl()->getDeclaredInterfaceType()
-                                                   ->getCanonicalType(),
+      params.push_back({C.getUnsafeRawPointerType()->getCanonicalType(),
                         ParameterConvention::Direct_Unowned});
     
     SILResultInfo result(loweredPropTy, ResultConvention::Indirect);
@@ -2888,8 +2891,7 @@ static SILFunction *getOrCreateKeyPathSetter(SILGenModule &SGM,
                         : paramConvention});
     // indexes
     if (!indexes.empty())
-      params.push_back({C.getUnsafeRawPointerDecl()->getDeclaredInterfaceType()
-                                                   ->getCanonicalType(),
+      params.push_back({C.getUnsafeRawPointerType()->getCanonicalType(),
                         ParameterConvention::Direct_Unowned});
     
     return SILFunctionType::get(genericSig,
@@ -3035,10 +3037,9 @@ getOrCreateKeyPathEqualsAndHash(SILGenModule &SGM,
   }
 
   auto &C = SGM.getASTContext();
-  auto unsafeRawPointerTy = C.getUnsafeRawPointerDecl()->getDeclaredInterfaceType()
-                                                       ->getCanonicalType();
-  auto boolTy = C.getBoolDecl()->getDeclaredInterfaceType()->getCanonicalType();
-  auto intTy = C.getIntDecl()->getDeclaredInterfaceType()->getCanonicalType();
+  auto unsafeRawPointerTy = C.getUnsafeRawPointerType()->getCanonicalType();
+  auto boolTy = C.getBoolType()->getCanonicalType();
+  auto intTy = C.getIntType()->getCanonicalType();
 
   auto hashableProto = C.getProtocol(KnownProtocolKind::Hashable);
 
@@ -3728,6 +3729,7 @@ RValue RValueEmitter::visitKeyPathExpr(KeyPathExpr *E, SGFContext C) {
     case KeyPathExpr::Component::Kind::Invalid:
     case KeyPathExpr::Component::Kind::UnresolvedProperty:
     case KeyPathExpr::Component::Kind::UnresolvedSubscript:
+    case KeyPathExpr::Component::Kind::CodeCompletion:
       llvm_unreachable("not resolved");
       break;
 
@@ -3838,7 +3840,7 @@ RValue RValueEmitter::visitCollectionExpr(CollectionExpr *E, SGFContext C) {
   } else {
     arrayType = E->getType()->getCanonicalType();
     auto genericType = cast<BoundGenericStructType>(arrayType);
-    assert(genericType->getDecl() == SGF.getASTContext().getArrayDecl());
+    assert(genericType->isArray());
     elementType = genericType.getGenericArgs()[0];
   }
 
@@ -5238,7 +5240,7 @@ RValue RValueEmitter::visitPropertyWrapperValuePlaceholderExpr(
 RValue RValueEmitter::visitAppliedPropertyWrapperExpr(
     AppliedPropertyWrapperExpr *E, SGFContext C) {
   auto *param = const_cast<ParamDecl *>(E->getParamDecl());
-  auto argument = visit(E->getValue(), C);
+  auto argument = visit(E->getValue());
   SILDeclRef::Kind initKind;
   switch (E->getValueKind()) {
   case swift::AppliedPropertyWrapperExpr::ValueKind::WrappedValue:

@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -enable-experimental-concurrency
+// RUN: %target-typecheck-verify-swift -enable-experimental-concurrency -warn-concurrency
 // REQUIRES: concurrency
 
 class Box {
@@ -19,8 +19,6 @@ actor Door {
     var getOnlyInt : Int {
         get { 0 }
     }
-    
-    @actorIndependent(unsafe) var unsafeIndependent : Int = 0
 
     @MainActor var globActor_mutable : Int = 0
     @MainActor let globActor_immutable : Int = 0
@@ -32,7 +30,7 @@ actor Door {
 
     @MainActor subscript(byName: String) -> Int { 0 }
 
-    @actorIndependent subscript(byIEEE754: Double) -> Int { 0 }
+    nonisolated subscript(byIEEE754: Double) -> Int { 0 }
 }
 
 func attemptAccess<T, V>(_ t : T, _ f : (T) -> V) -> V {
@@ -47,7 +45,7 @@ func tryKeyPathsMisc(d : Door) {
 
     // in combination with other key paths
 
-    _ = (\Door.letBox).appending(path:  // expected-warning {{cannot form key path that accesses non-concurrent-value type 'Box?'}}
+    _ = (\Door.letBox).appending(path:  // expected-warning {{cannot form key path that accesses non-sendable type 'Box?'}}
                                        \Box?.?.size)
 
     _ = (\Door.varBox).appending(path:  // expected-error {{cannot form key path to actor-isolated property 'varBox'}}
@@ -57,21 +55,20 @@ func tryKeyPathsMisc(d : Door) {
 
 func tryKeyPathsFromAsync() async {
     _ = \Door.unsafeGlobActor_immutable
-    _ = \Door.unsafeGlobActor_mutable // expected-error{{cannot form key path to actor-isolated property 'unsafeGlobActor_mutable'}}
+    _ = \Door.unsafeGlobActor_mutable // okay for now
 }
 
-func tryNonConcurrentValue() {
-    _ = \Door.letDict[0] // expected-warning {{cannot form key path that accesses non-concurrent-value type '[Int : Box]'}}
+func tryNonSendable() {
+    _ = \Door.letDict[0] // expected-warning {{cannot form key path that accesses non-sendable type '[Int : Box]'}}
     _ = \Door.varDict[0] // expected-error {{cannot form key path to actor-isolated property 'varDict'}}
-    _ = \Door.letBox!.size // expected-warning {{cannot form key path that accesses non-concurrent-value type 'Box?'}}
+    _ = \Door.letBox!.size // expected-warning {{cannot form key path that accesses non-sendable type 'Box?'}}
 }
 
 func tryKeypaths() {
     _ = \Door.unsafeGlobActor_immutable
-    _ = \Door.unsafeGlobActor_mutable
+    _ = \Door.unsafeGlobActor_mutable // okay for now
 
     _ = \Door.immutable
-    _ = \Door.unsafeIndependent
     _ = \Door.globActor_immutable
     _ = \Door.[4.2]
     _ = \Door.immutableNeighbor?.immutableNeighbor?.immutableNeighbor
@@ -84,7 +81,7 @@ func tryKeypaths() {
     let _ : PartialKeyPath<Door> = \.mutable // expected-error{{cannot form key path to actor-isolated property 'mutable'}}
     let _ : AnyKeyPath = \Door.mutable  // expected-error{{cannot form key path to actor-isolated property 'mutable'}}
 
-    _ = \Door.globActor_mutable // expected-error{{cannot form key path to actor-isolated property 'globActor_mutable'}}
+    _ = \Door.globActor_mutable // okay for now
     _ = \Door.[0] // expected-error{{cannot form key path to actor-isolated subscript 'subscript(_:)'}}
-    _ = \Door.["hello"] // expected-error{{cannot form key path to actor-isolated subscript 'subscript(_:)'}}
+    _ = \Door.["hello"] // okay for now
 }

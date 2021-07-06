@@ -50,8 +50,14 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
     # some stdlib hooks to implement SwiftObject.
     list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
       ${FOUNDATION_LIBRARY}
+      swift_Concurrency${SWIFT_PRIMARY_VARIANT_SUFFIX}
       swiftStdlibUnittest${SWIFT_PRIMARY_VARIANT_SUFFIX}
       )
+  elseif(SWIFT_HOST_VARIANT STREQUAL "Linux")
+    if(SWIFT_HOST_VARIANT_ARCH MATCHES "armv6|armv7|i686")
+      list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
+        "atomic")
+    endif()
   elseif(SWIFT_HOST_VARIANT STREQUAL "freebsd")
     find_library(EXECINFO_LIBRARY execinfo)
     list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
@@ -78,6 +84,15 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
     endif()
   endif()
 
+  if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
+#    list(APPEND PLATFORM_SOURCES
+#      DistributedActor.cpp
+#      )
+    list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
+      swift_Distributed${SWIFT_PRIMARY_VARIANT_SUFFIX}
+      )
+  endif()
+
   # Don't complain about these files not being in the sources list.
   set(LLVM_OPTIONAL_SOURCES
     weak.mm
@@ -87,7 +102,8 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
 
   add_swift_unittest(SwiftRuntimeTests
     Array.cpp
-    CompatibilityOverride.cpp
+    CompatibilityOverrideRuntime.cpp
+    CompatibilityOverrideConcurrency.cpp
     Concurrent.cpp
     Metadata.cpp
     Mutex.cpp
@@ -123,4 +139,3 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
     ${PLATFORM_TARGET_LINK_LIBRARIES}
     )
 endif()
-

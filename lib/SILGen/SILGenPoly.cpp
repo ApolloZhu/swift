@@ -82,6 +82,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "ExecutorBreadcrumb.h"
 #include "Initialization.h"
 #include "LValue.h"
 #include "RValue.h"
@@ -511,12 +512,11 @@ ManagedValue Transform::transform(ManagedValue v,
     // Attempt collection upcast only if input and output declarations match.
     if (inputStruct == outputStruct) {
       FuncDecl *fn = nullptr;
-      auto &ctx = SGF.getASTContext();
-      if (inputStruct == ctx.getArrayDecl()) {
+      if (inputSubstType->isArray()) {
         fn = SGF.SGM.getArrayForceCast(Loc);
-      } else if (inputStruct == ctx.getDictionaryDecl()) {
+      } else if (inputSubstType->isDictionary()) {
         fn = SGF.SGM.getDictionaryUpCast(Loc);
-      } else if (inputStruct == ctx.getSetDecl()) {
+      } else if (inputSubstType->isSet()) {
         fn = SGF.SGM.getSetUpCast(Loc);
       } else {
         llvm_unreachable("unsupported collection upcast kind");
@@ -608,9 +608,7 @@ ManagedValue Transform::transform(ManagedValue v,
   }
 
   // - T : Hashable to AnyHashable
-  if (isa<StructType>(outputSubstType) &&
-      outputSubstType->getAnyNominal() ==
-        SGF.getASTContext().getAnyHashableDecl()) {
+  if (outputSubstType->isAnyHashable()) {
     auto *protocol = SGF.getASTContext().getProtocol(
         KnownProtocolKind::Hashable);
     auto conformance = SGF.SGM.M.getSwiftModule()->lookupConformance(
@@ -624,6 +622,7 @@ ManagedValue Transform::transform(ManagedValue v,
   }
 
   // Should have handled the conversion in one of the cases above.
+  v.dump();
   llvm_unreachable("Unhandled transform?");
 }
 
@@ -2943,6 +2942,16 @@ static void buildThunkBody(SILGenFunction &SGF, SILLocation loc,
   assert(!fnType->isPolymorphic());
   auto argTypes = fnType->getParameters();
 
+  // If the input is synchronous and global-actor-qualified, and the
+  // output is asynchronous, hop to the executor expected by the input.
+  ExecutorBreadcrumb prevExecutor;
+  if (outputSubstType->isAsync() && !inputSubstType->isAsync()) {
+    if (Type globalActor = inputSubstType->getGlobalActor()) {
+      prevExecutor = SGF.emitHopToTargetActor(
+          loc, ActorIsolation::forGlobalActor(globalActor, false), None);
+    }
+  }
+
   // Translate the argument values.  Function parameters are
   // contravariant: we want to switch the direction of transformation
   // on them by flipping inputOrigType and outputOrigType.
@@ -2985,6 +2994,9 @@ static void buildThunkBody(SILGenFunction &SGF, SILLocation loc,
 
   // Reabstract the result.
   SILValue outerResult = resultPlanner.execute(innerResult);
+
+  // If we hopped to the target's executor, then we need to hop back.
+  prevExecutor.emit(SGF, loc);
 
   scope.pop();
   SGF.B.createReturn(loc, outerResult);
@@ -3331,11 +3343,20 @@ static ManagedValue createThunk(SILGenFunction &SGF,
                                       genericEnv,
                                       interfaceSubs,
                                       dynamicSelfType);
+  // An actor-isolated non-async function can be converted to an async function
+  // by inserting a hop to the global actor.
+  CanType globalActorForThunk;
+  if (outputSubstType->isAsync()
+      && !inputSubstType->isAsync()) {
+    globalActorForThunk = CanType(inputSubstType->getGlobalActor());
+  }
+  
   auto thunk = SGF.SGM.getOrCreateReabstractionThunk(
                                        thunkType,
                                        sourceType,
                                        toType,
-                                       dynamicSelfType);
+                                       dynamicSelfType,
+                                       globalActorForThunk);
 
   // Build it if necessary.
   if (thunk->empty()) {
@@ -3559,7 +3580,7 @@ SILGenFunction::createWithoutActuallyEscapingClosure(
       dynamicSelfType);
 
   auto *thunk = SGM.getOrCreateReabstractionThunk(
-      thunkType, noEscapingFnTy, escapingFnTy, dynamicSelfType);
+      thunkType, noEscapingFnTy, escapingFnTy, dynamicSelfType, CanType());
 
   if (thunk->empty()) {
     thunk->setWithoutActuallyEscapingThunk();
@@ -3663,7 +3684,7 @@ ManagedValue SILGenFunction::getThunkedAutoDiffLinearMap(
   // Otherwise, it is just a normal reabstraction thunk.
   else {
     name = mangler.mangleReabstractionThunkHelper(
-        thunkType, fromInterfaceType, toInterfaceType, Type(),
+        thunkType, fromInterfaceType, toInterfaceType, Type(), Type(),
         getModule().getSwiftModule());
   }
 
@@ -3914,7 +3935,7 @@ ManagedValue SILGenFunction::getThunkedAutoDiffLinearMap(
 
 SILFunction *SILGenModule::getOrCreateCustomDerivativeThunk(
     AbstractFunctionDecl *originalAFD, SILFunction *originalFn,
-    SILFunction *customDerivativeFn, AutoDiffConfig config,
+    SILFunction *customDerivativeFn, const AutoDiffConfig &config,
     AutoDiffDerivativeFunctionKind kind) {
   auto customDerivativeFnTy = customDerivativeFn->getLoweredFunctionType();
   auto *thunkGenericEnv = customDerivativeFnTy->getSubstGenericSignature()
@@ -4476,17 +4497,6 @@ SILGenFunction::emitVTableThunk(SILDeclRef base,
   // Now that the thunk body has been completely emitted, verify the
   // body early.
   F.verify();
-}
-
-//===----------------------------------------------------------------------===//
-// Concurrency
-//===----------------------------------------------------------------------===//
-
-/// If the current function is associated with an actor, then this
-/// function emits a hop_to_executor to that actor's executor at loc.
-void SILGenFunction::emitHopToCurrentExecutor(SILLocation loc) {
-  if (actor)
-    B.createHopToExecutor(loc, actor);
 }
 
 //===----------------------------------------------------------------------===//

@@ -82,11 +82,6 @@ public:
   }
 };
 
-inline TaskStatusRecord *
-ActiveTaskStatus::getStatusRecordParent(TaskStatusRecord *ptr) {
-  return ptr->getParent();
-}
-
 /// A deadline for the task.  If this is reached, the task will be
 /// automatically cancelled.  The deadline can also be queried and used
 /// in other ways.
@@ -254,7 +249,7 @@ public:
 /// subsequently used.
 class CancellationNotificationStatusRecord : public TaskStatusRecord {
 public:
-  using FunctionType = void (void *);
+  using FunctionType = SWIFT_CC(swift) void (SWIFT_CONTEXT void *);
 
 private:
   FunctionType * __ptrauth_swift_cancellation_notification_function Function;

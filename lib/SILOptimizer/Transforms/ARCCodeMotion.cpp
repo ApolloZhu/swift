@@ -72,11 +72,10 @@
 #define DEBUG_TYPE "sil-rr-code-motion"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILBuilder.h"
-#include "swift/SIL/BasicBlockBits.h"
+#include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/BasicBlockData.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
-#include "swift/SILOptimizer/Analysis/EscapeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProgramTerminationAnalysis.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
@@ -554,7 +553,7 @@ void RetainCodeMotionContext::convergeCodeMotionDataFlow() {
   // Process each basic block with the genset and killset. Every time the
   // BBSetOut of a basic block changes, the optimization is rerun on its
   // successors. 
-  BasicBlockWorklist<16> WorkList(BlockStates.getFunction());
+  BasicBlockWorklist WorkList(BlockStates.getFunction());
   // Push into reverse post order so that we can pop from the back and get
   // post order.
   for (SILBasicBlock *B : PO->getReversePostOrder()) {
@@ -966,7 +965,7 @@ void ReleaseCodeMotionContext::convergeCodeMotionDataFlow() {
   // Process each basic block with the gen and kill set. Every time the
   // BBSetIn of a basic block changes, the optimization is rerun on its
   // predecessors.
-  BasicBlockWorklist<16> WorkList(BlockStates.getFunction());
+  BasicBlockWorklist WorkList(BlockStates.getFunction());
   // Push into reverse post order so that we can pop from the back and get
   // post order.
   for (SILBasicBlock *B : PO->getPostOrder()) {
@@ -1189,7 +1188,7 @@ public:
       POA->invalidateFunction(F);
 
     auto *PO = POA->get(F);
-    auto *AA = PM->getAnalysis<AliasAnalysis>();
+    auto *AA = PM->getAnalysis<AliasAnalysis>(F);
     auto *RCFI = PM->getAnalysis<RCIdentityAnalysis>()->get(F);
 
     llvm::SpecificBumpPtrAllocator<BlockState> BPA;

@@ -62,6 +62,7 @@ namespace swift {
   class DynamicSelfType;
   class Type;
   class Expr;
+  struct ExternalSourceLocs;
   class CaptureListExpr;
   class DeclRefExpr;
   class ForeignAsyncConvention;
@@ -82,7 +83,8 @@ namespace swift {
   class ParameterTypeFlags;
   class Pattern;
   struct PrintOptions;
-  struct PropertyWrapperBackingPropertyInfo;
+  struct PropertyWrapperAuxiliaryVariables;
+  class PropertyWrapperInitializerInfo;
   struct PropertyWrapperTypeInfo;
   struct PropertyWrapperMutability;
   class ProtocolDecl;
@@ -226,6 +228,9 @@ struct OverloadSignature {
   /// Whether this is a function.
   unsigned IsFunction : 1;
 
+  /// Whether this is an async function.
+  unsigned IsAsyncFunction : 1;
+
   /// Whether this is a enum element.
   unsigned IsEnumElement : 1;
 
@@ -247,8 +252,9 @@ struct OverloadSignature {
 
   OverloadSignature()
       : UnaryOperator(UnaryOperatorKind::None), IsInstanceMember(false),
-        IsVariable(false), IsFunction(false), InProtocolExtension(false),
-        InExtensionOfGenericType(false), HasOpaqueReturnType(false) { }
+        IsVariable(false), IsFunction(false), IsAsyncFunction(false),
+        InProtocolExtension(false), InExtensionOfGenericType(false),
+        HasOpaqueReturnType(false) { }
 };
 
 /// Determine whether two overload signatures conflict.
@@ -316,9 +322,12 @@ protected:
     Hoisted : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(PatternBindingDecl, Decl, 1+2+16,
+  SWIFT_INLINE_BITFIELD_FULL(PatternBindingDecl, Decl, 1+1+2+16,
     /// Whether this pattern binding declares static variables.
     IsStatic : 1,
+
+    /// Whether this pattern binding is synthesized by the debugger.
+    IsDebugger : 1,
 
     /// Whether 'static' or 'class' was used.
     StaticSpelling : 2,
@@ -421,7 +430,7 @@ protected:
     HasNestedTypeDeclarations : 1
   );
 
-  SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1+1+1,
+  SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1,
     /// Whether we've computed the 'static' flag yet.
     IsStaticComputed : 1,
 
@@ -439,12 +448,6 @@ protected:
 
     /// Backing bits for 'self' access kind.
     SelfAccess : 2,
-
-    /// Whether we've computed the IsAsyncHandlerRequest.
-    IsAsyncHandlerComputed : 1,
-
-    /// The value of IsAsyncHandlerRequest.
-    IsAsyncHandler : 1,
 
     /// Whether this is a top-level function which should be treated
     /// as if it were in local context for the purposes of capture
@@ -586,7 +589,10 @@ protected:
     HasAnyUnavailableValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1,
+    /// If the module is compiled as static library.
+    StaticLibrary : 1,
+
     /// If the module was or is being compiled with `-enable-testing`.
     TestingEnabled : 1,
 
@@ -687,14 +693,12 @@ private:
   void operator=(const Decl&) = delete;
   SourceLoc getLocFromSource() const;
 
-  struct CachedExternalSourceLocs {
-    SourceLoc Loc;
-    SourceLoc StartLoc;
-    SourceLoc EndLoc;
-    SmallVector<CharSourceRange, 4> DocRanges;
-  };
-  mutable CachedExternalSourceLocs const *CachedSerializedLocs = nullptr;
-  const CachedExternalSourceLocs *getSerializedLocs() const;
+  /// Returns the serialized locations of this declaration from the
+  /// corresponding .swiftsourceinfo file. "Empty" (ie. \c BufferID of 0, an
+  /// invalid \c Loc, and empty \c DocRanges) if either there is no
+  /// .swiftsourceinfo or the buffer could not be created, eg. if the file
+  /// no longer exists.
+  const ExternalSourceLocs *getSerializedLocs() const;
 
   /// Directly set the invalid bit
   void setInvalidBit();
@@ -787,6 +791,9 @@ public:
   DeclAttributes &getAttrs() {
     return Attrs;
   }
+
+  /// Returns the innermost enclosing decl with an availability annotation.
+  const Decl *getInnermostDeclWithAvailability() const;
 
   /// Returns the introduced OS version in the given platform kind specified
   /// by @available attribute.
@@ -1312,6 +1319,9 @@ public:
   bool alreadyBoundToNominal() const { return NextExtension.getInt(); }
 
   /// Retrieve the extended type definition as written in the source, if it exists.
+  ///
+  /// Repr would not be available if the extension was been loaded
+  /// from a serialized module.
   TypeRepr *getExtendedTypeRepr() const { return ExtendedTypeRepr; }
                               
   /// Retrieve the set of protocols that this type inherits (i.e,
@@ -1471,9 +1481,10 @@ class PatternBindingEntry {
   enum class PatternFlags {
     IsText = 1 << 0,
     IsFullyValidated = 1 << 1,
+    IsFromDebugger = 1 << 2,
   };
   /// The initializer context used for this pattern binding entry.
-  llvm::PointerIntPair<DeclContext *, 2, OptionSet<PatternFlags>>
+  llvm::PointerIntPair<DeclContext *, 3, OptionSet<PatternFlags>>
       InitContextAndFlags;
 
   /// Values captured by this initializer.
@@ -1499,6 +1510,14 @@ private:
   void setFullyValidated() {
     InitContextAndFlags.setInt(InitContextAndFlags.getInt() |
                                PatternFlags::IsFullyValidated);
+  }
+
+  /// Set if this pattern binding came from the debugger.
+  ///
+  /// Stay away unless you are \c PatternBindingDecl::createForDebugger
+  void setFromDebugger() {
+    InitContextAndFlags.setInt(InitContextAndFlags.getInt() |
+                               PatternFlags::IsFromDebugger);
   }
 
 public:
@@ -1581,6 +1600,11 @@ private:
   }
   void setInitializerSubsumed() {
     PatternAndFlags.setInt(PatternAndFlags.getInt() | Flags::Subsumed);
+  }
+
+  /// Returns \c true if the debugger created this pattern binding entry.
+  bool isFromDebugger() const {
+    return InitContextAndFlags.getInt().contains(PatternFlags::IsFromDebugger);
   }
 
   // Return the first variable initialized by this pattern.
@@ -1668,6 +1692,13 @@ public:
                                unsigned NumPatternEntries,
                                DeclContext *Parent);
 
+  // A dedicated entrypoint that allows LLDB to create pattern bindings
+  // that look implicit to the compiler but contain user code.
+  static PatternBindingDecl *createForDebugger(ASTContext &Ctx,
+                                               StaticSpellingKind Spelling,
+                                               Pattern *Pat, Expr *E,
+                                               DeclContext *Parent);
+
   SourceLoc getStartLoc() const {
     return StaticLoc.isValid() ? StaticLoc : VarLoc;
   }
@@ -1679,6 +1710,62 @@ public:
   
   ArrayRef<PatternBindingEntry> getPatternList() const {
     return const_cast<PatternBindingDecl*>(this)->getMutablePatternList();
+  }
+
+  /// Clean up walking the initializers for the pattern
+  class InitIterator {
+
+    const PatternBindingDecl &decl;
+    unsigned currentPatternEntryIndex;
+
+    void next() { ++currentPatternEntryIndex; }
+
+  public:
+    using value_type = Expr *;
+    using pointer = value_type;
+    using reference = value_type;
+    using difference_type = unsigned;
+
+    InitIterator(const PatternBindingDecl &decl, unsigned start = 0)
+        : decl(decl), currentPatternEntryIndex(start) {}
+
+    InitIterator &operator++() {
+      next();
+      return *this;
+    }
+
+    InitIterator operator++(int) {
+      InitIterator newIterator(decl, currentPatternEntryIndex);
+      newIterator.next();
+      return newIterator;
+    }
+
+    pointer operator->() { return decl.getInit(currentPatternEntryIndex); }
+
+    pointer operator*() { return decl.getInit(currentPatternEntryIndex); }
+
+    difference_type operator-(const InitIterator &other) {
+      return currentPatternEntryIndex - other.currentPatternEntryIndex;
+    }
+
+    bool operator==(const InitIterator &other) const {
+      return &decl == &other.decl &&
+             currentPatternEntryIndex == other.currentPatternEntryIndex;
+    }
+
+    bool operator!=(const InitIterator &other) const {
+      return !(*this == other);
+    }
+  };
+
+  InitIterator beginInits() const { return InitIterator(*this); }
+
+  InitIterator endInits() const {
+    return InitIterator(*this, getNumPatternEntries());
+  }
+
+  llvm::iterator_range<InitIterator> initializers() const {
+    return llvm::make_range(beginInits(), endInits());
   }
 
   void setInitStringRepresentation(unsigned i, StringRef str) {
@@ -1812,6 +1899,9 @@ public:
                                         SmallVectorImpl<char> &scratch) const {
     return getPatternList()[i].getInitStringRepresentation(scratch);
   }
+
+  /// Returns \c true if this pattern binding was created by the debugger.
+  bool isDebuggerBinding() const { return Bits.PatternBindingDecl.IsDebugger; }
 
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::PatternBinding;
@@ -2284,11 +2374,17 @@ public:
   /// Note whether this declaration is known to be exposed to Objective-C.
   void setIsObjC(bool Value);
 
+  /// Is this declaration semantically 'final', meaning that the type checker
+  /// should treat it as final even if the ABI does not?
+  bool isSemanticallyFinal() const;
+
   /// Is this declaration 'final'?
   bool isFinal() const;
 
   /// Is this declaration marked with 'dynamic'?
   bool isDynamic() const;
+
+  bool isDistributedActorIndependent() const;
 
 private:
   bool isObjCDynamic() const {
@@ -3108,6 +3204,11 @@ public:
                                           OptionSet<LookupDirectFlags> flags =
                                           OptionSet<LookupDirectFlags>());
 
+  /// Find the '_remote_<...>' counterpart function to a 'distributed func'.
+  ///
+  /// If the passed in function is not distributed this function returns null.
+  AbstractFunctionDecl* lookupDirectRemoteFunc(AbstractFunctionDecl *func);
+
   /// Collect the set of protocols to which this type should implicitly
   /// conform, such as AnyObject (for classes).
   void getImplicitProtocols(SmallVectorImpl<ProtocolDecl *> &protocols);
@@ -3163,6 +3264,10 @@ public:
   /// either an actor type or a protocol whose `Self` type conforms to the
   /// `Actor` protocol.
   bool isActor() const;
+
+  /// Whether this nominal type qualifies as a distributed actor, meaning that
+  /// it is either a distributed actor.
+  bool isDistributedActor() const;
 
   /// Return the range of semantics attributes attached to this NominalTypeDecl.
   auto getSemanticsAttrs() const
@@ -3231,6 +3336,8 @@ public:
   /// \returns the static 'shared' property for a global actor, or \c nullptr
   /// for types that are not global actors.
   VarDecl *getGlobalActorInstance() const;
+
+  bool hasDistributedActorLocalInitializer() const;
 
   /// Whether this type is a global actor, which can be used as an
   /// attribute to decorate declarations for inclusion in the actor-isolated
@@ -3429,7 +3536,7 @@ class StructDecl final : public NominalTypeDecl {
   SourceLoc StructLoc;
 
   // We import C++ class templates as generic structs. Then when in Swift code
-  // we want to substitude generic parameters with actual arguments, we
+  // we want to substitute generic parameters with actual arguments, we
   // convert the arguments to C++ equivalents and ask Clang to instantiate the
   // C++ template. Then we import the C++ class template instantiation
   // as a non-generic structs with a name prefixed with `__CxxTemplateInst`.
@@ -3706,17 +3813,27 @@ public:
 
   /// Whether the class is (known to be) a default actor.
   bool isDefaultActor() const;
+  bool isDefaultActor(ModuleDecl *M, ResilienceExpansion expansion) const;
 
   /// Whether the class is known to be a *root* default actor,
   /// i.e. the first class in its hierarchy that is a default actor.
   bool isRootDefaultActor() const;
+  bool isRootDefaultActor(ModuleDecl *M, ResilienceExpansion expansion) const;
 
   /// Whether the class was explicitly declared with the `actor` keyword.
   bool isExplicitActor() const { return Bits.ClassDecl.IsActor; }
 
-  /// Does this class explicitly declare any of the methods that
-  /// would prevent it from being a default actor?
-  bool hasExplicitCustomActorMethods() const;
+  /// Whether the class was explicitly declared with the `distributed actor` keywords.
+  bool isExplicitDistributedActor() const {
+    return isExplicitActor() &&
+           getAttrs().hasAttribute<DistributedActorAttr>();
+  }
+
+  /// Get the closest-to-root superclass that's an actor class.
+  const ClassDecl *getRootActorClass() const;
+
+  /// Fetch this class's unownedExecutor property, if it has one.
+  const VarDecl *getUnownedExecutorProperty() const;
 
   /// Is this the NSObject class type?
   bool isNSObject() const;
@@ -3942,6 +4059,8 @@ enum class KnownDerivableProtocolKind : uint8_t {
   Decodable,
   AdditiveArithmetic,
   Differentiable,
+  Actor,
+  DistributedActor,
 };
 
 /// ProtocolDecl - A declaration of a protocol, for example:
@@ -4134,6 +4253,10 @@ public:
   /// Determine whether this is a "marker" protocol, meaning that is indicates
   /// semantics but has no corresponding witness table.
   bool isMarkerProtocol() const;
+
+  /// Is a protocol that can only be conformed by distributed actors.
+  /// Such protocols are allowed to contain distributed functions.
+  bool inheritsFromDistributedActor() const;
 
 private:
   void computeKnownProtocolKind() const;
@@ -4464,6 +4587,34 @@ public:
     return {};
   }
 
+  /// This is the primary mechanism by which we can easily determine whether
+  /// this storage decl has any effects.
+  ///
+  /// \returns the getter decl iff this decl has only one accessor that is
+  ///          a 'get' with an effect (i.e., 'async', 'throws', or both).
+  ///          Otherwise returns nullptr.
+  AccessorDecl *getEffectfulGetAccessor() const;
+
+  /// Performs a "limit check" on an effect possibly exhibited by this storage
+  /// decl with respect to some other storage decl that serves as the "limit."
+  /// This check says that \c this is less effectful than \c other if
+  /// \c this either does not exhibit the effect, or if it does, then \c other
+  /// also exhibits the effect. Thus, it is conceptually equivalent to
+  /// a less-than-or-equal (≤) check like so:
+  ///
+  /// \verbatim
+  ///
+  ///           this->hasEffect(E) ≤ other->hasEffect(E)
+  ///
+  /// \endverbatim
+  ///
+  /// \param kind the single effect we are performing a check for.
+  ///
+  /// \returns true iff \c this decl either does not exhibit the effect,
+  ///          or \c other also exhibits the effect.
+  bool isLessEffectfulThan(AbstractStorageDecl const* other,
+                           EffectKind kind) const;
+
   /// Return an accessor that this storage is expected to have, synthesizing
   /// one if necessary. Note that will always synthesize one, even if the
   /// accessor is not part of the expected opaque set for the storage, so use
@@ -4624,6 +4775,8 @@ public:
   bool hasDidSetOrWillSetDynamicReplacement() const;
 
   bool hasAnyNativeDynamicAccessors() const;
+
+  bool isDistributedActorIndependent() const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
@@ -4928,6 +5081,10 @@ public:
   /// Whether this var has an implicit property wrapper attribute.
   bool hasImplicitPropertyWrapper() const;
 
+  /// Whether this var is a parameter with an attached property wrapper
+  /// that has an external effect on the function.
+  bool hasExternalPropertyWrapper() const;
+
   /// Whether all of the attached property wrappers have an init(wrappedValue:)
   /// initializer.
   bool allAttachedPropertyWrappersHaveWrappedValueInit() const;
@@ -4957,10 +5114,15 @@ public:
   /// unbound generic types. It will be the type of the backing property.
   Type getPropertyWrapperBackingPropertyType() const;
 
-  /// Retrieve information about the backing properties of the attached
-  /// property wrapper.
-  PropertyWrapperBackingPropertyInfo
-      getPropertyWrapperBackingPropertyInfo() const;
+  /// If there is an attached property wrapper, retrieve the synthesized
+  /// auxiliary variables.
+  PropertyWrapperAuxiliaryVariables
+      getPropertyWrapperAuxiliaryVariables() const;
+
+  /// If there is an attached property wrapper, retrieve information about
+  /// how to initialize the backing property.
+  PropertyWrapperInitializerInfo
+      getPropertyWrapperInitializerInfo() const;
 
   /// Retrieve information about the mutability of the composed
   /// property wrappers.
@@ -5072,13 +5234,19 @@ public:
     return getAttrs().getAttributes<SemanticsAttr>();
   }
 
-  /// Returns true if this VarDelc has the string \p attrValue as a semantics
+  /// Returns true if this VarDecl has the string \p attrValue as a semantics
   /// attribute.
   bool hasSemanticsAttr(StringRef attrValue) const {
     return llvm::any_of(getSemanticsAttrs(), [&](const SemanticsAttr *attr) {
       return attrValue.equals(attr->Value);
     });
   }
+
+  /// Whether the given name is actorAddress, which is used for distributed actors.
+  static bool isDistributedActorAddressName(ASTContext &ctx, DeclName name);
+
+  /// Whether the given name is actorTransport, which is used for distributed actors.
+  static bool isDistributedActorTransportName(ASTContext &ctx, DeclName name);
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) { 
@@ -5105,7 +5273,7 @@ class ParamDecl : public VarDecl {
 
   TypeRepr *TyRepr = nullptr;
 
-  struct StoredDefaultArgument {
+  struct alignas(1 << DeclAlignInBits) StoredDefaultArgument {
     PointerUnion<Expr *, VarDecl *> DefaultArg;
 
     /// Stores the context for the default argument as well as a bit to
@@ -5126,10 +5294,13 @@ class ParamDecl : public VarDecl {
 
     /// Whether or not this parameter is `@autoclosure`.
     IsAutoClosure = 1 << 1,
+
+    /// Whether or not this parameter is 'isolated'.
+    IsIsolated = 1 << 2,
   };
 
   /// The default value, if any, along with flags.
-  llvm::PointerIntPair<StoredDefaultArgument *, 2, OptionSet<Flags>>
+  llvm::PointerIntPair<StoredDefaultArgument *, 3, OptionSet<Flags>>
       DefaultValueAndFlags;
 
   friend class ParamSpecifierRequest;
@@ -5141,7 +5312,10 @@ public:
 
   /// Create a new ParamDecl identical to the first except without the interface type.
   static ParamDecl *cloneWithoutType(const ASTContext &Ctx, ParamDecl *PD);
-  
+
+  /// Create a an identical copy of this ParamDecl.
+  static ParamDecl *clone(const ASTContext &Ctx, ParamDecl *PD);
+
   /// Retrieve the argument (API) name for this function parameter.
   Identifier getArgumentName() const {
     return ArgumentNameAndDestructured.getPointer();
@@ -5278,6 +5452,17 @@ public:
     auto flags = DefaultValueAndFlags.getInt();
     DefaultValueAndFlags.setInt(value ? flags | Flags::IsAutoClosure
                                       : flags - Flags::IsAutoClosure);
+  }
+
+  /// Whether or not this parameter is marked with 'isolated'.
+  bool isIsolated() const {
+    return DefaultValueAndFlags.getInt().contains(Flags::IsIsolated);
+  }
+
+  void setIsolated(bool value = true) {
+    auto flags = DefaultValueAndFlags.getInt();
+    DefaultValueAndFlags.setInt(value ? flags | Flags::IsIsolated
+                                      : flags - Flags::IsIsolated);
   }
 
   /// Does this parameter reject temporary pointer conversions?
@@ -5616,7 +5801,7 @@ public:
   ArrayRef<AutoDiffConfig> getDerivativeFunctionConfigurations();
 
   /// Add the given derivative function configuration.
-  void addDerivativeFunctionConfiguration(AutoDiffConfig config);
+  void addDerivativeFunctionConfiguration(const AutoDiffConfig &config);
 
 protected:
   // If a function has a body at all, we have either a parsed body AST node or
@@ -5738,22 +5923,15 @@ public:
 
   /// Determine whether the given function is concurrent.
   ///
-  /// A function is concurrent if it has the @concurrent attribute.
-  bool isConcurrent() const;
+  /// A function is concurrent if it has the @Sendable attribute.
+  bool isSendable() const;
 
   /// Returns true if the function is a suitable 'async' context.
   ///
   /// Functions that are an 'async' context can make calls to 'async' functions.
   bool isAsyncContext() const {
-    return hasAsync() || isAsyncHandler();
+    return hasAsync();
   }
-
-  /// Returns true if the function is an @asyncHandler.
-  bool isAsyncHandler() const;
-
-  /// Returns true if the function signature matches the form of an
-  /// @asyncHandler.
-  bool canBeAsyncHandler() const;
 
   /// Returns true if the function body throws.
   bool hasThrows() const { return Bits.AbstractFunctionDecl.Throws; }
@@ -5763,6 +5941,9 @@ public:
 
   /// Returns if the function is 'rethrows' or 'reasync'.
   bool hasPolymorphicEffect(EffectKind kind) const;
+
+  /// Returns 'true' if the function is distributed.
+  bool isDistributed() const;
 
   PolymorphicEffectKind getPolymorphicEffectKind(EffectKind kind) const;
 
@@ -6007,6 +6188,17 @@ public:
   /// constructor.
   bool hasDynamicSelfResult() const;
 
+
+  AbstractFunctionDecl *getAsyncAlternative() const;
+
+  /// Determine whether this function is implicitly known to have its
+  /// parameters of function type be @_unsafeSendable.
+  ///
+  /// This hard-codes knowledge of a number of functions that will
+  /// eventually have @_unsafeSendable and, eventually, @Sendable,
+  /// on their parameters of function type.
+  bool hasKnownUnsafeSendableFunctionParams() const;
+
   using DeclContext::operator new;
   using Decl::getASTContext;
 };
@@ -6028,7 +6220,6 @@ class FuncDecl : public AbstractFunctionDecl {
   friend class SelfAccessKindRequest;
   friend class IsStaticRequest;
   friend class ResultTypeRequest;
-  friend class IsAsyncHandlerRequest;
 
   SourceLoc StaticLoc;  // Location of the 'static' token or invalid.
   SourceLoc FuncLoc;    // Location of the 'func' token.
@@ -6060,8 +6251,6 @@ protected:
     Bits.FuncDecl.SelfAccessComputed = false;
     Bits.FuncDecl.IsStaticComputed = false;
     Bits.FuncDecl.IsStatic = false;
-    Bits.FuncDecl.IsAsyncHandlerComputed = false;
-    Bits.FuncDecl.IsAsyncHandler = false;
     Bits.FuncDecl.HasTopLevelLocalContextCaptures = false;
   }
 
@@ -6090,18 +6279,6 @@ private:
       return Bits.FuncDecl.IsStatic;
 
     return None;
-  }
-
-  Optional<bool> getCachedIsAsyncHandler() const {
-    if (Bits.FuncDecl.IsAsyncHandlerComputed)
-      return Bits.FuncDecl.IsAsyncHandler;
-
-    return None;
-  }
-
-  void setIsAsyncHandler(bool value) {
-    Bits.FuncDecl.IsAsyncHandlerComputed = true;
-    Bits.FuncDecl.IsAsyncHandler = value;
   }
 
 public:
@@ -6265,16 +6442,18 @@ class AccessorDecl final : public FuncDecl {
   AccessorDecl(SourceLoc declLoc, SourceLoc accessorKeywordLoc,
                AccessorKind accessorKind, AbstractStorageDecl *storage,
                SourceLoc staticLoc, StaticSpellingKind staticSpelling,
-               bool throws, SourceLoc throwsLoc,
+               bool async, SourceLoc asyncLoc, bool throws, SourceLoc throwsLoc,
                bool hasImplicitSelfDecl, GenericParamList *genericParams,
                DeclContext *parent)
     : FuncDecl(DeclKind::Accessor,
                staticLoc, staticSpelling, /*func loc*/ declLoc,
                /*name*/ Identifier(), /*name loc*/ declLoc,
-               /*Async=*/false, SourceLoc(), throws, throwsLoc,
+               async, asyncLoc, throws, throwsLoc,
                hasImplicitSelfDecl, genericParams, parent),
       AccessorKeywordLoc(accessorKeywordLoc),
       Storage(storage) {
+    assert(!async || accessorKind == AccessorKind::Get
+           && "only get accessors can be async");
     Bits.AccessorDecl.AccessorKind = unsigned(accessorKind);
   }
 
@@ -6285,6 +6464,7 @@ class AccessorDecl final : public FuncDecl {
                                   AbstractStorageDecl *storage,
                                   SourceLoc staticLoc,
                                   StaticSpellingKind staticSpelling,
+                                  bool async, SourceLoc asyncLoc,
                                   bool throws, SourceLoc throwsLoc,
                                   GenericParamList *genericParams,
                                   DeclContext *parent,
@@ -6303,7 +6483,7 @@ public:
                                           AccessorKind accessorKind,
                                           AbstractStorageDecl *storage,
                                           StaticSpellingKind staticSpelling,
-                                          bool throws,
+                                          bool async, bool throws,
                                           GenericParamList *genericParams,
                                           Type fnRetType, DeclContext *parent);
 
@@ -6313,6 +6493,7 @@ public:
                               AbstractStorageDecl *storage,
                               SourceLoc staticLoc,
                               StaticSpellingKind staticSpelling,
+                              bool async, SourceLoc asyncLoc,
                               bool throws, SourceLoc throwsLoc,
                               GenericParamList *genericParams,
                               ParameterList *parameterList,
@@ -6652,6 +6833,7 @@ class ConstructorDecl : public AbstractFunctionDecl {
 public:
   ConstructorDecl(DeclName Name, SourceLoc ConstructorLoc, 
                   bool Failable, SourceLoc FailabilityLoc,
+                  bool Async, SourceLoc AsyncLoc,
                   bool Throws, SourceLoc ThrowsLoc,
                   ParameterList *BodyParams,
                   GenericParamList *GenericParams, 
@@ -6659,8 +6841,10 @@ public:
 
   static ConstructorDecl *
   createImported(ASTContext &ctx, ClangNode clangNode, DeclName name,
-                 SourceLoc constructorLoc, bool failable,
-                 SourceLoc failabilityLoc, bool throws, SourceLoc throwsLoc,
+                 SourceLoc constructorLoc, 
+                 bool failable, SourceLoc failabilityLoc, 
+                 bool async, SourceLoc asyncLoc,
+                 bool throws, SourceLoc throwsLoc,
                  ParameterList *bodyParams, GenericParamList *genericParams,
                  DeclContext *parent);
 
@@ -6769,6 +6953,18 @@ public:
   /// @objc init(forMemory: ())
   /// \endcode
   bool isObjCZeroParameterWithLongSelector() const;
+
+  /// Checks if the initializer is a distributed actor's 'local' initializer:
+  /// ```
+  /// init(transport: ActorTransport)
+  /// ```
+  bool isDistributedActorLocalInit() const;
+
+  /// Checks if the initializer is a distributed actor's 'resolve' initializer:
+  /// ```
+  /// init(resolve address: ActorAddress, using transport: ActorTransport)
+  /// ```
+  bool isDistributedActorResolveInit() const;
 
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::Constructor;
@@ -7364,7 +7560,8 @@ inline bool Decl::isPotentiallyOverridable() const {
       isa<SubscriptDecl>(this) ||
       isa<FuncDecl>(this) ||
       isa<DestructorDecl>(this)) {
-    return getDeclContext()->getSelfClassDecl();
+    auto classDecl = getDeclContext()->getSelfClassDecl();
+    return classDecl && !classDecl->isActor();
   } else {
     return false;
   }

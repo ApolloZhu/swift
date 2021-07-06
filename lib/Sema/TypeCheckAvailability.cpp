@@ -179,7 +179,7 @@ ExportContext ExportContext::forDeclSignature(Decl *D) {
       (Ctx.LangOpts.DisableAvailabilityChecking
        ? AvailabilityContext::alwaysAvailable()
        : TypeChecker::overApproximateAvailabilityAtLocation(D->getEndLoc(), DC));
-  bool spi = false;
+  bool spi = Ctx.LangOpts.LibraryLevel == LibraryLevel::SPI;
   bool implicit = false;
   bool deprecated = false;
   Optional<PlatformKind> unavailablePlatformKind;
@@ -208,7 +208,7 @@ ExportContext ExportContext::forFunctionBody(DeclContext *DC, SourceLoc loc) {
        ? AvailabilityContext::alwaysAvailable()
        : TypeChecker::overApproximateAvailabilityAtLocation(loc, DC));
 
-  bool spi = false;
+  bool spi = Ctx.LangOpts.LibraryLevel == LibraryLevel::SPI;
   bool implicit = false;
   bool deprecated = false;
   Optional<PlatformKind> unavailablePlatformKind;
@@ -400,13 +400,15 @@ private:
     // The potential versions in the declaration are constrained by both
     // the declared availability of the declaration and the potential versions
     // of its lexical context.
-    AvailabilityContext DeclInfo =
+    AvailabilityContext ExplicitDeclInfo =
         swift::AvailabilityInference::availableRange(D, Context);
+    AvailabilityContext DeclInfo = ExplicitDeclInfo;
     DeclInfo.intersectWith(getCurrentTRC()->getAvailabilityInfo());
 
     TypeRefinementContext *NewTRC =
         TypeRefinementContext::createForDecl(Context, D, getCurrentTRC(),
                                              DeclInfo,
+                                             ExplicitDeclInfo,
                                              refinementSourceRangeForDecl(D));
     
     // Record the TRC for this storage declaration so that
@@ -646,6 +648,8 @@ private:
     for (StmtConditionElement Element : Cond) {
       TypeRefinementContext *CurrentTRC = getCurrentTRC();
       AvailabilityContext CurrentInfo = CurrentTRC->getAvailabilityInfo();
+      AvailabilityContext CurrentExplicitInfo =
+        CurrentTRC->getExplicitAvailabilityInfo();
 
       // If the element is not a condition, walk it in the current TRC.
       if (Element.getKind() != StmtConditionElement::CK_Availability) {
@@ -708,24 +712,17 @@ private:
         continue;
       }
 
-
-      // If the version range for the current TRC is completely contained in
-      // the range for the spec, then a version query can never be false, so the
-      // spec is useless. If so, report this.
-      if (CurrentInfo.isContainedIn(NewConstraint)) {
+      // If the explicitly-specified (via #availability) version range for the
+      // current TRC is completely contained in the range for the spec, then
+      // a version query can never be false, so the spec is useless.
+      // If so, report this.
+      if (CurrentExplicitInfo.isContainedIn(NewConstraint)) {
         DiagnosticEngine &Diags = Context.Diags;
-        // Some availability checks will always pass because the minimum
-        // deployment target guarantees they will never be false. We don't
-        // diagnose these checks as useless because the source file may
-        // be shared with other projects/targets having older deployment
-        // targets. We don't currently have a mechanism for the user to
-        // suppress these warnings (for example, by indicating when the
-        // required compatibility version is different than the deployment
-        // target).
         if (CurrentTRC->getReason() != TypeRefinementContext::Reason::Root) {
           PlatformKind BestPlatform = targetPlatform(Context.LangOpts);
           auto *PlatformSpec =
               dyn_cast<PlatformVersionConstraintAvailabilitySpec>(Spec);
+
           // If possible, try to report the diagnostic in terms for the
           // platform the user uttered in the '#available()'. For a platform
           // that inherits availability from another platform it may be
@@ -738,7 +735,9 @@ private:
           Diags.diagnose(CurrentTRC->getIntroductionLoc(),
                          diag::availability_query_useless_enclosing_scope_here);
         }
+      }
 
+      if (CurrentInfo.isContainedIn(NewConstraint)) {
         // No need to actually create the refinement context if we know it is
         // useless.
         continue;
@@ -1737,7 +1736,8 @@ static bool isInsideCompatibleUnavailableDeclaration(
   // but allow the use of types.
   PlatformKind platform = attr->Platform;
   if (platform == PlatformKind::none &&
-      !isa<TypeDecl>(D)) {
+      !isa<TypeDecl>(D) &&
+      !isa<ExtensionDecl>(D)) {
     return false;
   }
 
@@ -2462,19 +2462,18 @@ bool isSubscriptReturningString(const ValueDecl *D, ASTContext &Context) {
 
   // The subscripts taking T<Int> do not return Substring, and our
   // special fixit does not help here.
-  auto intDecl = Context.getIntDecl();
   auto nominalTypeParam = genericArgs[0]->getAs<NominalType>();
   if (!nominalTypeParam)
     return false;
 
-  if (nominalTypeParam->getDecl() == intDecl)
+  if (nominalTypeParam->isInt())
     return false;
 
   auto resultTy = fnTy->getResult()->getAs<NominalType>();
   if (!resultTy)
     return false;
 
-  return resultTy->getDecl() == stringDecl;
+  return resultTy->isString();
 }
 
 bool swift::diagnoseExplicitUnavailability(
@@ -2840,6 +2839,7 @@ private:
       case KeyPathExpr::Component::Kind::OptionalForce:
       case KeyPathExpr::Component::Kind::Identity:
       case KeyPathExpr::Component::Kind::DictionaryKey:
+      case KeyPathExpr::Component::Kind::CodeCompletion:
         break;
       }
     }
@@ -3016,16 +3016,11 @@ swift::diagnoseDeclAvailability(const ValueDecl *D,
 
 /// Return true if the specified type looks like an integer of floating point
 /// type.
-static bool isIntegerOrFloatingPointType(Type ty, DeclContext *DC,
-                                         ASTContext &Context) {
-  auto integerType =
-    Context.getProtocol(KnownProtocolKind::ExpressibleByIntegerLiteral);
-  auto floatingType =
-    Context.getProtocol(KnownProtocolKind::ExpressibleByFloatLiteral);
-  if (!integerType || !floatingType) return false;
-
-  return TypeChecker::conformsToProtocol(ty, integerType, DC) ||
-         TypeChecker::conformsToProtocol(ty, floatingType, DC);
+static bool isIntegerOrFloatingPointType(Type ty, ModuleDecl *M) {
+  return (TypeChecker::conformsToKnownProtocol(
+            ty, KnownProtocolKind::ExpressibleByIntegerLiteral, M) ||
+          TypeChecker::conformsToKnownProtocol(
+            ty, KnownProtocolKind::ExpressibleByFloatLiteral, M));
 }
 
 
@@ -3055,7 +3050,7 @@ ExprAvailabilityWalker::diagnoseIncDecRemoval(const ValueDecl *D, SourceRange R,
   // to "lvalue += 1".
   auto *DC = Where.getDeclContext();
   std::string replacement;
-  if (isIntegerOrFloatingPointType(call->getType(), DC, Context))
+  if (isIntegerOrFloatingPointType(call->getType(), DC->getParentModule()))
     replacement = isInc ? " += 1" : " -= 1";
   else {
     // Otherwise, it must be an index type.  Rewrite to:

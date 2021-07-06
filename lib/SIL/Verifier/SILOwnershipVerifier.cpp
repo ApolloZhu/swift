@@ -36,7 +36,6 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/SIL/SILOpenedArchetypesTracker.h"
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SIL/TypeLowering.h"
@@ -138,7 +137,7 @@ private:
   bool checkValueWithoutLifetimeEndingUses(ArrayRef<Operand *> regularUsers);
 
   bool checkFunctionArgWithoutLifetimeEndingUses(SILFunctionArgument *arg);
-  bool checkYieldWithoutLifetimeEndingUses(BeginApplyResult *yield,
+  bool checkYieldWithoutLifetimeEndingUses(MultipleValueInstructionResult *yield,
                                            ArrayRef<Operand *> regularUsers);
 
   bool isGuaranteedFunctionArgWithLifetimeEndingUses(
@@ -245,7 +244,7 @@ bool SILValueOwnershipChecker::gatherNonGuaranteedUsers(
     // regular users so we can ensure that the borrow scope operand's scope is
     // completely within the owned value's scope. If we do not have a borrow
     // scope operand, just continue, we are done.
-    auto initialScopedOperand = BorrowingOperand::get(op);
+    auto initialScopedOperand = BorrowingOperand(op);
     if (!initialScopedOperand) {
       continue;
     }
@@ -349,7 +348,7 @@ bool SILValueOwnershipChecker::gatherUsers(
       // Ok, our operand does not consume guaranteed values. Check if it is a
       // BorrowScopeOperand and if so, add its end scope instructions as
       // implicit regular users of our value.
-      if (auto scopedOperand = BorrowingOperand::get(op)) {
+      if (auto scopedOperand = BorrowingOperand(op)) {
         assert(!scopedOperand.isReborrow());
 
         std::function<void(Operand *)> onError = [&](Operand *op) {
@@ -487,7 +486,7 @@ bool SILValueOwnershipChecker::checkFunctionArgWithoutLifetimeEndingUses(
 }
 
 bool SILValueOwnershipChecker::checkYieldWithoutLifetimeEndingUses(
-    BeginApplyResult *yield, ArrayRef<Operand *> regularUses) {
+    MultipleValueInstructionResult *yield, ArrayRef<Operand *> regularUses) {
   switch (yield->getOwnershipKind()) {
   case OwnershipKind::Any:
     llvm_unreachable("value with any ownership kind?!");
@@ -515,7 +514,8 @@ bool SILValueOwnershipChecker::checkYieldWithoutLifetimeEndingUses(
   // If we have a guaranteed value, make sure that all uses are before our
   // end_yield.
   SmallVector<Operand *, 4> coroutineEndUses;
-  for (auto *use : yield->getParent()->getTokenResult()->getUses()) {
+  for (auto *use : yield->getParent<BeginApplyInst>()->
+                     getTokenResult()->getUses()) {
     coroutineEndUses.push_back(use);
   }
 
@@ -545,7 +545,7 @@ bool SILValueOwnershipChecker::checkValueWithoutLifetimeEndingUses(
     }
   }
 
-  if (auto *yield = dyn_cast<BeginApplyResult>(value)) {
+  if (auto *yield = isaResultOf<BeginApplyInst>(value)) {
     return checkYieldWithoutLifetimeEndingUses(yield, regularUses);
   }
 
@@ -735,21 +735,31 @@ void SILInstruction::verifyOperandOwnership() const {
     if (isTypeDependentOperand(op))
       continue;
 
-    if (op.satisfiesConstraints())
-      continue;
+    if (!checkOperandOwnershipInvariants(&op)) {
+      errorBuilder->handleMalformedSIL([&] {
+        llvm::errs() << "Found an operand with invalid invariants.\n";
+        llvm::errs() << "Value: " << op.get();
+        llvm::errs() << "Instruction:\n";
+        printInContext(llvm::errs());
+        llvm::errs() << "OperandOwnership: " << op.getOperandOwnership()
+                     << "\n";
+      });
+    }
 
-    auto constraint = op.getOwnershipConstraint();
-    SILValue opValue = op.get();
-    auto valueOwnershipKind = opValue.getOwnershipKind();
-    errorBuilder->handleMalformedSIL([&] {
-      llvm::errs() << "Found an operand with a value that is not compatible "
-                      "with the operand's operand ownership kind map.\n";
-      llvm::errs() << "Value: " << opValue;
-      llvm::errs() << "Value Ownership Kind: " << valueOwnershipKind << "\n";
-      llvm::errs() << "Instruction:\n";
-      printInContext(llvm::errs());
-      llvm::errs() << "Constraint: " << constraint << "\n";
-    });
+    if (!op.satisfiesConstraints()) {
+      auto constraint = op.getOwnershipConstraint();
+      SILValue opValue = op.get();
+      auto valueOwnershipKind = opValue.getOwnershipKind();
+      errorBuilder->handleMalformedSIL([&] {
+        llvm::errs() << "Found an operand with a value that is not compatible "
+                        "with the operand's operand ownership kind map.\n";
+        llvm::errs() << "Value: " << opValue;
+        llvm::errs() << "Value Ownership Kind: " << valueOwnershipKind << "\n";
+        llvm::errs() << "Instruction:\n";
+        printInContext(llvm::errs());
+        llvm::errs() << "Constraint: " << constraint << "\n";
+      });
+    }
   }
 }
 

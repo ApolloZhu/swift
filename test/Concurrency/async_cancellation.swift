@@ -6,10 +6,12 @@ enum PictureData {
   case failedToLoadImagePlaceholder
 }
 
+@available(SwiftStdlib 5.5, *)
 func test_cancellation_checkCancellation() async throws {
   try Task.checkCancellation()
 }
 
+@available(SwiftStdlib 5.5, *)
 func test_cancellation_guard_isCancelled(_ any: Any) async -> PictureData {
   guard !Task.isCancelled else {
     return PictureData.failedToLoadImagePlaceholder
@@ -18,24 +20,27 @@ func test_cancellation_guard_isCancelled(_ any: Any) async -> PictureData {
   return PictureData.value("...")
 }
 
-struct SomeFile: ConcurrentValue {
+@available(SwiftStdlib 5.5, *)
+struct SomeFile: Sendable {
   func close() {}
 }
 
-func test_cancellation_withCancellationHandler(_ anything: Any) async -> PictureData {
-  let handle: Task.Handle<PictureData, Error> = Task.runDetached {
+@available(SwiftStdlib 5.5, *)
+func test_cancellation_withTaskCancellationHandler(_ anything: Any) async -> PictureData {
+  let handle: Task<PictureData, Error> = .init {
     let file = SomeFile()
 
-    return await Task.withCancellationHandler(
-      handler: { file.close() },
-      operation: {
+    return await withTaskCancellationHandler {
       await test_cancellation_guard_isCancelled(file)
-    })
+    } onCancel: {
+      file.close()
+    }
   }
 
   handle.cancel()
 }
 
+@available(SwiftStdlib 5.5, *)
 func test_cancellation_loop() async -> Int {
   struct SampleTask { func process() async {} }
 

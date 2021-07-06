@@ -25,26 +25,14 @@ namespace {
 int serializeSymbolGraph(SymbolGraph &SG,
                          const SymbolGraphOptions &Options) {
   SmallString<256> FileName;
-  if (SG.DeclaringModule.hasValue()) {
-    // Save a cross-import overlay symbol graph as `MainModule@BystandingModule[@BystandingModule...]@OverlayModule.symbols.json`
-    //
-    // The overlay module's name is added as a disambiguator in case an overlay
-    // declares multiple modules for the same set of imports.
-    FileName.append(SG.DeclaringModule.getValue()->getNameStr());
-    for (auto BystanderModule : SG.BystanderModules) {
-      FileName.push_back('@');
-      FileName.append(BystanderModule.str());
-    }
-    
+  FileName.append(SG.M.getNameStr());
+  if (SG.ExtendedModule.hasValue()) {
     FileName.push_back('@');
-    FileName.append(SG.M.getNameStr());
-  } else {
-    FileName.append(SG.M.getNameStr());
-    
-    if (SG.ExtendedModule.hasValue()) {
-      FileName.push_back('@');
-      FileName.append(SG.ExtendedModule.getValue()->getNameStr());
-    }
+    FileName.append(SG.ExtendedModule.getValue()->getNameStr());
+  } else if (SG.DeclaringModule.hasValue()) {
+    // Treat cross-import overlay modules as "extensions" of their declaring module
+    FileName.push_back('@');
+    FileName.append(SG.DeclaringModule.getValue()->getNameStr());
   }
   FileName.append(".symbols.json");
 
@@ -70,16 +58,18 @@ symbolgraphgen::emitSymbolGraphForModule(ModuleDecl *M,
   SmallVector<Decl *, 64> ModuleDecls;
   M->getDisplayDecls(ModuleDecls);
 
-  llvm::errs() << ModuleDecls.size()
-      << " top-level declarations in this module.\n";
+  if (Options.PrintMessages)
+    llvm::errs() << ModuleDecls.size()
+        << " top-level declarations in this module.\n";
 
   for (auto *Decl : ModuleDecls) {
     Walker.walk(Decl);
   }
 
-  llvm::errs()
-    << "Found " << Walker.MainGraph.Nodes.size() << " symbols and "
-    << Walker.MainGraph.Edges.size() << " relationships.\n";
+  if (Options.PrintMessages)
+    llvm::errs()
+      << "Found " << Walker.MainGraph.Nodes.size() << " symbols and "
+      << Walker.MainGraph.Edges.size() << " relationships.\n";
 
   int Success = EXIT_SUCCESS;
 
@@ -100,7 +90,8 @@ printSymbolGraphForDecl(const ValueDecl *D, Type BaseTy,
                         bool InSynthesizedExtension,
                         const SymbolGraphOptions &Options,
                         llvm::raw_ostream &OS,
-                        SmallVectorImpl<PathComponent> &ParentContexts) {
+                        SmallVectorImpl<PathComponent> &ParentContexts,
+                        SmallVectorImpl<FragmentInfo> &FragmentInfo) {
   if (!Symbol::supportsKind(D->getKind()))
     return EXIT_FAILURE;
 
@@ -116,6 +107,7 @@ printSymbolGraphForDecl(const ValueDecl *D, Type BaseTy,
 
   Symbol MySym(&Graph, D, NTD, BaseTy);
   MySym.getPathComponents(ParentContexts);
+  MySym.getFragmentInfo(FragmentInfo);
   Graph.recordNode(MySym);
   Graph.serialize(JOS);
   return EXIT_SUCCESS;
